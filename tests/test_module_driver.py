@@ -4578,6 +4578,87 @@ def test_delete_request_guard_allows_the_target_record_id():
     assert driver.page.removed
 
 
+@pytest.mark.parametrize("absence_verified", [False, True])
+def test_delete_registry_entry_is_removed_only_after_absence_is_verified(
+    monkeypatch, absence_verified,
+):
+    events = []
+
+    class Button:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def click(self):
+            events.append("confirm")
+
+    class Confirm:
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return Button()
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            events.append("confirmed")
+
+    delete_response = JsonResponse(
+        "https://host/api/projects/delete/record-1",
+        {"code": 200},
+    )
+    delete_response.request.method = "DELETE"
+    delete_response.request.url = delete_response.url
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type(
+        "Page",
+        (),
+        {"wait_for_timeout": lambda _self, _timeout: events.append("settled")},
+    )()
+
+    def open_confirmation(_result, responses):
+        responses.append(delete_response)
+        return {"name": "AUTO_项目"}, ["AUTO_项目"], [], Confirm()
+
+    def verify_absent(*_args, **_kwargs):
+        events.append("verify_absent")
+        if not absence_verified:
+            raise AssertionError("记录仍然存在")
+
+    monkeypatch.setattr(driver, "_open_delete_confirmation", open_confirmation)
+    monkeypatch.setattr(driver, "_install_delete_request_guard", lambda _id: [])
+    monkeypatch.setattr(
+        driver, "_refresh_list_after_delete", lambda: events.append("refresh")
+    )
+    monkeypatch.setattr(driver, "_wait_for_deleted_record_absent", verify_absent)
+    monkeypatch.setattr(
+        driver,
+        "_forget_automation_owned_record",
+        lambda _id: events.append("forget_registry"),
+    )
+
+    result = ModuleSmokeResult(
+        mode="delete_reusable_record",
+        business_id="record-1",
+        record_markers=("AUTO_项目",),
+    )
+    if absence_verified:
+        assert driver.delete_created_record(result).mode == "add_and_delete_verified"
+        assert events[-2:] == ["verify_absent", "forget_registry"]
+    else:
+        with pytest.raises(AssertionError, match="记录仍然存在"):
+            driver.delete_created_record(result)
+        assert events[-1] == "verify_absent"
+        assert "forget_registry" not in events
+
+
 def test_delete_request_business_id_uses_the_path_value():
     request = type("Request", (), {
         "url": "https://host/api/projDecision/delete/record-1?ignored=true"
