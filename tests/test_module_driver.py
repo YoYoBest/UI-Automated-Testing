@@ -4263,6 +4263,33 @@ def test_reusable_delete_record_rejects_unregistered_automation_marker_and_id():
     assert driver.find_reusable_automation_delete_record() is None
 
 
+def test_reusable_delete_record_rejects_registry_entry_from_different_scope(
+    tmp_path,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage(
+        [
+            RecordRow(
+                ["AUTO_delete_me", "删除"],
+                **{"data-row-key": "auto-1"},
+            )
+        ],
+        url="https://host/projects",
+    )
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        '{"records":[{"business_id":"auto-1",'
+        '"page_scope":"https://host/investors",'
+        '"record_markers":["AUTO_delete_me"],'
+        '"submitted":{"name":"AUTO_delete_me"},'
+        '"record_identity_payload":{"id":"auto-1",'
+        '"name":"AUTO_delete_me"}}]}',
+        encoding="utf-8",
+    )
+
+    assert driver.find_reusable_automation_delete_record() is None
+
+
 def test_reusable_delete_record_accepts_registered_automation_marker_and_id(
     monkeypatch, tmp_path,
 ):
