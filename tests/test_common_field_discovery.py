@@ -39,6 +39,9 @@ def test_discover_common_fields(browser_page, request):
             form_code=form_code,
             component=os.getenv("EI_COMPONENT", ""),
         ),
+        automation_record_registry=(
+            project_root / "artifacts" / "automation-record-registry.json"
+        ),
     )
     executor.prepare_form_context = detail_context_preparer_from_env(
         lambda: executor.driver.run(provision_only=True)

@@ -936,6 +936,152 @@ def test_verify_saved_record_accepts_current_list_readback(monkeypatch):
     assert result.record_identity_payload == {"code": 200, "data": {"id": "record-1"}}
 
 
+def test_successful_automation_create_is_registered_before_readback_failure(
+    monkeypatch, tmp_path,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects/detail/record-1"})()
+    driver.source_fields = [("name", "名称", False)]
+    driver._collection_submission_codes = set()
+    driver._submitted_display_values = {}
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    save = JsonResponse(
+        "https://host/api/projects/add",
+        {"code": 200, "data": {"id": "record-1", "name": "AUTO_项目"}},
+    )
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        driver,
+        "_try_current_page_list_readback",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        driver, "_find_associated_detail_response", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        driver, "_can_uniquely_locate_current_record", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        driver,
+        "_open_detail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("保存后回读失败")
+        ),
+    )
+
+    with pytest.raises(AssertionError, match="保存后回读失败"):
+        driver.verify_saved_record(
+            [save],
+            save,
+            {"name": "AUTO_项目"},
+            ("AUTO_项目",),
+            created_by_automation=True,
+            automation_registry_scope="https://host/projects?tab=active",
+        )
+
+    registry = module_driver_module.json.loads(
+        driver.automation_record_registry.read_text(encoding="utf-8")
+    )
+    assert registry["records"] == [
+        {
+            "business_id": "record-1",
+            "page_scope": "https://host/projects",
+            "record_markers": ["AUTO_项目"],
+            "submitted": {"name": "AUTO_项目"},
+            "record_identity_payload": {
+                "id": "record-1",
+                "name": "AUTO_项目",
+            },
+        }
+    ]
+
+
+def test_edit_save_with_business_id_is_not_registered(monkeypatch, tmp_path):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects/detail/record-1"})()
+    driver.source_fields = [("name", "名称", False)]
+    driver._collection_submission_codes = set()
+    driver._submitted_display_values = {}
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    save = JsonResponse(
+        "https://host/api/projects/update",
+        {"code": 200, "data": {"id": "record-1", "name": "普通业务记录"}},
+    )
+    expected = ModuleSmokeResult(mode="add_edit_and_detail_verified")
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        driver,
+        "_verify_saved_record_in_edit_and_detail",
+        lambda *_args, **_kwargs: expected,
+    )
+
+    result = driver.verify_saved_record(
+        [save],
+        save,
+        {"name": "普通业务记录"},
+        (),
+        saved_from_current_detail_edit=True,
+    )
+
+    assert result is expected
+    assert not driver.automation_record_registry.exists()
+
+
+def test_registry_keeps_same_business_id_in_different_page_scopes(tmp_path):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects"})()
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver._submitted_display_values = {}
+    result = ModuleSmokeResult(
+        mode="automation_create_succeeded",
+        business_id="record-1",
+        submitted={"name": "AUTO_项目"},
+        record_markers=("AUTO_项目",),
+        record_identity_payload={"data": {"id": "record-1", "name": "AUTO_项目"}},
+    )
+
+    driver._remember_automation_owned_record(
+        result, page_scope="https://host/projects"
+    )
+    driver._remember_automation_owned_record(
+        result, page_scope="https://host/investors"
+    )
+
+    registry = module_driver_module.json.loads(
+        driver.automation_record_registry.read_text(encoding="utf-8")
+    )
+    assert [record["page_scope"] for record in registry["records"]] == [
+        "https://host/investors",
+        "https://host/projects",
+    ]
+
+
+def test_forget_registered_record_only_removes_current_page_scope(tmp_path):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects"})()
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        '{"records":['
+        '{"business_id":"record-1","page_scope":"https://host/projects"},'
+        '{"business_id":"record-1","page_scope":"https://host/investors"}'
+        "]}",
+        encoding="utf-8",
+    )
+
+    driver._forget_automation_owned_record("record-1")
+
+    registry = module_driver_module.json.loads(
+        driver.automation_record_registry.read_text(encoding="utf-8")
+    )
+    assert registry["records"] == [
+        {"business_id": "record-1", "page_scope": "https://host/investors"}
+    ]
+
+
 def test_verify_saved_record_preserves_parent_detail_when_edit_response_id_is_child(
     monkeypatch,
 ):
@@ -2095,8 +2241,10 @@ def test_double_readback_uses_partial_associated_list_to_open_embedded_edit(monk
     monkeypatch.setattr(
         driver,
         "_find_response_associated_record_container",
-        lambda payload, business_id: (
-            events.append(("associate", payload, business_id)) or (container, "响应关联")
+        lambda payload, business_id, **options: (
+            events.append((
+                "associate", payload, business_id, options["display_field_codes"],
+            )) or (container, "响应关联")
         ),
     )
     monkeypatch.setattr(
@@ -2121,7 +2269,12 @@ def test_double_readback_uses_partial_associated_list_to_open_embedded_edit(monk
 
     assert result.mode == "add_edit_and_detail_verified"
     assert events == [
-        ("associate", child_list.json(), "child-1"),
+        (
+            "associate",
+            child_list.json(),
+            "child-1",
+            ("riskSummary", "riskReason"),
+        ),
         ("open-embedded", container, "响应关联", ("编辑", "修改")),
         ("edit-readback", {"riskSummary", "riskReason"}),
     ]
@@ -2802,6 +2955,91 @@ def test_response_record_values_uniquely_associate_dom_row_without_row_id():
 
     assert row is expected
     assert "取得开工批复" in evidence
+
+
+def test_edit_response_association_uses_source_display_fields_not_hidden_technical_values():
+    driver = object.__new__(ModuleSmokeDriver)
+    target = RecordRow(["江西板块", "2041", "325,644.32", "编辑", "删除"])
+    driver.page = RecordPage([
+        target,
+        RecordRow(["四川板块", "2040", "610,389.41", "编辑", "删除"]),
+    ])
+
+    row, evidence = driver._find_response_associated_record_container(
+        {
+            "data": [{
+                "id": "net-1",
+                "belongSection": "2",
+                "belongSectionName": "江西板块",
+                "assetYear": "2041",
+                "netAssetAmount": 325644.32,
+                "rowVersion": 17,
+                "updateByName": "管理员",
+            }],
+        },
+        "net-1",
+        display_field_codes=("belongSection", "assetYear", "netAssetAmount"),
+    )
+
+    assert row is target
+    assert "江西板块" in evidence
+    assert "2041" in evidence
+    assert "325644.32" in evidence
+    evidence_values = {
+        value.strip() for value in evidence.partition("=")[2].split(",")
+    }
+    assert "2" not in evidence_values
+    assert "17" not in evidence_values
+    assert "管理员" not in evidence_values
+
+
+def test_default_response_association_remains_strict_for_delete_evidence():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["江西板块", "2041", "325,644.32", "编辑", "删除"]),
+    ])
+
+    with pytest.raises(AssertionError, match="未完整匹配"):
+        driver._find_response_associated_record_container(
+            {
+                "data": [{
+                    "id": "net-1",
+                    "belongSection": "2",
+                    "belongSectionName": "江西板块",
+                    "assetYear": "2041",
+                    "netAssetAmount": 325644.32,
+                    "rowVersion": 17,
+                }],
+            },
+            "net-1",
+        )
+
+
+def test_edit_response_association_still_requires_two_visible_display_fields():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([RecordRow(["江西板块", "编辑", "删除"])])
+
+    with pytest.raises(AssertionError, match="至少两个稳定展示字段"):
+        driver._find_response_associated_record_container(
+            {
+                "data": [{
+                    "id": "net-1",
+                    "belongSection": "2",
+                    "belongSectionName": "江西板块",
+                    "assetYear": "2041",
+                    "netAssetAmount": 325644.32,
+                }],
+            },
+            "net-1",
+            display_field_codes=("belongSection", "assetYear", "netAssetAmount"),
+        )
+
+
+def test_edit_response_association_without_source_fields_uses_strict_fallback():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+
+    assert driver._source_response_association_codes() is None
 
 
 def test_response_record_values_reject_ambiguous_dom_rows():
@@ -3999,7 +4237,7 @@ def test_delete_row_rejects_conflicting_row_and_command_business_ids():
         )
 
 
-def test_reusable_delete_record_requires_automation_marker_and_business_id():
+def test_reusable_delete_record_rejects_unregistered_automation_marker_and_id():
     class EmptyLocator:
         @property
         def first(self):
@@ -4022,11 +4260,69 @@ def test_reusable_delete_record_requires_automation_marker_and_business_id():
         ),
     })()
 
+    assert driver.find_reusable_automation_delete_record() is None
+
+
+def test_reusable_delete_record_accepts_registered_automation_marker_and_id(
+    monkeypatch, tmp_path,
+):
+    class EmptyLocator:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {
+        "url": "https://host/projects",
+        "locator": lambda _self, selector: (
+            EmptyLocator()
+            if "loading" in selector or "busy" in selector
+            else DeleteRows([
+                DeleteRow(["普通业务数据"], **{"data-row-key": "business-1"}),
+                DeleteRow(["AUTO_delete_me"], **{"data-row-key": "auto-1"}),
+            ])
+        ),
+    })()
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        '{"records":[{"business_id":"auto-1",'
+        '"page_scope":"https://host/projects",'
+        '"record_markers":["AUTO_delete_me"],'
+        '"submitted":{"name":"AUTO_delete_me"},'
+        '"record_identity_payload":{"id":"auto-1",'
+        '"name":"AUTO_delete_me"}}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(driver, "_pin_delete_row", lambda row, *_args, **_kwargs: row)
+
     result = driver.find_reusable_automation_delete_record()
 
     assert result is not None
     assert result.business_id == "auto-1"
     assert result.record_markers == ("AUTO_delete_me",)
+
+
+def test_registered_marker_without_row_id_still_requires_two_display_values(
+    tmp_path,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([RecordRow(["AUTO_delete_me", "删除"])])
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        '{"records":[{"business_id":"auto-1",'
+        '"page_scope":"https://host/projects",'
+        '"record_markers":["AUTO_delete_me"],'
+        '"submitted":{"name":"AUTO_delete_me"},'
+        '"record_identity_payload":{"id":"auto-1",'
+        '"name":"AUTO_delete_me"}}]}',
+        encoding="utf-8",
+    )
+
+    assert driver.find_reusable_automation_delete_record() is None
 
 
 def test_reusable_delete_record_ignores_business_rows_and_unaddressable_automation_rows():

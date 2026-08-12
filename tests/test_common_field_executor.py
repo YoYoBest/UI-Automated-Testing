@@ -44,6 +44,16 @@ class _Strategy:
     pass
 
 
+def test_common_field_executor_passes_automation_registry_to_driver(tmp_path):
+    registry = tmp_path / "automation-record-registry.json"
+
+    executor = CommonFieldExecutor(
+        _Page(), _Strategy(), automation_record_registry=registry
+    )
+
+    assert executor.driver.automation_record_registry == registry
+
+
 def test_attachment_transaction_uploads_each_field_with_one_save(monkeypatch):
     monkeypatch.setattr(
         "ei_ui_smoke.common_field_executor.clear_failure_evidence",
@@ -4364,6 +4374,7 @@ def test_verify_saved_record_receives_all_transaction_values_once():
     page = Page()
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = page
+    executor.entry_url = "https://example.test/projects?tab=active"
     calls = {"verify": [], "delete": []}
     verified = ModuleSmokeResult(
         mode="add_and_detail_verified",
@@ -4384,6 +4395,8 @@ def test_verify_saved_record_receives_all_transaction_values_once():
             required_codes=None,
             rendered_text_expectations=None,
             require_edit_and_detail=False,
+            created_by_automation=False,
+            automation_registry_scope="",
         ):
             calls["verify"].append(
                 (
@@ -4395,6 +4408,8 @@ def test_verify_saved_record_receives_all_transaction_values_once():
                     set(required_codes or ()),
                     dict(rendered_text_expectations or {}),
                     require_edit_and_detail,
+                    created_by_automation,
+                    automation_registry_scope,
                 )
             )
             return verified
@@ -4435,6 +4450,8 @@ def test_verify_saved_record_receives_all_transaction_values_once():
             {"summary", "purpose"},
             {"purpose": ("项目建设目的", "第一行\n  第二行")},
             False,
+            True,
+            "https://example.test/projects?tab=active",
         )
     ]
     assert calls["delete"] == []
@@ -4457,6 +4474,7 @@ def test_add_069_forwards_all_submitted_fields_to_edit_and_detail_readback():
 
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = Page()
+    executor.entry_url = "https://example.test/projects"
     executor.driver = Driver()
     submitted = {
         "projName": "AUTO_项目",
@@ -4477,6 +4495,8 @@ def test_add_069_forwards_all_submitted_fields_to_edit_and_detail_readback():
     assert captured["kwargs"] == {
         "required_codes": set(submitted),
         "require_edit_and_detail": True,
+        "created_by_automation": True,
+        "automation_registry_scope": "https://example.test/projects",
     }
 
 
@@ -4497,6 +4517,7 @@ def test_attachment_readback_forwards_explicit_empty_field_set():
 
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = Page()
+    executor.entry_url = "https://example.test/projects"
     executor.driver = Driver()
 
     result = executor._verify_saved_record(
@@ -4512,6 +4533,8 @@ def test_attachment_readback_forwards_explicit_empty_field_set():
     assert captured["kwargs"] == {
         "required_codes": set(),
         "require_edit_and_detail": True,
+        "created_by_automation": True,
+        "automation_registry_scope": "https://example.test/projects",
     }
 
 

@@ -33,6 +33,9 @@ def test_selected_module_auto_add_or_page_access(browser_page, request):
         source_fields=source_fields,
         default_upload_file=data_pool.default_upload_file(),
         dynamic_collections=dynamic_collections,
+        automation_record_registry=(
+            project_root / "artifacts" / "automation-record-registry.json"
+        ),
     ).run()
     if os.getenv("EI_REQUIRE_ADD", "false").lower() == "true":
         assert result.mode in {

@@ -4,6 +4,13 @@
       "formCode": "BUILD_NETASSETS_MAINTAIL",
       "fieldCodes": ["belongSection", "assetYear"],
       "repairField": "assetYear",
+      "alternateRepairFields": ["belongSection"],
+      "listUrlIncludes": ["/netAsset/listPage"],
+      "recordPaths": ["data.records", "data.rows", "data"],
+      "fieldAliases": {
+        "belongSection": ["belongSectionName", "belongSection"],
+        "assetYear": ["assetYear"]
+      },
       "messageIncludes": ["板块", "年度", "已存在"]
     }
   ]

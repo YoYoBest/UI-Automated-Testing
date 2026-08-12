@@ -62,7 +62,7 @@ FIELD_TYPE_TO_COMPONENT = {
     "checkbox": "ElCheckboxGroup-CHECKBOX",
     "file": "ElUpload-FILE",
 }
-COMMON_ADD_ACTION_PREFIXES = ("新增", "添加", "新建")
+COMMON_ADD_ACTION_PREFIXES = ("新增", "添加", "新建", "创建")
 COMMON_EDIT_ACTION_PREFIXES = ("编辑", "修改")
 
 FORM_VALIDATION_SELECTOR = ".el-form-item__error:visible"
@@ -290,6 +290,7 @@ class CommonFieldExecutor:
         default_upload_file: Path | None = None,
         dynamic_collections: list[DynamicCollectionSpec] | None = None,
         prepare_form_context: Callable[[object], None] | None = None,
+        automation_record_registry: Path | None = None,
     ):
         self.page = page
         self.entry_url = (
@@ -302,6 +303,7 @@ class CommonFieldExecutor:
             source_fields=source_fields,
             default_upload_file=default_upload_file,
             dynamic_collections=dynamic_collections,
+            automation_record_registry=automation_record_registry,
         )
         self._form_session = CommonFieldFormSession(self)
         self._record_identity_sequence = 0
@@ -4261,6 +4263,14 @@ class CommonFieldExecutor:
         if require_edit_and_detail:
             verify_options["require_edit_and_detail"] = True
         form_action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
+        created_by_automation = (
+            not form_action or form_action.startswith(COMMON_ADD_ACTION_PREFIXES)
+        )
+        if created_by_automation:
+            verify_options.update(
+                created_by_automation=True,
+                automation_registry_scope=getattr(self, "entry_url", ""),
+            )
         if (
             not terminal_operation
             and form_action.startswith(COMMON_EDIT_ACTION_PREFIXES)

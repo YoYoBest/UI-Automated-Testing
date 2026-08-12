@@ -617,6 +617,9 @@ def module_case_executor(browser_runtime):
             form_code=form_code,
             component=os.getenv("EI_COMPONENT", ""),
         ),
+        automation_record_registry=(
+            project_root / "artifacts" / "automation-record-registry.json"
+        ),
     )
     yield executor
     executor.close_form_session()

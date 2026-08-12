@@ -242,6 +242,7 @@ class ModuleSmokeDriver:
         self._reset_nested_evidence()
         self._submitted_display_values = {}
         self._collection_submission_codes = set()
+        automation_registry_scope = self._automation_registry_scope()
         add = self._wait_for_add_button()
         add.click()
         scope = self._wait_for_form_scope()
@@ -297,6 +298,8 @@ class ModuleSmokeDriver:
             submitted,
             record_markers,
             provision_only=provision_only,
+            created_by_automation=True,
+            automation_registry_scope=automation_registry_scope,
         )
 
     def verify_saved_record(
@@ -311,6 +314,8 @@ class ModuleSmokeDriver:
         rendered_text_expectations: dict[str, tuple[str, str]] | None = None,
         require_edit_and_detail: bool = False,
         saved_from_current_detail_edit: bool = False,
+        created_by_automation: bool = False,
+        automation_registry_scope: str = "",
     ) -> ModuleSmokeResult:
         """Complete the shared save, identity, and persisted-value verification."""
         requested_codes = (
@@ -342,16 +347,28 @@ class ModuleSmokeDriver:
         except Exception:
             body = save_response.text()
         self._assert_business_success(body)
+        business_id = extract_business_id(body)
+        record_identity_payload = self._saved_record_identity_payload(
+            responses, body, business_id
+        )
+        if created_by_automation and business_id:
+            self._remember_automation_owned_record(
+                ModuleSmokeResult(
+                    mode="automation_create_succeeded",
+                    business_id=business_id,
+                    save_url=save_response.url,
+                    submitted=submitted,
+                    record_markers=record_markers,
+                    record_identity_payload=record_identity_payload,
+                ),
+                page_scope=automation_registry_scope,
+            )
         save_payload = self._request_payload(save_response.request)
         self._assert_nested_values_in_payload(
             save_payload,
             submitted=submitted,
             stage=f"保存请求 {save_response.url}",
             synchronize_support=True,
-        )
-        business_id = extract_business_id(body)
-        record_identity_payload = self._saved_record_identity_payload(
-            responses, body, business_id
         )
         echo_values = list(record_markers)
         # An edit starts from an already-associated detail record.  Its update
@@ -365,7 +382,7 @@ class ModuleSmokeDriver:
         ):
             raise AssertionError(f"保存成功但列表未回显本次数据：{echo_values}")
         if provision_only:
-            result = ModuleSmokeResult(
+            return ModuleSmokeResult(
                 mode="add_provisioned",
                 business_id=business_id,
                 save_url=save_response.url,
@@ -373,8 +390,6 @@ class ModuleSmokeDriver:
                 record_markers=record_markers,
                 record_identity_payload=record_identity_payload,
             )
-            self._remember_automation_owned_record(result)
-            return result
         if require_edit_and_detail or saved_from_current_detail_edit:
             return self._verify_saved_record_in_edit_and_detail(
                 responses,
@@ -703,7 +718,9 @@ class ModuleSmokeDriver:
                 if association_payload is not None:
                     try:
                         container, identity = self._find_response_associated_record_container(
-                            association_payload, business_id
+                            association_payload,
+                            business_id,
+                            display_field_codes=self._source_response_association_codes(),
                         )
                     except AssertionError as association_exc:
                         if requested_detail is not None:
@@ -1399,24 +1416,6 @@ class ModuleSmokeDriver:
             raise AssertionError("复用删除记录前列表在 20 秒内未加载完成") from exc
 
         rows = self.page.locator(".el-table__row:visible")
-        row_items = [rows.nth(index) for index in range(rows.count())]
-        direct_candidates: list[tuple[str, str]] = []
-        for row in row_items:
-            business_id = self._row_business_id(row)
-            if not business_id:
-                continue
-            markers = self._automation_owned_markers(
-                row.locator("td,[role='cell']").all_inner_texts()
-            )
-            if markers:
-                direct_candidates.append((business_id, markers[0]))
-        if direct_candidates:
-            business_id, marker = direct_candidates[0]
-            return ModuleSmokeResult(
-                mode="delete_reusable_record",
-                business_id=business_id,
-                record_markers=(marker,),
-            )
         for entry in self._registered_automation_records():
             business_id = self._normalize_record_text(entry.get("business_id"))
             markers = self._automation_owned_markers(entry.get("record_markers") or [])
@@ -1425,17 +1424,35 @@ class ModuleSmokeDriver:
             if not business_id:
                 continue
             try:
-                row, _identity = self._find_unique_delete_row(
+                fallback_values = self._delete_display_identity_values(
+                    submitted, markers
+                )
+                row, identity = self._find_unique_delete_row(
                     business_id,
                     markers,
-                    fallback_values=self._delete_display_identity_values(submitted, markers),
+                    fallback_values=fallback_values,
                     response_payload=response_payload,
                     rows=rows,
                 )
+                row_id = self._row_business_id(row)
+                if not row_id and not (
+                    identity.startswith("响应关联字段=")
+                    or identity == "保存字段组合"
+                ):
+                    row, identity = self._find_unique_delete_row(
+                        business_id,
+                        [],
+                        fallback_values=fallback_values,
+                        response_payload=response_payload,
+                        rows=rows,
+                    )
                 self._pin_delete_row(
                     row,
                     business_id,
-                    allow_missing_id=True,
+                    allow_missing_id=(
+                        identity.startswith("响应关联字段=")
+                        or identity == "保存字段组合"
+                    ),
                 )
             except (AssertionError, RecordNotDeletableError):
                 continue
@@ -1466,24 +1483,107 @@ class ModuleSmokeDriver:
             if isinstance(record, dict) and record.get("page_scope") == scope
         ]
 
-    def _automation_registry_scope(self) -> str:
-        page_url = str(getattr(self.page, "url", "") or "")
+    def _automation_registry_scope(self, page_url: str = "") -> str:
+        page_url = str(page_url or getattr(self.page, "url", "") or "")
         parts = urlsplit(page_url)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
 
-    def _remember_automation_owned_record(self, result: ModuleSmokeResult) -> None:
+    def _automation_registry_display_values(
+        self, submitted: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Retain only stable scalar values that can identify the created row."""
+        display_values: dict[str, Any] = {}
+        for code, value in submitted.items():
+            if self._is_generated_identifier(str(code)) or value in (None, "", []):
+                continue
+            display_value = self._remembered_display_value(str(code), value)
+            candidate = display_value if display_value is not None else value
+            if isinstance(candidate, bool) or isinstance(candidate, (dict, list, tuple, set)):
+                continue
+            if isinstance(candidate, Decimal):
+                candidate = str(candidate)
+            if not isinstance(candidate, (str, int, float)):
+                candidate = str(candidate)
+            if self._normalize_record_text(candidate):
+                display_values[str(code)] = candidate
+        return display_values
+
+    @classmethod
+    def _minimal_record_identity_payload(
+        cls,
+        payload: Any,
+        business_id: str,
+        *,
+        submitted: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Keep only the created ID and submitted fields that may identify its row."""
+        normalized_id = cls._normalize_record_text(business_id)
+        records = [
+            record
+            for record in cls._collect_dicts(payload)
+            if cls._direct_record_business_id(record) == normalized_id
+        ]
+        record = records[-1] if records else {}
+        minimal: dict[str, Any] = {"id": str(business_id)}
+        submitted_codes = tuple(
+            str(code) for code in (submitted or {}) if str(code)
+        )
+        for code in submitted_codes:
+            wildcard_code = re.sub(r"(?<=\.)\d+(?=\.|$)", "*", code)
+            candidates = cls._deduplicate([
+                *DETAIL_DISPLAY_ALIASES.get(code, ()),
+                *DETAIL_DISPLAY_ALIASES.get(wildcard_code, ()),
+                code,
+                wildcard_code,
+            ])
+            for candidate in candidates:
+                values = [
+                    value
+                    for value in cls._field_values_from_record(record, candidate)
+                    if value not in (None, "")
+                    and not isinstance(value, (bool, dict, list))
+                ]
+                normalized_values = {
+                    cls._normalize_record_text(value): value for value in values
+                    if cls._normalize_record_text(value)
+                }
+                if len(normalized_values) != 1:
+                    continue
+                value = next(iter(normalized_values.values()))
+                if isinstance(value, Decimal):
+                    value = str(value)
+                elif not isinstance(value, (str, int, float)):
+                    value = str(value)
+                minimal[candidate] = value
+                break
+        return minimal
+
+    def _remember_automation_owned_record(
+        self,
+        result: ModuleSmokeResult,
+        *,
+        page_scope: str = "",
+    ) -> None:
         """Persist minimal identity evidence only after a successful automation create."""
         path = getattr(self, "automation_record_registry", None)
         if path is None or not result.business_id:
             return
+        normalized_scope = self._automation_registry_scope(page_scope)
+        if not normalized_scope:
+            return
         markers = self._automation_owned_markers(list(result.record_markers))
-        records = self._registered_automation_records()
         entry = {
             "business_id": str(result.business_id),
-            "page_scope": self._automation_registry_scope(),
+            "page_scope": normalized_scope,
             "record_markers": markers,
-            "submitted": result.submitted or {},
-            "record_identity_payload": result.record_identity_payload,
+            "submitted": self._automation_registry_display_values(
+                result.submitted or {}
+            ),
+            "record_identity_payload": self._minimal_record_identity_payload(
+                result.record_identity_payload,
+                str(result.business_id),
+                submitted=result.submitted or {},
+            ),
         }
         try:
             raw_payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -1497,7 +1597,11 @@ class ModuleSmokeDriver:
         records = [
             record for record in existing_records
             if not isinstance(record, dict)
-            or self._normalize_record_text(record.get("business_id")) != entry["business_id"]
+            or (
+                self._normalize_record_text(record.get("business_id"))
+                != entry["business_id"]
+                or record.get("page_scope") != normalized_scope
+            )
         ]
         records.insert(0, entry)
         try:
@@ -1512,9 +1616,15 @@ class ModuleSmokeDriver:
             # Failure to maintain local cleanup evidence must only disable reuse.
             return
 
-    def _forget_automation_owned_record(self, business_id: str) -> None:
+    def _forget_automation_owned_record(
+        self,
+        business_id: str,
+        *,
+        page_scope: str = "",
+    ) -> None:
         path = getattr(self, "automation_record_registry", None)
         normalized_id = self._normalize_record_text(business_id)
+        normalized_scope = self._automation_registry_scope(page_scope)
         if path is None or not normalized_id:
             return
         try:
@@ -1528,6 +1638,7 @@ class ModuleSmokeDriver:
             record for record in existing_records
             if not isinstance(record, dict)
             or self._normalize_record_text(record.get("business_id")) != normalized_id
+            or record.get("page_scope") != normalized_scope
         ]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3487,10 +3598,14 @@ class ModuleSmokeDriver:
             return marker_matches[0]
         if not marker_matches:
             if response_payload is not None and normalized_id:
-                response_row, evidence = self._find_response_associated_record_container(
-                    response_payload, normalized_id, containers=row_items
-                )
-                return response_row, evidence
+                try:
+                    response_row, evidence = self._find_response_associated_record_container(
+                        response_payload, normalized_id, containers=row_items
+                    )
+                except AssertionError:
+                    pass
+                else:
+                    return response_row, evidence
             normalized_fallbacks = {
                 self._normalize_record_text(value)
                 for value in fallback_values or ()
@@ -3977,6 +4092,7 @@ class ModuleSmokeDriver:
         business_id: str,
         *,
         containers: Iterable[Any] | None = None,
+        display_field_codes: Iterable[str] | None = None,
     ):
         """Associate an ID-bearing response record with one exact visible row/card."""
         normalized_id = self._normalize_record_text(business_id)
@@ -4018,14 +4134,13 @@ class ModuleSmokeDriver:
         response_values = {
             value
             for record in records
-            for value in self._response_display_identity_values(record, normalized_id)
-        }
-        if len(response_values) < 2:
-            raise AssertionError(
-                f"业务 ID {business_id} 的关联响应记录缺少至少两个稳定展示字段，"
-                "无法唯一操作"
+            for value in self._response_display_identity_values(
+                record,
+                normalized_id,
+                field_codes=display_field_codes,
             )
-        matches: list[tuple[Any, tuple[str, ...]]] = []
+        }
+        rendered_containers: list[tuple[Any, list[str]]] = []
         for container in container_items:
             cells = self._record_container_cell_texts(container)
             if not cells:
@@ -4033,11 +4148,27 @@ class ModuleSmokeDriver:
                     cells = container.inner_text().splitlines()
                 except Exception:
                     cells = []
-            cell_values = [
+            rendered_containers.append((container, [
                 self._normalize_record_text(value)
                 for value in cells
                 if self._normalize_record_text(value)
-            ]
+            ]))
+        if display_field_codes is not None:
+            response_values = {
+                value
+                for value in response_values
+                if any(
+                    self._response_display_value_matches_cell(value, cell_values)
+                    for _container, cell_values in rendered_containers
+                )
+            }
+        if len(response_values) < 2:
+            raise AssertionError(
+                f"业务 ID {business_id} 的关联响应记录缺少至少两个稳定展示字段，"
+                "无法唯一操作"
+            )
+        matches: list[tuple[Any, tuple[str, ...]]] = []
+        for container, cell_values in rendered_containers:
             evidence = tuple(
                 value
                 for value in sorted(response_values, key=len, reverse=True)
@@ -4059,9 +4190,36 @@ class ModuleSmokeDriver:
 
     @classmethod
     def _response_display_identity_values(
-        cls, record: dict[str, Any], business_id: str
+        cls,
+        record: dict[str, Any],
+        business_id: str,
+        *,
+        field_codes: Iterable[str] | None = None,
     ) -> set[str]:
         """Keep only stable response scalars that a rendered row can display."""
+        if field_codes is not None:
+            logical_records = cls._collect_logical_record_dicts(record)
+            values: set[str] = set()
+            for code in dict.fromkeys(str(value) for value in field_codes if str(value)):
+                alias_values = [
+                    value
+                    for alias in DETAIL_DISPLAY_ALIASES.get(code, ())
+                    for item in logical_records
+                    for value in cls._field_values_from_record(item, alias)
+                ]
+                candidates = alias_values or [
+                    value
+                    for item in logical_records
+                    for value in cls._field_values_from_record(item, code)
+                ]
+                for value in candidates:
+                    if isinstance(value, (dict, list, bool)) or value in (None, ""):
+                        continue
+                    normalized = cls._normalize_record_text(value)
+                    if normalized and normalized != business_id:
+                        values.add(normalized)
+            return values
+
         excluded_key_tokens = ("id", "code", "key", "flag", "status")
         values: set[str] = set()
         for item in cls._collect_logical_record_dicts(record):
@@ -4077,6 +4235,15 @@ class ModuleSmokeDriver:
                 if normalized and normalized != business_id:
                     values.add(normalized)
         return values
+
+    def _source_response_association_codes(self) -> tuple[str, ...] | None:
+        """Return stable form fields allowed to identify a row during edit readback."""
+        codes = tuple(dict.fromkeys(
+            str(field[0])
+            for field in getattr(self, "source_fields", ())
+            if field and not self._is_generated_identifier(str(field[0]))
+        ))
+        return codes or None
 
     @classmethod
     def _response_display_value_matches_cell(

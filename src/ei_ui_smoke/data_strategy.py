@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from threading import Lock
 
 from .data_pool import ConstrainedGenerator, GlobalDataPool
 from .models import FieldDefinition
@@ -10,6 +11,10 @@ from .validation_repair import generate_repair_value, parse_validation_message
 class DataStrategy:
     pool: GlobalDataPool
     form_code: str
+    _unique_reservation_lock = Lock()
+    _unique_reservations: dict[
+        tuple[str, tuple[str, ...]], set[tuple[str, ...]]
+    ] = {}
 
     def value_for(self, field: FieldDefinition, index: int) -> Any:
         raise NotImplementedError
@@ -26,6 +31,43 @@ class DataStrategy:
             if spec.repair_field not in fields:
                 fields.append(spec.repair_field)
         return tuple(fields)
+
+    def declared_unique_constraints(self, submitted: dict[str, Any] | None = None):
+        specs = tuple(
+            spec for spec in getattr(self.pool, "unique_constraints", ())
+            if spec.form_code == self.form_code
+        )
+        if submitted is None:
+            return specs
+        return tuple(
+            spec for spec in specs
+            if all(submitted.get(code) not in (None, "", []) for code in spec.field_codes)
+        )
+
+    def declared_unique_constraint_for_message(
+        self, message: str, submitted: dict[str, Any],
+    ):
+        matches = tuple(
+            spec for spec in self.declared_unique_constraints(submitted)
+            if spec.matches_message(message)
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _normalized_unique_key(values: tuple[Any, ...]) -> tuple[str, ...]:
+        return tuple(str(value or "").strip() for value in values)
+
+    def unique_key_is_reserved(self, spec, values: tuple[Any, ...]) -> bool:
+        bucket = (spec.form_code, tuple(spec.field_codes))
+        normalized = self._normalized_unique_key(values)
+        with self._unique_reservation_lock:
+            return normalized in self._unique_reservations.get(bucket, set())
+
+    def reserve_unique_key(self, spec, values: tuple[Any, ...]) -> None:
+        bucket = (spec.form_code, tuple(spec.field_codes))
+        normalized = self._normalized_unique_key(values)
+        with self._unique_reservation_lock:
+            self._unique_reservations.setdefault(bucket, set()).add(normalized)
 
     def unique_repair_field(
         self, message: str, submitted: dict[str, Any],

@@ -90,12 +90,23 @@ class UniqueConstraintSpec:
     field_codes: tuple[str, ...]
     repair_field: str
     message_includes: tuple[str, ...] = ()
+    alternate_repair_fields: tuple[str, ...] = ()
+    list_url_includes: tuple[str, ...] = ()
+    record_paths: tuple[str, ...] = ("data.records", "data.rows", "data")
+    field_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def matches_message(self, message: str) -> bool:
         text = re.sub(r"\s+", "", str(message or ""))
         return bool(self.message_includes) and all(
             re.sub(r"\s+", "", token) in text for token in self.message_includes
         )
+
+    def aliases_for(self, field_code: str) -> tuple[str, ...]:
+        aliases = next(
+            (values for code, values in self.field_aliases if code == field_code),
+            (),
+        )
+        return tuple(dict.fromkeys((*aliases, field_code)))
 
 
 def load_unique_constraints(path: Path) -> tuple[UniqueConstraintSpec, ...]:
@@ -121,11 +132,47 @@ def load_unique_constraints(path: Path) -> tuple[UniqueConstraintSpec, ...]:
             for value in (entry.get("messageIncludes") or [])
             if str(value or "").strip()
         )
+        alternate_repair_fields = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in (entry.get("alternateRepairFields") or [])
+                if str(value or "").strip()
+            )
+        )
+        list_url_includes = tuple(
+            str(value or "").strip()
+            for value in (entry.get("listUrlIncludes") or [])
+            if str(value or "").strip()
+        )
+        record_paths = tuple(
+            str(value or "").strip()
+            for value in (entry.get("recordPaths") or [
+                "data.records", "data.rows", "data",
+            ])
+            if str(value or "").strip()
+        )
+        raw_aliases = entry.get("fieldAliases") or {}
+        if not isinstance(raw_aliases, dict):
+            raise ValueError(f"{path} 的第 {index} 个唯一约束 fieldAliases 必须是对象")
+        field_aliases = tuple(
+            (
+                str(code),
+                tuple(
+                    str(value or "").strip()
+                    for value in (values if isinstance(values, list) else [values])
+                    if str(value or "").strip()
+                ),
+            )
+            for code, values in raw_aliases.items()
+            if str(code or "").strip()
+        )
         if (
             not form_code
             or not field_codes
             or repair_field not in field_codes
             or not message_includes
+            or any(code not in field_codes for code in alternate_repair_fields)
+            or any(code not in field_codes for code, _aliases in field_aliases)
         ):
             raise ValueError(f"{path} 的第 {index} 个唯一约束配置不完整")
         specs.append(UniqueConstraintSpec(
@@ -133,6 +180,10 @@ def load_unique_constraints(path: Path) -> tuple[UniqueConstraintSpec, ...]:
             field_codes=field_codes,
             repair_field=repair_field,
             message_includes=message_includes,
+            alternate_repair_fields=alternate_repair_fields,
+            list_url_includes=list_url_includes,
+            record_paths=record_paths,
+            field_aliases=field_aliases,
         ))
     return tuple(specs)
 
