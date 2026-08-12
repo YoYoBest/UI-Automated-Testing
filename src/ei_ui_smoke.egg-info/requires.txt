@@ -1,0 +1,3 @@
+playwright<2,>=1.52
+pytest<10,>=8
+allure-pytest<3,>=2.16

@@ -1,0 +1,181 @@
+import json
+import re
+from pathlib import Path
+
+from ei_ui_smoke.contracts import normalize_field
+from ei_ui_smoke.data_pool import (
+    ConstrainedGenerator,
+    GlobalDataPool,
+    UniqueConstraintSpec,
+)
+from ei_ui_smoke.data_strategy import (
+    ProbeDataStrategy,
+    StableDataStrategy,
+    StandardDataStrategy,
+    create_data_strategy,
+)
+
+
+def pool(unique_constraints=()):
+    return GlobalDataPool(
+        common={
+            "generators": {
+                "mobile": {"prefixes": ["139"]},
+                "creditCode": {"registrationAuthority": "91", "organizationCodePrefix": "320500"},
+                "amount": {"min": 10, "max": 20, "scale": 2},
+                "enterpriseName": {"prefix": "测试企业"},
+                "businessIdentifier": {"digits": 16},
+                "text": {"prefix": "测试"},
+            },
+            "candidatePools": {"currency": ["人民币"]},
+            "fieldMappings": {
+                "mobile": ["phone", "手机号"],
+                "creditCode": ["creditCode", "统一社会信用代码"],
+                "amount": ["amount", "金额"],
+                "enterpriseName": ["companyName", "企业名称"],
+                "businessIdentifier": ["itemId", "ID"],
+            },
+        },
+        collected={"forms": {"FORM": {"fields": {"status": {"values": ["有效"]}}}}},
+        overrides={"forms": {"FORM": {"values": {"amount": 88}}}},
+        unique_constraints=tuple(unique_constraints),
+    )
+
+
+def field(code, name="", field_type="ElInput-TEXT"):
+    return normalize_field({"fieldCode": code, "fieldName": name, "fieldType": field_type}, "test")
+
+
+def test_probe_generates_valid_semantic_values_without_page_data():
+    strategy = ProbeDataStrategy(pool(), "run-1")
+    mobile = strategy.value_for(field("contactPhone", "联系电话"), 1)
+    credit = strategy.value_for(field("creditCode", "统一社会信用代码"), 2)
+    amount = strategy.value_for(field("amount", "金额", "ElInputNumber-NUMBER"), 3)
+    assert re.fullmatch(r"139\d{8}", mobile)
+    assert len(credit) == 18 and all(char in ConstrainedGenerator.USCC_CHARS for char in credit)
+    assert 10 <= amount <= 20
+
+
+def test_probe_is_reproducible_with_same_run_id():
+    first = ProbeDataStrategy(pool(), "same").value_for(field("contactPhone"), 1)
+    second = ProbeDataStrategy(pool(), "same").value_for(field("contactPhone"), 1)
+    assert first == second
+
+
+def test_visible_business_item_id_uses_numeric_identifier():
+    strategy = ProbeDataStrategy(pool(), "20260731153000")
+
+    value = strategy.value_for(field("itemId", "ID"), 1)
+
+    assert value.isdigit()
+    assert len(value) == 16
+    assert pool().semantic_for(field("orgId", "关联组织")) == ""
+
+
+def test_short_rate_alias_does_not_match_registration_status():
+    strategy = ProbeDataStrategy(pool(), "same")
+
+    value = strategy.value_for(
+        field("registrationStatus", "管理人登记情况", "PurvarCodeSelect-RADIO"), 1
+    )
+
+    assert value == ""
+
+
+def test_stable_priority_is_override_then_collected_then_common_or_generated():
+    strategy = StableDataStrategy(pool(), "FORM", "stable")
+    assert strategy.value_for(field("amount", "金额"), 1) == 88
+    assert strategy.value_for(field("status", "状态", "PurvarCodeSelect-SELECT"), 2) == "有效"
+    assert strategy.value_for(field("companyName", "企业名称"), 3).startswith("测试企业_")
+
+
+def test_mode_switch_rejects_unknown_mode():
+    assert isinstance(create_data_strategy("probe", pool(), "FORM"), ProbeDataStrategy)
+    assert isinstance(create_data_strategy("stable", pool(), "FORM"), StableDataStrategy)
+    assert isinstance(create_data_strategy("standard", pool(), "FORM"), StandardDataStrategy)
+    assert create_data_strategy("standard", pool(), "FORM").strict_field_validation
+    try:
+        create_data_strategy("random", pool(), "FORM")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown mode must fail")
+
+
+def test_strategy_repairs_value_only_for_supported_validation_message():
+    strategy = ProbeDataStrategy(pool(), "run-1")
+    definition = field("email", "联系邮箱")
+
+    repaired = strategy.repair_value(definition, "bad", "邮箱格式不正确", 1)
+
+    assert repaired is not None
+    assert "@" in repaired[0]
+    assert strategy.repair_value(definition, "bad", "无操作权限", 1) is None
+
+
+def test_global_default_upload_file_is_read_from_common_data(tmp_path):
+    attachment = tmp_path / "attachment.jpg"
+    attachment.write_bytes(b"image")
+    data_pool = GlobalDataPool(
+        common={"uploads": {"defaultFile": str(attachment)}},
+        collected={},
+        overrides={},
+    )
+
+    assert data_pool.default_upload_file() == Path(attachment).resolve()
+
+
+def test_declared_composite_unique_constraint_uses_batch_year_sequence():
+    constraint = UniqueConstraintSpec(
+        form_code="BUILD_NETASSETS_MAINTAIL",
+        field_codes=("belongSection", "assetYear"),
+        repair_field="assetYear",
+        message_includes=("板块", "年度", "已存在"),
+    )
+    strategy = StandardDataStrategy(
+        pool([constraint]), "run", form_code="BUILD_NETASSETS_MAINTAIL"
+    )
+    submitted = {"belongSection": "1", "assetYear": "2026", "netAssetAmount": "10"}
+    definition = field("assetYear", "年度", "DATE")
+
+    first, first_meta = strategy.allocate_unique_value(definition, "2026")
+    second, second_meta = strategy.allocate_unique_value(definition, "2026")
+
+    assert strategy.declared_unique_repair_fields(submitted) == ("assetYear",)
+    assert strategy.unique_repair_field(
+        "该板块对应年度的净资产已存在", submitted
+    ) == "assetYear"
+    assert (first, second) == ("2027", "2028")
+    assert (first_meta["sequence"], second_meta["sequence"]) == (1, 2)
+
+
+def test_unique_sequence_is_isolated_by_form_code():
+    constraint = UniqueConstraintSpec(
+        form_code="FORM_A",
+        field_codes=("section", "year"),
+        repair_field="year",
+        message_includes=("已存在",),
+    )
+    strategy = StandardDataStrategy(pool([constraint]), "run", form_code="FORM_B")
+
+    assert strategy.declared_unique_repair_fields({"section": "1", "year": "2026"}) == ()
+    assert strategy.unique_repair_field(
+        "记录已存在", {"section": "1", "year": "2026"}
+    ) == ""
+
+
+def test_global_pool_loads_and_validates_unique_constraint_manifest(tmp_path):
+    (tmp_path / "unique_constraints.json").write_text(
+        json.dumps({"constraints": [{
+            "formCode": "FORM_A",
+            "fieldCodes": ["section", "year"],
+            "repairField": "year",
+            "messageIncludes": ["年度", "已存在"],
+        }]}),
+        encoding="utf-8",
+    )
+
+    loaded = GlobalDataPool.from_directory(tmp_path)
+
+    assert loaded.unique_constraints[0].field_codes == ("section", "year")
+    assert loaded.unique_constraints[0].repair_field == "year"

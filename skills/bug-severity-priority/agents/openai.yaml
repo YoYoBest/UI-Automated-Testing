@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bug Severity Priority"
+  short_description: "Classify bug severity and repair priority consistently"
+  default_prompt: "Use $bug-severity-priority to assess this defect and explain its severity and priority."

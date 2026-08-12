@@ -1,0 +1,77 @@
+[
+  {
+    "sheet": "UI整体",
+    "cases": 5,
+    "reference": false
+  },
+  {
+    "sheet": "权限",
+    "cases": 14,
+    "reference": false
+  },
+  {
+    "sheet": "查询",
+    "cases": 26,
+    "reference": false
+  },
+  {
+    "sheet": "列表",
+    "cases": 28,
+    "reference": false
+  },
+  {
+    "sheet": "新增_原始",
+    "cases": 117,
+    "reference": false
+  },
+  {
+    "sheet": "编辑",
+    "cases": 24,
+    "reference": false
+  },
+  {
+    "sheet": "查看",
+    "cases": 12,
+    "reference": false
+  },
+  {
+    "sheet": "删除",
+    "cases": 5,
+    "reference": false
+  },
+  {
+    "sheet": "流程",
+    "cases": 42,
+    "reference": false
+  },
+  {
+    "sheet": "附件",
+    "cases": 10,
+    "reference": false
+  },
+  {
+    "sheet": "翻页",
+    "cases": 11,
+    "reference": false
+  },
+  {
+    "sheet": "导出",
+    "cases": 11,
+    "reference": false
+  },
+  {
+    "sheet": "导入",
+    "cases": 17,
+    "reference": false
+  },
+  {
+    "sheet": "打印",
+    "cases": 9,
+    "reference": false
+  },
+  {
+    "sheet": "新增",
+    "cases": 121,
+    "reference": true
+  }
+]

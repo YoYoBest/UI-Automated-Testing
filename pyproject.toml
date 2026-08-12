@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ei-ui-smoke"
+version = "0.1.0"
+description = "Independent Playwright smoke tests for ei-parent"
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.52,<2",
+  "pytest>=8,<10",
+  "allure-pytest>=2.16,<3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["smoke: browser smoke test"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

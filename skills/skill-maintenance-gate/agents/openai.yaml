@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill 沉淀强制门禁"
+  short_description: "强制代码变更完成对应 Skill 沉淀或留下可审计的决策记录"
+  default_prompt: "检查当前代码变更是否已同步沉淀到对应 Skill，并执行强制门禁。"

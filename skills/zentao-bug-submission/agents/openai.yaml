@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZenTao Bug Submission"
+  short_description: "Submit verified Allure failures to ZenTao consistently"
+  default_prompt: "Use $zentao-bug-submission to convert verified Allure failures into correctly populated ZenTao bugs."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Smoke Test Data Strategy"
+  short_description: "Manage probe and stable modes, shared data, and collection rules"
+  default_prompt: "Use $smoke-test-data-strategy to select and maintain probe or stable business test data for UI smoke tests."

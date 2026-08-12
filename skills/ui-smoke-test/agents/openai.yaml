@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI Smoke Test"
+  short_description: "Run verified UI saves, detail checks, and Allure reports"
+  default_prompt: "Use $ui-smoke-test to run a UI smoke test with save and detail verification, then produce an accessible Allure report."

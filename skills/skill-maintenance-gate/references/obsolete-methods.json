@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "obsolete_method_patterns": [
+    "compatibility fallback that removes option-label text",
+    "从.*容器.*(?:减去|删除|剔除).*(?:是/否|是、否).*(?:猜|推断|识别).*(?:字段|标签)"
+  ]
+}

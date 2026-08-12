@@ -1,0 +1,11 @@
+{
+  "forms": {
+    "EXAMPLE_FORM": {
+      "formUrl": "https://replace-me/ei-view/#/module/add",
+      "saveButton": "button:has-text('保存'),button:has-text('提交')",
+      "saveApiPattern": "*/api/example/save*",
+      "detailUrlTemplate": "https://replace-me/ei-view/#/module/detail/{businessId}",
+      "successTexts": ["保存成功", "新增成功"]
+    }
+  }
+}

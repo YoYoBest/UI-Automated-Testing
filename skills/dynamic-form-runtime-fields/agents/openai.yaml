@@ -1,0 +1,4 @@
+interface:
+  display_name: "动态表单运行时字段"
+  short_description: "复用非固定和半固定字段渲染读写改造流程"
+  default_prompt: "使用 $dynamic-form-runtime-fields 改造 Vue 表单页面，支持运行时渲染非固定字段和半固定字段。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runtime Module Discovery"
+  short_description: "Discover modules, permissions, nested actions, and source alignment"
+  default_prompt: "Use $runtime-module-discovery to discover EI/FI modules and nested dialog operations, reconcile runtime permissions with version-matched source, and diagnose source mismatches."

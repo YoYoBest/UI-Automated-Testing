@@ -1,0 +1,4 @@
+interface:
+  display_name: "Generic Module CRUD Smoke"
+  short_description: "Run real add, save, business ID, and echo verification workflows"
+  default_prompt: "Use $generic-module-crud-smoke to run and diagnose a real add-save-echo smoke workflow for a selected module."

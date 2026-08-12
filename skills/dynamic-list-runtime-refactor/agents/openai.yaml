@@ -1,0 +1,4 @@
+interface:
+  display_name: "动态列表运行时改造"
+  short_description: "复用尽调动态列表改造模式"
+  default_prompt: "使用 $dynamic-list-runtime-refactor 将另一个 EI 列表页面改造成 UIM 运行时表头和查询条件模式。"

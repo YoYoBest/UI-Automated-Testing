@@ -1,0 +1,22 @@
+{
+  "collections": [
+    {
+      "formCode": "BUILD_PROJ_MAJOR_ADJUSTMENT",
+      "component": "buildProject/before/projectChange/index",
+      "fieldCode": "adjustmentItems",
+      "mode": "selection",
+      "rootSelector": ".adjustment-type-form",
+      "createSelector": ".adjustment-type-item .el-checkbox",
+      "itemSelector": ".adjustment-type-item:has(.adjustment-description)",
+      "minRows": 1,
+      "children": [
+        {
+          "fieldCodeTemplate": "items.{index}.description",
+          "selector": ".adjustment-description textarea",
+          "kind": "textarea",
+          "label": "重大调整情形说明"
+        }
+      ]
+    }
+  ]
+}

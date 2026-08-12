@@ -1,0 +1,10 @@
+{
+  "constraints": [
+    {
+      "formCode": "BUILD_NETASSETS_MAINTAIL",
+      "fieldCodes": ["belongSection", "assetYear"],
+      "repairField": "assetYear",
+      "messageIncludes": ["板块", "年度", "已存在"]
+    }
+  ]
+}

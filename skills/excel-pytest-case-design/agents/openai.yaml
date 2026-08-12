@@ -1,0 +1,4 @@
+interface:
+  display_name: "Excel Pytest 用例设计"
+  short_description: "将 Excel 人工用例转换为可维护的 pytest 参数化数据"
+  default_prompt: "Use $excel-pytest-case-design to design or review Excel cases for pytest parameterization."

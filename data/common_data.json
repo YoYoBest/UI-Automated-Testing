@@ -1,0 +1,28 @@
+{
+  "generators": {
+    "mobile": {"prefixes": ["138", "139", "188"]},
+    "email": {"domain": "example.test"},
+    "creditCode": {"registrationAuthority": "91", "organizationCodePrefix": "320500"},
+    "amount": {"min": 10000, "max": 1000000, "scale": 2},
+    "percentage": {"min": 1, "max": 100, "scale": 2},
+    "enterpriseName": {"prefix": "UI自动化测试企业"},
+    "businessIdentifier": {"digits": 16},
+    "text": {"prefix": "UI自动化"}
+  },
+  "candidatePools": {
+    "currency": ["人民币"],
+    "boolean": ["是", "否"]
+  },
+  "uploads": {
+    "defaultFile": "D:/00 常用/金融项目/附件/UI自动化附件-cat.jpg"
+  },
+  "fieldMappings": {
+    "mobile": ["mobile", "phone", "telephone", "contactPhone", "联系电话", "手机号"],
+    "email": ["email", "邮箱"],
+    "creditCode": ["creditCode", "socialCreditCode", "unifiedSocialCreditCode", "统一社会信用代码"],
+    "enterpriseName": ["enterpriseName", "companyName", "partnerName", "企业名称", "公司名称", "合伙人名称"],
+    "businessIdentifier": ["itemId", "ID"],
+    "percentage": ["percent", "percentage", "ratio", "rate", "比例", "百分比"],
+    "amount": ["amount", "money", "capital", "金额", "出资", "投资额"]
+  }
+}

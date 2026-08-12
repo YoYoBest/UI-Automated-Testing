@@ -1,0 +1,20 @@
+{
+  "forms": {
+    "EXAMPLE_FORM": {
+      "list": {
+        "method": "POST",
+        "url": "/api/example/pageList",
+        "body": {"pageNum": 1, "pageSize": 20},
+        "recordsPath": "data.records"
+      },
+      "detail": {
+        "method": "GET",
+        "url": "/api/example/detail",
+        "idParam": "id",
+        "idFields": ["id", "businessId"],
+        "dataPath": "data"
+      },
+      "allowedFields": ["enterpriseName", "contactPhone", "amount", "status"]
+    }
+  }
+}
