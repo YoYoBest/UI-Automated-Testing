@@ -42,6 +42,41 @@ def pool(unique_constraints=()):
     )
 
 
+def test_unique_key_reservation_is_atomic_alias_aware_and_scope_isolated():
+    constraint = UniqueConstraintSpec(
+        form_code="BUILD_NETASSETS_MAINTAIL",
+        field_codes=("belongSection", "assetYear"),
+        repair_field="assetYear",
+        message_includes=("已存在",),
+    )
+    first = StandardDataStrategy(
+        pool([constraint]), "run-a", form_code=constraint.form_code
+    )
+    second = StandardDataStrategy(
+        pool([constraint]), "run-b", form_code=constraint.form_code
+    )
+    key_by_code_and_name = (
+        frozenset({"1", "四川板块"}), frozenset({"2030"}),
+    )
+    key_by_name = (frozenset({"四川板块"}), frozenset({"2030"}))
+
+    assert first.reserve_unique_key_if_available(
+        constraint, key_by_code_and_name, page_scope="https://one/list"
+    )
+    assert not second.reserve_unique_key_if_available(
+        constraint, key_by_name, page_scope="https://one/list"
+    )
+    assert second.reserve_unique_key_if_available(
+        constraint, key_by_name, page_scope="https://two/list"
+    )
+    first.release_unique_key(
+        constraint, key_by_code_and_name, page_scope="https://one/list"
+    )
+    assert second.reserve_unique_key_if_available(
+        constraint, key_by_name, page_scope="https://one/list"
+    )
+
+
 def field(code, name="", field_type="ElInput-TEXT"):
     return normalize_field({"fieldCode": code, "fieldName": name, "fieldType": field_type}, "test")
 
@@ -100,6 +135,20 @@ def test_mode_switch_rejects_unknown_mode():
         pass
     else:
         raise AssertionError("unknown mode must fail")
+
+
+def test_strategy_uses_one_launcher_run_id_with_distinct_target_sequences(monkeypatch):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "20260812230000123456_ab12cd34")
+    monkeypatch.setenv("EI_AUTOMATION_TARGET_SEQUENCE", "7")
+    first = create_data_strategy("standard", pool(), "FORM")
+    monkeypatch.setenv("EI_AUTOMATION_TARGET_SEQUENCE", "8")
+    second = create_data_strategy("standard", pool(), "FORM")
+
+    assert first.generator.run_id == "20260812230000123456_ab12cd34_7"
+    assert second.generator.run_id == "20260812230000123456_ab12cd34_8"
+    assert first.value_for(field("name", "名称"), 1) != second.value_for(
+        field("name", "名称"), 1
+    )
 
 
 def test_strategy_repairs_value_only_for_supported_validation_message():

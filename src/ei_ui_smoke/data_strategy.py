@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 from threading import Lock
 
@@ -13,7 +14,7 @@ class DataStrategy:
     form_code: str
     _unique_reservation_lock = Lock()
     _unique_reservations: dict[
-        tuple[str, tuple[str, ...]], set[tuple[str, ...]]
+        tuple[str, str, tuple[str, ...]], set[tuple[frozenset[str], ...]]
     ] = {}
 
     def value_for(self, field: FieldDefinition, index: int) -> Any:
@@ -54,20 +55,91 @@ class DataStrategy:
         return matches[0] if len(matches) == 1 else None
 
     @staticmethod
-    def _normalized_unique_key(values: tuple[Any, ...]) -> tuple[str, ...]:
-        return tuple(str(value or "").strip() for value in values)
+    def _normalized_unique_key(
+        values: tuple[Any, ...],
+    ) -> tuple[frozenset[str], ...]:
+        normalized = []
+        for value in values:
+            raw_values = (
+                value
+                if isinstance(value, (list, tuple, set, frozenset))
+                else (value,)
+            )
+            aliases = frozenset(
+                str(item or "").strip().lower()
+                for item in raw_values
+                if str(item or "").strip()
+            )
+            normalized.append(aliases)
+        return tuple(normalized)
 
-    def unique_key_is_reserved(self, spec, values: tuple[Any, ...]) -> bool:
-        bucket = (spec.form_code, tuple(spec.field_codes))
+    @staticmethod
+    def _unique_keys_conflict(
+        left: tuple[frozenset[str], ...],
+        right: tuple[frozenset[str], ...],
+    ) -> bool:
+        return len(left) == len(right) and all(
+            left_aliases & right_aliases
+            for left_aliases, right_aliases in zip(left, right)
+        )
+
+    @staticmethod
+    def _unique_reservation_bucket(
+        spec, page_scope: str,
+    ) -> tuple[str, str, tuple[str, ...]]:
+        return (
+            str(page_scope or "").strip().lower(),
+            spec.form_code,
+            tuple(spec.field_codes),
+        )
+
+    def unique_key_is_reserved(
+        self, spec, values: tuple[Any, ...], *, page_scope: str = "",
+    ) -> bool:
+        bucket = self._unique_reservation_bucket(spec, page_scope)
         normalized = self._normalized_unique_key(values)
         with self._unique_reservation_lock:
-            return normalized in self._unique_reservations.get(bucket, set())
+            return any(
+                self._unique_keys_conflict(normalized, existing)
+                for existing in self._unique_reservations.get(bucket, set())
+            )
 
-    def reserve_unique_key(self, spec, values: tuple[Any, ...]) -> None:
-        bucket = (spec.form_code, tuple(spec.field_codes))
+    def reserve_unique_key(
+        self, spec, values: tuple[Any, ...], *, page_scope: str = "",
+    ) -> None:
+        bucket = self._unique_reservation_bucket(spec, page_scope)
         normalized = self._normalized_unique_key(values)
         with self._unique_reservation_lock:
             self._unique_reservations.setdefault(bucket, set()).add(normalized)
+
+    def reserve_unique_key_if_available(
+        self, spec, values: tuple[Any, ...], *, page_scope: str = "",
+    ) -> bool:
+        """Atomically claim one composite key across strategy instances."""
+        bucket = self._unique_reservation_bucket(spec, page_scope)
+        normalized = self._normalized_unique_key(values)
+        with self._unique_reservation_lock:
+            reservations = self._unique_reservations.setdefault(bucket, set())
+            if any(
+                self._unique_keys_conflict(normalized, existing)
+                for existing in reservations
+            ):
+                return False
+            reservations.add(normalized)
+            return True
+
+    def release_unique_key(
+        self, spec, values: tuple[Any, ...], *, page_scope: str = "",
+    ) -> None:
+        bucket = self._unique_reservation_bucket(spec, page_scope)
+        normalized = self._normalized_unique_key(values)
+        with self._unique_reservation_lock:
+            reservations = self._unique_reservations.get(bucket)
+            if reservations is None:
+                return
+            reservations.discard(normalized)
+            if not reservations:
+                self._unique_reservations.pop(bucket, None)
 
     def unique_repair_field(
         self, message: str, submitted: dict[str, Any],
@@ -176,6 +248,11 @@ class StandardDataStrategy(ProbeDataStrategy):
 
 
 def create_data_strategy(mode: str, pool: GlobalDataPool, form_code: str, run_id: str = "") -> DataStrategy:
+    if not run_id:
+        run_id = os.getenv("EI_AUTOMATION_RUN_ID", "").strip()
+        target_sequence = os.getenv("EI_AUTOMATION_TARGET_SEQUENCE", "").strip()
+        if run_id and target_sequence:
+            run_id = f"{run_id}_{target_sequence}"
     normalized = (mode or "probe").strip().lower()
     if normalized == "probe":
         return ProbeDataStrategy(pool, run_id, form_code=form_code)

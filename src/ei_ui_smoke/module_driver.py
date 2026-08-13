@@ -10,10 +10,13 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .dom import is_semantic_numeric_field, scan_dom_fields
 from .dynamic_collections import DynamicCollectionSpec
+from .failure_evidence import capture_failure_evidence
 from .interactions import FieldInteractor
 from .models import DomField, FieldDefinition, ResolvedField
 from .verification import BUSINESS_ID_KEYS, extract_business_id
@@ -128,6 +131,21 @@ class _RequestContextDetailResponse:
         return str(text() if callable(text) else text or "")
 
 
+class _UniqueListReplayResponse:
+    """Expose a browser-context fetch result through the response contract."""
+
+    def __init__(self, result: dict[str, Any], request_url: str):
+        self.ok = bool(result.get("ok"))
+        self.status = int(result.get("status") or 0)
+        self.url = str(result.get("url") or request_url)
+        self._body = result.get("body")
+
+    def json(self) -> Any:
+        if isinstance(self._body, (dict, list)):
+            return self._body
+        raise ValueError("response body is not JSON")
+
+
 @dataclass(slots=True)
 class FieldCompletionReport:
     not_located: list[str]
@@ -163,6 +181,8 @@ class AttachmentCompletionReport:
     pending: int = 0
     requests_observed: int = 0
     errors: list[str] = dataclass_field(default_factory=list)
+    classification: str = ""
+    lifecycle: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -176,6 +196,9 @@ class AttachmentLifecycleTracker:
     responses: list[Any] = dataclass_field(default_factory=list)
     validated_responses: set[int] = dataclass_field(default_factory=set)
     failures: list[str] = dataclass_field(default_factory=list)
+    events: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    backend_pending: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    final_classification: str = ""
     callbacks: dict[str, Callable] = dataclass_field(default_factory=dict)
     last_activity: float = dataclass_field(default_factory=time.monotonic)
     enabled: bool = False
@@ -227,9 +250,73 @@ class ModuleSmokeDriver:
         self._nested_evidence: list[dict[str, str]] = []
         self._submitted_display_values: dict[str, tuple[Any, str]] = {}
         self._collection_submission_codes: set[str] = set()
+        self._unique_list_responses: list[Any] = []
+        self._unique_list_listener = None
+        self._unique_occupied_snapshot: dict[tuple[Any, ...], list[Any]] = {}
+        self._pending_unique_reservations: list[tuple[Any, tuple[Any, ...], str]] = []
         self.automation_record_registry = automation_record_registry
 
+    def prepare_unique_constraint_evidence(self) -> None:
+        """Capture a complete, authenticated occupied-key snapshot before Add."""
+        specs = self._declared_unique_constraints()
+        if not any(spec.list_url_includes for spec in specs):
+            return
+        self._stop_unique_list_capture()
+        self._unique_list_responses = []
+        self._unique_occupied_snapshot = {}
+        self._start_unique_list_capture()
+        reload_page = getattr(self.page, "reload", None)
+        if not callable(reload_page):
+            self._stop_unique_list_capture()
+            raise AssertionError("组合唯一约束缺少列表证据：当前页面不能刷新列表")
+        try:
+            try:
+                reload_page(wait_until="domcontentloaded")
+            except TypeError:
+                reload_page()
+            self._wait_for_unique_list_response(specs)
+        finally:
+            self._stop_unique_list_capture()
+        for spec in specs:
+            if not spec.list_url_includes:
+                continue
+            matching = [
+                response for response in self._unique_list_responses
+                if self._response_matches_unique_list(response, spec)
+            ]
+            if not matching:
+                raise AssertionError(
+                    f"组合唯一约束没有捕获本轮列表响应：{spec.form_code}"
+                )
+            self._unique_occupied_snapshot[
+                self._unique_spec_key(spec)
+            ] = self._occupied_unique_keys_from_response(matching[-1], spec)
+
+    def bind_page(self, page) -> None:
+        """Move the driver to a recovered Page without retaining stale evidence."""
+        old_page = getattr(self, "page", None)
+        if page is old_page:
+            return
+        self.release_pending_unique_reservations()
+        self._stop_unique_list_capture(page=old_page)
+        self._unique_list_responses = []
+        self._unique_occupied_snapshot = {}
+        self.page = page
+        interactor = getattr(self, "interactor", None)
+        if interactor is not None:
+            interactor.page = page
+        self._common_form_scope = None
+
     def run(self, *, provision_only: bool = False) -> ModuleSmokeResult:
+        try:
+            result = self._run_create(provision_only=provision_only)
+        except Exception:
+            self.release_pending_unique_reservations()
+            raise
+        self.commit_pending_unique_reservations()
+        return result
+
+    def _run_create(self, *, provision_only: bool = False) -> ModuleSmokeResult:
         # Detail actions such as Edit do not themselves require an Add button,
         # but their isolated parent-data provisioner always does.  Do not let
         # the action's EI_REQUIRE_ADD setting turn that provisioner into a
@@ -243,6 +330,7 @@ class ModuleSmokeDriver:
         self._submitted_display_values = {}
         self._collection_submission_codes = set()
         automation_registry_scope = self._automation_registry_scope()
+        self.prepare_unique_constraint_evidence()
         add = self._wait_for_add_button()
         add.click()
         scope = self._wait_for_form_scope()
@@ -292,6 +380,8 @@ class ModuleSmokeDriver:
         save_response = self._find_save_response(responses, submitted)
         if save_response is None:
             raise AssertionError("保存后没有捕获到新增/保存接口响应")
+        self._assert_successful_save_response(save_response)
+        self.commit_pending_unique_reservations()
         return self.verify_saved_record(
             responses,
             save_response,
@@ -301,6 +391,20 @@ class ModuleSmokeDriver:
             created_by_automation=True,
             automation_registry_scope=automation_registry_scope,
         )
+
+    def _assert_successful_save_response(self, response) -> None:
+        if not bool(getattr(response, "ok", False)):
+            raise AssertionError(
+                f"保存接口失败：HTTP {getattr(response, 'status', 0)} "
+                f"{getattr(response, 'url', '')}"
+            )
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        except Exception:
+            body = response.text()
+        self._assert_business_success(body)
 
     def verify_saved_record(
         self,
@@ -371,6 +475,11 @@ class ModuleSmokeDriver:
             synchronize_support=True,
         )
         echo_values = list(record_markers)
+        display_identity_values = (
+            self._delete_display_identity_values(submitted, [])
+            if business_id and not echo_values
+            else []
+        )
         # An edit starts from an already-associated detail record.  Its update
         # response may deliberately return no record data, so use the detail
         # and reopened-edit readback below as the identity proof instead.
@@ -499,18 +608,33 @@ class ModuleSmokeDriver:
             )
         if detail_body is None:
             if associated_detail_body is None:
-                self._open_detail(echo_values, business_id)
+                self._open_detail(
+                    echo_values,
+                    business_id,
+                    **(
+                        {"display_identity_values": display_identity_values}
+                        if display_identity_values else {}
+                    ),
+                )
             else:
                 self._open_detail(
                     echo_values,
                     business_id,
                     response_payload=associated_detail_body,
+                    **(
+                        {"display_identity_values": display_identity_values}
+                        if display_identity_values else {}
+                    ),
                 )
         else:
             self._open_detail(
                 echo_values,
                 business_id,
                 response_payload=detail_body,
+                **(
+                    {"display_identity_values": display_identity_values}
+                    if display_identity_values else {}
+                ),
             )
         if detail_body is None:
             detail_response = self._find_detail_response(
@@ -1466,7 +1590,7 @@ class ModuleSmokeDriver:
         return None
 
     def _registered_automation_records(self) -> list[dict[str, Any]]:
-        """Read only locally persisted evidence created by this automation."""
+        """Read registry records whose authoritative scope/ID key is intact."""
         path = getattr(self, "automation_record_registry", None)
         if path is None or not path.is_file():
             return []
@@ -1478,10 +1602,18 @@ class ModuleSmokeDriver:
         if not isinstance(records, list):
             return []
         scope = self._automation_registry_scope()
-        return [
-            record for record in records
-            if isinstance(record, dict) and record.get("page_scope") == scope
-        ]
+        seen_keys: set[tuple[str, str]] = set()
+        valid: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict) or record.get("page_scope") != scope:
+                continue
+            business_id = self._normalize_record_text(record.get("business_id"))
+            key = (scope, business_id)
+            if not business_id or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            valid.append(record)
+        return valid
 
     def _automation_registry_scope(self, page_url: str = "") -> str:
         page_url = str(page_url or getattr(self.page, "url", "") or "")
@@ -1572,9 +1704,14 @@ class ModuleSmokeDriver:
         if not normalized_scope:
             return
         markers = self._automation_owned_markers(list(result.record_markers))
+        run_id = self._automation_registry_run_id(markers)
         entry = {
+            "schema_version": 2,
+            "registry_key": f"{normalized_scope}::{result.business_id}",
             "business_id": str(result.business_id),
             "page_scope": normalized_scope,
+            "run_id": run_id,
+            "sequence": self._automation_registry_sequence(markers),
             "record_markers": markers,
             "submitted": self._automation_registry_display_values(
                 result.submitted or {}
@@ -1594,6 +1731,20 @@ class ModuleSmokeDriver:
         )
         if not isinstance(existing_records, list):
             existing_records = []
+        conflicting_marker_ids = sorted({
+            self._normalize_record_text(record.get("business_id"))
+            for record in existing_records
+            if isinstance(record, dict)
+            and record.get("page_scope") == normalized_scope
+            and markers
+            and set(markers).intersection(
+                self._automation_owned_markers(record.get("record_markers") or [])
+            )
+            and self._normalize_record_text(record.get("business_id"))
+            != entry["business_id"]
+        })
+        if conflicting_marker_ids:
+            entry["marker_conflict_business_ids"] = conflicting_marker_ids
         records = [
             record for record in existing_records
             if not isinstance(record, dict)
@@ -1615,6 +1766,23 @@ class ModuleSmokeDriver:
         except OSError:
             # Failure to maintain local cleanup evidence must only disable reuse.
             return
+
+    @staticmethod
+    def _automation_registry_run_id(markers: Iterable[str]) -> str:
+        """Derive a readable run identity from this run's generated markers."""
+        for marker in markers:
+            match = re.search(r"(?:AUTO_|UI自动化_)(\d{14,})(?:_|$)", str(marker))
+            if match:
+                return match.group(1)
+        return ""
+
+    @staticmethod
+    def _automation_registry_sequence(markers: Iterable[str]) -> int | None:
+        for marker in markers:
+            match = re.search(r"_(\d+)(?:_S\d+)?$", str(marker))
+            if match:
+                return int(match.group(1))
+        return None
 
     def _forget_automation_owned_record(
         self,
@@ -2065,7 +2233,35 @@ class ModuleSmokeDriver:
             cls._normalize_record_text(value) for value in actual_values
         }
 
-    def _save_with_validation_repairs(self, scope, save, responses, submitted: dict[str, Any]) -> None:
+    def _save_with_validation_repairs(
+        self,
+        scope,
+        save,
+        responses,
+        submitted: dict[str, Any],
+        *,
+        protected_codes: set[str] | None = None,
+        allow_unique_repair: bool = True,
+    ) -> None:
+        self._save_with_validation_repairs_inner(
+            scope,
+            save,
+            responses,
+            submitted,
+            protected_codes=protected_codes,
+            allow_unique_repair=allow_unique_repair,
+        )
+
+    def _save_with_validation_repairs_inner(
+        self,
+        scope,
+        save,
+        responses,
+        submitted: dict[str, Any],
+        *,
+        protected_codes: set[str] | None = None,
+        allow_unique_repair: bool = True,
+    ) -> None:
         max_attempts = max(1, int(os.getenv("EI_VALIDATION_SAVE_ATTEMPTS", "3")))
         for attempt in range(1, max_attempts + 1):
             self._capture_submitted_display_values(submitted, scope)
@@ -2098,7 +2294,11 @@ class ModuleSmokeDriver:
                             body.get("message") or body.get("msg") or body
                         ) if isinstance(body, dict) else str(body)
                         repaired = self._repair_business_validation_message(
-                            message, submitted, attempt
+                            message,
+                            submitted,
+                            attempt,
+                            protected_codes=protected_codes,
+                            allow_unique_repair=allow_unique_repair,
                         )
                         if repaired and attempt < max_attempts:
                             submitted.update(repaired)
@@ -2120,10 +2320,23 @@ class ModuleSmokeDriver:
                 raise AssertionError(f"新增保存未完成：{detail}")
 
     def _repair_business_validation_message(
-        self, message: str, submitted: dict[str, Any], attempt: int,
+        self,
+        message: str,
+        submitted: dict[str, Any],
+        attempt: int,
+        *,
+        protected_codes: set[str] | None = None,
+        retryable_unique_codes: set[str] | None = None,
+        allow_unique_repair: bool = True,
     ) -> dict[str, Any]:
         if not hasattr(self.data_strategy, "repair_value"):
             return {}
+        if not allow_unique_repair or self._is_edit_operation():
+            return {}
+        protected = {str(code).lower() for code in (protected_codes or set())}
+        retryable_unique = {
+            str(code).lower() for code in (retryable_unique_codes or set())
+        }
         normalized = self._normalize_label(message)
         preferred_code = ""
         preferred_resolver = getattr(
@@ -2131,13 +2344,49 @@ class ModuleSmokeDriver:
         )
         if callable(preferred_resolver):
             preferred_code = preferred_resolver(message, submitted)
+        spec = self._declared_unique_constraint_for_message(message, submitted)
+        print(
+            "COMMON_UNIQUE_REPAIR_DECISION "
+            f"form={getattr(self.data_strategy, 'form_code', '')} "
+            f"declared_match={spec is not None} "
+            f"submitted_codes={sorted(str(code) for code in submitted)} "
+            f"submitted_key_fields={tuple(getattr(spec, 'field_codes', ())) if spec else ()} "
+            f"protected={sorted(protected)} "
+            f"retryable={sorted(retryable_unique)}",
+            flush=True,
+        )
+        if spec is not None:
+            self._release_pending_unique_reservations_for_spec(spec)
+            # A duplicate response is explicit evidence that the current Add
+            # target is invalid. It may be retried only when this transaction
+            # opted that code in and the constraint declares it repairable.
+            unique_protected = protected - retryable_unique
+            candidates = self._constraint_repair_candidates(spec, unique_protected)
+            if retryable_unique:
+                candidates = tuple(
+                    code for code in candidates
+                    if str(code).lower() in retryable_unique
+                )
+            return self._repair_declared_unique_constraint(
+                spec,
+                candidates,
+                submitted,
+                message=message,
+                source="saveResponse",
+                protected_codes=unique_protected,
+            )
         candidates = (
-            [field for field in self.source_fields if field[0] == preferred_code]
+            [
+                field for field in self.source_fields
+                if field[0] == preferred_code
+                and str(field[0]).lower() not in protected
+            ]
             if preferred_code
             else [
                 field for field in self.source_fields
                 if field[0].lower() in message.lower()
                 or self._normalize_label(field[1]) in normalized
+                if str(field[0]).lower() not in protected
             ]
         )
         if preferred_code and not candidates:
@@ -2145,15 +2394,21 @@ class ModuleSmokeDriver:
                 (dom.field_code, dom.label, dom.qcc_remote)
                 for dom in scan_dom_fields(self.page)
                 if dom.field_code == preferred_code
+                and str(dom.field_code).lower() not in protected
             ]
         if not candidates:
             candidates = [
                 (dom.field_code, dom.label, dom.qcc_remote)
                 for dom in scan_dom_fields(self.page)
                 if dom.label and self._normalize_label(dom.label) in normalized
+                and str(dom.field_code).lower() not in protected
             ]
         if not candidates and any(token in message for token in ("已存在", "重复", "不能重复")):
             candidates = self._duplicate_field_candidates(self.source_fields, submitted)
+        candidates = [
+            field for field in candidates
+            if str(field[0]).lower() not in protected
+        ]
         for code, label, *metadata in candidates:
             definition, dom = self._definition_for_validation_issue({
                 "message": message, "code": code, "label": label, "selector": "",
@@ -2200,78 +2455,673 @@ class ModuleSmokeDriver:
         *,
         exclude_codes: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Allocate type-safe values for declared composite keys before create."""
+        """Allocate an unoccupied composite key before a physical create."""
+        if self._is_edit_operation():
+            return {}
+        specs = self._declared_unique_constraints(submitted)
+        if not specs:
+            return {}
+        prepared: dict[str, Any] = {}
+        protected = {str(code).lower() for code in (exclude_codes or set())}
+        for spec in specs:
+            prepared.update(self._repair_declared_unique_constraint(
+                spec,
+                self._constraint_repair_candidates(spec, protected),
+                {**submitted, **prepared},
+                source="declaredUniqueConstraint",
+                protected_codes=protected,
+                scope=scope,
+            ))
+        return prepared
+
+    def _declared_unique_constraints(
+        self, submitted: dict[str, Any] | None = None,
+    ) -> tuple[Any, ...]:
+        strategy = getattr(self, "data_strategy", None)
         resolver = getattr(
-            self.data_strategy, "declared_unique_repair_fields", None
+            strategy, "declared_unique_constraints", None
         )
-        allocator = getattr(self.data_strategy, "allocate_unique_value", None)
-        if not callable(resolver) or not callable(allocator):
-            return {}
-        excluded = {str(code).lower() for code in (exclude_codes or set())}
-        target_codes = [
-            code for code in resolver(submitted)
-            if str(code).lower() not in excluded
+        if not callable(resolver):
+            return ()
+        return tuple(resolver(submitted))
+
+    def _declared_unique_constraint_for_message(
+        self, message: str, submitted: dict[str, Any],
+    ):
+        resolver = getattr(
+            self.data_strategy, "declared_unique_constraint_for_message", None
+        )
+        return resolver(message, submitted) if callable(resolver) else None
+
+    @staticmethod
+    def _is_edit_operation() -> bool:
+        action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
+        return action.startswith(("编辑", "修改"))
+
+    def _track_unique_reservation(
+        self, spec, key: tuple[Any, ...], page_scope: str,
+    ) -> None:
+        pending = getattr(self, "_pending_unique_reservations", None)
+        if not isinstance(pending, list):
+            pending = self._pending_unique_reservations = []
+        pending.append((spec, key, page_scope))
+
+    def commit_pending_unique_reservations(self) -> None:
+        pending = getattr(self, "_pending_unique_reservations", None)
+        if isinstance(pending, list):
+            pending.clear()
+
+    def _release_pending_unique_reservations_for_spec(self, target_spec) -> None:
+        release = getattr(
+            getattr(self, "data_strategy", None), "release_unique_key", None
+        )
+        pending = getattr(self, "_pending_unique_reservations", None)
+        if not isinstance(pending, list):
+            return
+        retained = []
+        for spec, key, page_scope in pending:
+            if spec == target_spec:
+                if callable(release):
+                    release(spec, key, page_scope=page_scope)
+            else:
+                retained.append((spec, key, page_scope))
+        pending[:] = retained
+
+    def release_pending_unique_reservations(self) -> None:
+        release = getattr(
+            getattr(self, "data_strategy", None), "release_unique_key", None
+        )
+        if callable(release):
+            for spec, key, page_scope in reversed(
+                getattr(self, "_pending_unique_reservations", [])
+            ):
+                release(spec, key, page_scope=page_scope)
+        pending = getattr(self, "_pending_unique_reservations", None)
+        if isinstance(pending, list):
+            pending.clear()
+
+    @staticmethod
+    def _constraint_repair_candidates(
+        spec, protected_codes: set[str],
+    ) -> tuple[str, ...]:
+        return tuple(
+            code for code in (spec.repair_field, *spec.alternate_repair_fields)
+            if str(code).lower() not in protected_codes
+        )
+
+    def _start_unique_list_capture(self) -> None:
+        if getattr(self, "_unique_list_listener", None) is not None:
+            return
+        if not isinstance(getattr(self, "_unique_list_responses", None), list):
+            self._unique_list_responses = []
+
+        def capture(response) -> None:
+            self._unique_list_responses.append(response)
+
+        self._unique_list_listener = capture
+        on = getattr(self.page, "on", None)
+        if callable(on):
+            on("response", capture)
+
+    def _stop_unique_list_capture(self, *, page=None) -> None:
+        listener = getattr(self, "_unique_list_listener", None)
+        if listener is None:
+            return
+        target_page = page if page is not None else getattr(self, "page", None)
+        try:
+            remove = getattr(target_page, "remove_listener", None)
+            if callable(remove):
+                remove("response", listener)
+            else:
+                off = getattr(target_page, "off", None)
+                if callable(off):
+                    off("response", listener)
+        finally:
+            self._unique_list_listener = None
+
+    @staticmethod
+    def _unique_spec_key(spec) -> tuple[Any, ...]:
+        return (
+            str(spec.form_code or "").strip().lower(),
+            tuple(str(code or "").strip().lower() for code in spec.field_codes),
+        )
+
+    def _wait_for_unique_list_response(
+        self, specs: tuple[Any, ...], *, response_start: int = 0,
+    ) -> None:
+        deadline = time.monotonic() + max(
+            1, int(os.getenv("EI_UNIQUE_LIST_TIMEOUT_MS", "10000"))
+        ) / 1000
+        while time.monotonic() < deadline:
+            if all(
+                any(self._response_matches_unique_list(response, spec)
+                    for response in self._unique_list_responses[response_start:])
+                for spec in specs if spec.list_url_includes
+            ):
+                return
+            wait = getattr(self.page, "wait_for_timeout", None)
+            if callable(wait):
+                wait(100)
+            else:
+                break
+        missing = [
+            spec.form_code for spec in specs
+            if spec.list_url_includes and not any(
+                self._response_matches_unique_list(response, spec)
+                for response in self._unique_list_responses[response_start:]
+            )
         ]
-        if not target_codes:
-            return {}
+        if missing:
+            raise AssertionError(
+                "组合唯一约束缺少真实列表响应，无法证明可用组合："
+                + ", ".join(missing)
+            )
+
+    @staticmethod
+    def _response_matches_unique_list(response, spec) -> bool:
+        url = str(getattr(response, "url", "") or "").lower()
+        return bool(url) and any(
+            token.lower() in url for token in spec.list_url_includes
+        )
+
+    @staticmethod
+    def _payload_path(payload: Any, path: str) -> Any:
+        current = payload
+        for part in str(path or "").split("."):
+            if not part:
+                continue
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    @classmethod
+    def _unique_record_envelope(cls, payload: Any, spec) -> tuple[list[dict[str, Any]], Any]:
+        for path in spec.record_paths:
+            value = cls._payload_path(payload, path)
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                parent_path = path.rsplit(".", 1)[0] if "." in path else ""
+                envelope = cls._payload_path(payload, parent_path) if parent_path else payload
+                return list(value), envelope
+        return [], None
+
+    @classmethod
+    def _records_from_unique_payload(cls, payload: Any, spec) -> list[dict[str, Any]]:
+        return cls._unique_record_envelope(payload, spec)[0]
+
+    @staticmethod
+    def _request_payload_dict(request) -> dict[str, Any]:
+        payload = getattr(request, "post_data_json", None)
+        try:
+            payload = payload() if callable(payload) else payload
+        except Exception:
+            payload = None
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _request_pagination_value(
+        cls, request, keys: tuple[str, ...],
+    ) -> int | None:
+        payload = cls._request_payload_dict(request)
+        query = dict(parse_qsl(urlsplit(str(getattr(request, "url", ""))).query))
+        for values in (payload, query):
+            for key in keys:
+                value = values.get(key)
+                if str(value or "").isdigit() and int(value) > 0:
+                    return int(value)
+        return None
+
+    @staticmethod
+    def _pagination_total(envelope: Any) -> int | None:
+        if not isinstance(envelope, dict):
+            return None
+        for key in ("total", "totalCount", "recordsTotal"):
+            value = envelope.get(key)
+            if str(value or "").isdigit():
+                return int(value)
+        return None
+
+    @classmethod
+    def _unique_record_identity(cls, record: dict[str, Any], spec) -> tuple[Any, ...]:
+        business_id = cls._direct_record_business_id(record)
+        if business_id:
+            return ("id", business_id)
+        key = tuple(
+            frozenset(cls._record_alias_values(record, spec.aliases_for(code)))
+            for code in spec.field_codes
+        )
+        if not all(key):
+            raise AssertionError(
+                "组合唯一约束列表记录缺少业务 ID 或完整键字段，"
+                "无法证明分页数据完整"
+            )
+        return ("composite", *key)
+
+    @classmethod
+    def _deduplicate_unique_records(
+        cls, records: list[dict[str, Any]], spec, *, total: int,
+    ) -> list[dict[str, Any]]:
+        deduplicated: list[dict[str, Any]] = []
+        identities = set()
+        for record in records:
+            identity = cls._unique_record_identity(record, spec)
+            if identity in identities:
+                raise AssertionError(
+                    "组合唯一约束分页存在重复业务记录，无法证明占用快照完整"
+                )
+            identities.add(identity)
+            deduplicated.append(record)
+        if len(deduplicated) != total:
+            raise AssertionError(
+                f"组合唯一约束分页读取不完整：{len(deduplicated)}/{total}"
+            )
+        return deduplicated
+
+    def _complete_unique_list_records(self, response, spec) -> list[dict[str, Any]]:
+        if not bool(getattr(response, "ok", False)):
+            raise AssertionError(
+                f"组合唯一约束列表接口失败：{getattr(response, 'url', '')}"
+            )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise AssertionError("组合唯一约束列表响应不是有效 JSON") from exc
+        records, envelope = self._unique_record_envelope(payload, spec)
+        total = self._pagination_total(envelope)
+        request = getattr(response, "request", None)
+        if total is None:
+            raise AssertionError(
+                "组合唯一约束列表响应缺少总数，无法证明分页数据完整"
+            )
+        if len(records) >= total:
+            return self._deduplicate_unique_records(records, spec, total=total)
+        page_size = self._request_pagination_value(
+            request, ("pageSize", "size", "limit", "rows")
+        )
+        if page_size is None:
+            raise AssertionError(
+                "组合唯一约束列表存在分页但请求缺少 pageSize，无法完整读取"
+            )
+        required_pages = (total + page_size - 1) // page_size
+        max_pages = max(1, int(os.getenv("EI_UNIQUE_LIST_MAX_PAGES", "100")))
+        if required_pages > max_pages:
+            raise AssertionError(
+                f"组合唯一约束列表需要读取 {required_pages} 页，"
+                f"超过安全上限 {max_pages}"
+            )
+        all_records = []
+        for page_number in range(1, required_pages + 1):
+            replay = self._replay_unique_list_request(response, page_number)
+            if replay is None:
+                raise AssertionError("组合唯一约束分页请求未返回响应")
+            if not bool(getattr(replay, "ok", False)):
+                raise AssertionError(
+                    f"组合唯一约束分页接口失败：HTTP {getattr(replay, 'status', 0)} "
+                    f"{getattr(replay, 'url', '')}"
+                )
+            try:
+                replay_payload = replay.json()
+            except Exception as exc:
+                raise AssertionError("组合唯一约束分页响应不是有效 JSON") from exc
+            page_records, replay_envelope = self._unique_record_envelope(
+                replay_payload, spec
+            )
+            replay_total = self._pagination_total(replay_envelope)
+            if replay_total != total:
+                raise AssertionError(
+                    "组合唯一约束分页期间总数变化，无法证明占用快照完整"
+                )
+            if not page_records:
+                raise AssertionError("组合唯一约束分页返回空记录，无法证明占用快照完整")
+            all_records.extend(page_records)
+        return self._deduplicate_unique_records(all_records, spec, total=total)
+
+    def _replay_unique_list_request(self, response, page_number: int):
+        request = getattr(response, "request", None)
+        if request is None:
+            return None
+        request_context = getattr(self.page, "request", None)
+        if request_context is None:
+            return None
+        url = str(getattr(request, "url", "") or getattr(response, "url", ""))
+        payload = None
+        try:
+            payload = getattr(request, "post_data_json", None)
+            payload = payload() if callable(payload) else payload
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            body = dict(payload)
+            page_key = next(
+                (key for key in ("pageNum", "currPage", "page", "current") if key in body),
+                "pageNum",
+            )
+            body[page_key] = page_number
+            fetch = getattr(request_context, "fetch", None)
+            if callable(fetch):
+                return fetch(request, data=body)
+            return None
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        page_key = next(
+            (key for key in ("pageNum", "currPage", "page", "current") if key in query),
+            "pageNum",
+        )
+        query[page_key] = str(page_number)
+        fetch = getattr(request_context, "fetch", None)
+        return fetch(request, params=urlencode(query)) if callable(fetch) else None
+
+    @staticmethod
+    def _record_alias_values(record: dict[str, Any], aliases: tuple[str, ...]) -> set[str]:
+        result = set()
+        for alias in aliases:
+            value = record.get(alias)
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                normalized = ModuleSmokeDriver._normalize_record_text(value)
+                if normalized:
+                    result.add(normalized)
+        return result
+
+    def _occupied_unique_keys(self, spec) -> list[tuple[frozenset[str], ...]]:
+        snapshot = getattr(self, "_unique_occupied_snapshot", {})
+        if isinstance(snapshot, dict) and self._unique_spec_key(spec) in snapshot:
+            return list(snapshot[self._unique_spec_key(spec)])
+        matching = [
+            response for response in self._unique_list_responses
+            if self._response_matches_unique_list(response, spec)
+        ]
+        if not matching:
+            raise AssertionError(
+                "组合唯一约束没有捕获真实列表响应，禁止盲目创建"
+            )
+        return self._occupied_unique_keys_from_response(matching[-1], spec)
+
+    def _occupied_unique_keys_from_response(
+        self, response, spec,
+    ) -> list[tuple[frozenset[str], ...]]:
+        records = self._complete_unique_list_records(response, spec)
+        occupied = []
+        for record in records:
+            key = tuple(
+                frozenset(self._record_alias_values(record, spec.aliases_for(code)))
+                for code in spec.field_codes
+            )
+            if all(key):
+                occupied.append(key)
+        if len(occupied) != len(records):
+            raise AssertionError(
+                "组合唯一约束列表记录缺少完整键字段，无法证明可用组合"
+            )
+        return occupied
+
+    def _dom_fields_by_code(self, scope) -> dict[str, tuple[DomField, str]]:
         try:
             dom_fields = scan_dom_fields(self.page, scope)
         except TypeError:
             dom_fields = scan_dom_fields(self.page)
-        prepared: dict[str, Any] = {}
-        for target_code in target_codes:
-            match = None
-            match_label = ""
-            for index, dom in enumerate(dom_fields, start=1):
-                source_code, source_label, *_ = self._source_for_dom(dom, index)
-                stable_code = (
-                    source_code
-                    if self._is_generated_identifier(dom.field_code)
-                    else dom.field_code
-                )
-                if stable_code == target_code or source_code == target_code:
-                    match = dom
-                    match_label = dom.label or source_label
-                    break
+        result = {}
+        for index, dom in enumerate(dom_fields, start=1):
+            source_code, source_label, *_ = self._source_for_dom(dom, index)
+            stable_code = (
+                source_code if self._is_generated_identifier(dom.field_code)
+                else dom.field_code
+            )
+            for code in (stable_code, source_code):
+                if code and code not in result:
+                    result[code] = (dom, dom.label or source_label or code)
+        return result
+
+    def _candidate_alias_values(
+        self, spec, values: dict[str, Any], candidate_code: str, candidate_value: Any,
+    ) -> tuple[frozenset[str], ...]:
+        key = []
+        for code in spec.field_codes:
+            value = candidate_value if code == candidate_code else values.get(code)
+            aliases = {self._normalize_record_text(value)}
+            display = self._remembered_display_value(code, value)
+            if display:
+                aliases.add(self._normalize_record_text(display))
+            key.append(frozenset(item for item in aliases if item))
+        return tuple(key)
+
+    @staticmethod
+    def _unique_key_conflicts(
+        candidate: tuple[frozenset[str], ...],
+        occupied: list[tuple[frozenset[str], ...]],
+    ) -> bool:
+        return any(
+            all(left & right for left, right in zip(candidate, existing))
+            for existing in occupied
+        )
+
+    def _repair_declared_unique_constraint(
+        self,
+        spec,
+        candidates: tuple[str, ...],
+        submitted: dict[str, Any],
+        *,
+        source: str,
+        protected_codes: set[str],
+        message: str = "",
+        scope=None,
+    ) -> dict[str, Any]:
+        if not candidates:
+            raise AssertionError(
+                "组合唯一约束的所有可修复字段均为 Excel 目标字段，禁止覆盖"
+            )
+        scope = scope or getattr(self, "_common_form_scope", None)
+        if scope is None:
+            scope = self.page.locator(DIALOG).last
+        self._capture_submitted_display_values(submitted, scope)
+        occupied = self._occupied_unique_keys(spec)
+        dom_by_code = self._dom_fields_by_code(scope)
+        allocator = getattr(self.data_strategy, "allocate_unique_value", None)
+        reserve = getattr(
+            self.data_strategy, "reserve_unique_key_if_available", None
+        )
+        release = getattr(self.data_strategy, "release_unique_key", None)
+        reserved = getattr(self.data_strategy, "unique_key_is_reserved", None)
+        page_scope = self._automation_registry_scope()
+        max_candidates = max(
+            1, int(os.getenv("EI_UNIQUE_ALLOCATION_ATTEMPTS", "100"))
+        )
+        failures = []
+        current_key = self._candidate_alias_values(spec, submitted, "", None)
+        # A declared duplicate save response is authoritative: the list snapshot
+        # may be stale or omit a just-created concurrent record, so it cannot
+        # justify resubmitting the same key.
+        if (
+            source != "saveResponse"
+            and all(current_key)
+            and not self._unique_key_conflicts(current_key, occupied)
+        ):
+            if not callable(reserve) or reserve(
+                spec, current_key, page_scope=page_scope
+            ):
+                if callable(reserve):
+                    self._track_unique_reservation(spec, current_key, page_scope)
+                return {}
+        for target_code in candidates:
+            match = dom_by_code.get(target_code)
             if match is None:
-                raise AssertionError(
-                    f"组合唯一约束的修复字段未渲染：{target_code}"
-                )
+                failures.append(f"{target_code}:字段未渲染")
+                continue
+            dom, label = match
             definition = FieldDefinition(
                 field_code=target_code,
-                field_name=match_label or target_code,
-                field_type=TYPE_BY_KIND.get(match.kind, "ElInput-TEXT"),
-                required=match.required,
-                readonly=match.readonly,
+                field_name=label,
+                field_type=TYPE_BY_KIND.get(dom.kind, "ElInput-TEXT"),
+                required=dom.required,
+                readonly=dom.readonly,
                 source="declared-unique-constraint",
                 props={
-                    "domKind": match.kind,
-                    "maxlength": match.maxlength,
-                    "min": match.minimum,
-                    "max": match.maximum,
-                    "step": match.step,
+                    "domKind": dom.kind,
+                    "maxlength": dom.maxlength,
+                    "min": dom.minimum,
+                    "max": dom.maximum,
+                    "step": dom.step,
                 },
             )
             old_value = submitted.get(target_code)
-            new_value, constraint = allocator(definition, old_value)
-            actual = self.interactor.fill(
-                ResolvedField(definition, match), new_value, root=scope
-            )
-            if actual in (None, "", []) or str(actual) == str(old_value):
-                raise AssertionError(
-                    f"组合唯一约束无法为 {target_code} 分配新的合法值"
+            for offset in range(1, max_candidates + 1):
+                if dom.kind in {"select", "multi_select", "radio", "checkbox"}:
+                    try:
+                        options = self._available_choice_values(
+                            dom,
+                            label,
+                            target_code,
+                            scope,
+                        )
+                    except AssertionError:
+                        break
+                    if offset > len(options):
+                        break
+                    new_value, option_index = options[offset - 1]
+                    constraint = {"kind": "unique", "sequence": offset}
+                elif callable(allocator):
+                    new_value, constraint = allocator(definition, old_value)
+                else:
+                    break
+                candidate_key = self._candidate_alias_values(
+                    spec, submitted, target_code, new_value
                 )
-            prepared[target_code] = actual
-            self._validation_repairs.append({
-                "fieldCode": target_code,
-                "label": definition.field_name,
-                "oldValue": old_value,
-                "constraint": constraint,
-                "newValue": actual,
-                "source": "declaredUniqueConstraint",
-                "repairResult": "applied",
-            })
-        return prepared
+                is_reserved = bool(
+                    callable(reserved)
+                    and reserved(spec, candidate_key, page_scope=page_scope)
+                )
+                if self._unique_key_conflicts(candidate_key, occupied) or is_reserved:
+                    continue
+                if callable(reserve) and not reserve(
+                    spec, candidate_key, page_scope=page_scope
+                ):
+                    continue
+                if callable(reserve):
+                    self._track_unique_reservation(
+                        spec, candidate_key, page_scope
+                    )
+                try:
+                    if dom.kind in {"select", "multi_select", "radio", "checkbox"}:
+                        actual = self._select_by_label(
+                            label,
+                            option_index=option_index,
+                            field_code=target_code,
+                            selector=dom.selector,
+                            dom_scope=scope,
+                        )
+                    else:
+                        actual = self.interactor.fill(
+                            ResolvedField(definition, dom), new_value, root=scope
+                        )
+                except Exception:
+                    if callable(release):
+                        release(spec, candidate_key, page_scope=page_scope)
+                    self._pending_unique_reservations = [
+                        item for item in self._pending_unique_reservations
+                        if item != (spec, candidate_key, page_scope)
+                    ]
+                    raise
+                if actual in (None, "", []) or str(actual) == str(old_value):
+                    if callable(release):
+                        release(spec, candidate_key, page_scope=page_scope)
+                    self._pending_unique_reservations = [
+                        item for item in self._pending_unique_reservations
+                        if item != (spec, candidate_key, page_scope)
+                    ]
+                    failures.append(f"{target_code}:没有产生新值")
+                    break
+                actual_key = self._candidate_alias_values(
+                    spec, submitted, target_code, actual
+                )
+                if actual_key != candidate_key:
+                    if callable(release):
+                        release(spec, candidate_key, page_scope=page_scope)
+                    self._pending_unique_reservations = [
+                        item for item in self._pending_unique_reservations
+                        if item != (spec, candidate_key, page_scope)
+                    ]
+                    if self._unique_key_conflicts(actual_key, occupied) or (
+                        callable(reserved)
+                        and reserved(spec, actual_key, page_scope=page_scope)
+                    ) or (
+                        callable(reserve)
+                        and not reserve(spec, actual_key, page_scope=page_scope)
+                    ):
+                        failures.append(f"{target_code}:实际选择值占用或无法预留")
+                        continue
+                    if callable(reserve):
+                        self._track_unique_reservation(
+                            spec, actual_key, page_scope
+                        )
+                self._validation_repairs.append({
+                    "fieldCode": target_code,
+                    "label": definition.field_name,
+                    "oldValue": old_value,
+                    "validationMessage": message,
+                    "constraint": constraint,
+                    "newValue": actual,
+                    "source": source,
+                    "repairResult": "applied",
+                })
+                return {target_code: actual}
+            failures.append(f"{target_code}:没有真实可用组合")
+        raise AssertionError(
+            "组合唯一约束无法分配未占用值：" + "; ".join(failures)
+        )
+
+    def _available_choice_values(
+        self, dom: DomField, label: str, field_code: str, scope,
+    ) -> list[tuple[str, int]]:
+        """Read real options without selecting or changing the current value."""
+        dialog = scope
+        label_node = dialog.get_by_text(label, exact=True).first
+        row = label_node.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
+            "' purvar_form_item ') or contains(concat(' ',normalize-space(@class),' '),"
+            "' el-form-item ')][1]"
+        )
+        if not row.count():
+            raise AssertionError(f"未找到 {label} 的选择控件")
+        wrapper = row.locator(
+            ".el-select__wrapper,.el-cascader .el-input__wrapper"
+        ).first
+        if dom.selector:
+            scanned = dialog.locator(dom.selector).first
+            if scanned.count():
+                nested = scanned.locator(
+                    ".el-select__wrapper,.el-cascader .el-input__wrapper"
+                ).first
+                wrapper = nested if nested.count() else wrapper
+        if not wrapper.count() or not wrapper.is_visible():
+            raise AssertionError(f"未找到 {label} 的选择控件")
+        wrapper.click(force=True)
+        controls_id = self._select_controls_id(None, wrapper)
+        popper = (
+            self.page.locator(f"#{controls_id}")
+            if controls_id else self.page.locator(".el-popper:visible,.el-popover:visible").last
+        )
+        options = popper.locator(
+            ".el-select-dropdown__item:not(.is-disabled),"
+            ".el-cascader-node:not(.is-disabled),.el-tree-node__content"
+        )
+        result = []
+        try:
+            for index in range(options.count()):
+                option = options.nth(index)
+                text = (option.inner_text() or "").strip()
+                if option.is_visible() and text and not any(
+                    token in text for token in ("请选择", "全部", "暂无", "无数据", "加载")
+                ):
+                    keyed = option.locator("xpath=ancestor-or-self::*[@data-key][1]")
+                    value = keyed.get_attribute("data-key") if keyed.count() else text
+                    result.append((str(value or text), index))
+        finally:
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+        if not result:
+            raise AssertionError(f"{field_code or label} 没有真实可用选项")
+        return result
 
     @staticmethod
     def _duplicate_field_candidates(source_fields, submitted):
@@ -2459,7 +3309,7 @@ class ModuleSmokeDriver:
                     continue
                 file_input.set_input_files(str(path))
                 uploaded += 1
-                self._wait_for_file_upload(file_input, path.name)
+                self._wait_for_file_upload(file_input, path.name, tracker=tracker)
             if uploaded:
                 self._wait_for_attachment_lifecycle(
                     tracker, phase="默认附件上传"
@@ -2470,8 +3320,20 @@ class ModuleSmokeDriver:
                 existing=existing,
                 pending=len(tracker.pending),
                 requests_observed=len(tracker.requests),
+                classification="completed" if uploaded else "existing",
+                lifecycle=tracker.events[-20:],
             )
         except Exception as exc:
+            classification = (
+                getattr(tracker, "final_classification", "")
+                or self._attachment_timeout_classification(tracker)
+            )
+            if not tracker.failures:
+                self._capture_attachment_failure(
+                    tracker,
+                    classification=classification,
+                    message=f"附件超时待诊断（前端渲染等待超时）：{exc}",
+                )
             self.last_attachment_report = AttachmentCompletionReport(
                 status="failed",
                 uploaded=uploaded,
@@ -2479,8 +3341,18 @@ class ModuleSmokeDriver:
                 pending=len(tracker.pending),
                 requests_observed=len(tracker.requests),
                 errors=[str(exc)],
+                classification=classification,
+                lifecycle=tracker.events[-20:],
             )
-            raise AssertionError(f"附件上传失败：{path.name}: {exc}") from exc
+            if classification in {
+                "network_request_timeout",
+                "backend_task_processing_timeout",
+                "frontend_render_timeout",
+            }:
+                raise AssertionError(
+                    f"附件超时待诊断（{classification}）：{path.name}: {exc}"
+                ) from exc
+            raise AssertionError(f"附件/存储服务明确失败：{path.name}: {exc}") from exc
         finally:
             self._stop_attachment_lifecycle_tracking(tracker)
         return uploaded
@@ -2516,6 +3388,79 @@ class ModuleSmokeDriver:
             )
         )
 
+    @staticmethod
+    def _safe_attachment_url(value: Any) -> str:
+        parts = urlsplit(str(value or ""))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+    @staticmethod
+    def _safe_attachment_response(response) -> Any:
+        """Capture a bounded response summary without retaining credentials or payloads."""
+        if response is None:
+            return None
+        try:
+            payload = response.json()
+        except Exception:
+            return None
+        if isinstance(payload, dict):
+            return {
+                key: str(payload[key])[:500]
+                for key in ("code", "status", "message", "msg", "success", "error")
+                if key in payload
+            }
+        return str(payload)[:500]
+
+    def _attachment_lifecycle_snapshot(
+        self, tracker: AttachmentLifecycleTracker, *, classification: str,
+    ) -> dict[str, Any]:
+        return {
+            "classification": classification,
+            "observedRequests": len(tracker.requests),
+            "pendingRequests": len(tracker.pending),
+            "backendPending": tracker.backend_pending[-10:],
+            "events": tracker.events[-20:],
+        }
+
+    def _capture_attachment_failure(
+        self, tracker: AttachmentLifecycleTracker, *, classification: str,
+        message: str,
+    ) -> None:
+        tracker.final_classification = classification
+        if getattr(self.page, "_ei_ui_failure_evidence", None) is not None:
+            return
+        capture_failure_evidence(
+            self.page,
+            message,
+            diagnostics={"attachmentLifecycle": self._attachment_lifecycle_snapshot(
+                tracker, classification=classification,
+            )},
+        )
+
+    @staticmethod
+    def _attachment_response_is_pending(response) -> bool:
+        if not isinstance(response, dict):
+            return False
+        values = [
+            response.get(key)
+            for key in ("status", "state", "taskStatus", "jobStatus")
+        ]
+        return any(
+            str(value or "").strip().lower() in {
+                "pending", "processing", "queued", "running", "in_progress",
+            }
+            for value in values
+        )
+
+    @staticmethod
+    def _attachment_timeout_classification(
+        tracker: AttachmentLifecycleTracker,
+    ) -> str:
+        if tracker.failures:
+            return "attachment_request_failed"
+        if tracker.backend_pending:
+            return "backend_task_processing_timeout"
+        return "frontend_render_timeout"
+
     def _start_attachment_lifecycle_tracking(self) -> AttachmentLifecycleTracker:
         tracker = AttachmentLifecycleTracker()
         if not hasattr(self.page, "on") or not hasattr(self.page, "remove_listener"):
@@ -2527,6 +3472,12 @@ class ModuleSmokeDriver:
             tracker.requests.append(request)
             tracker.pending[id(request)] = request
             tracker.last_activity = time.monotonic()
+            tracker.events.append({
+                "event": "request_started",
+                "method": str(getattr(request, "method", "?")),
+                "url": self._safe_attachment_url(getattr(request, "url", "")),
+                "startedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
 
         def request_finished(request) -> None:
             if id(request) not in tracker.pending:
@@ -2541,6 +3492,24 @@ class ModuleSmokeDriver:
             if response is not None:
                 tracker.responses.append(response)
                 status = getattr(response, "status", None)
+                tracker.events.append({
+                    "event": "response_finished",
+                    "method": str(getattr(request, "method", "?")),
+                    "url": self._safe_attachment_url(getattr(request, "url", "")),
+                    "httpStatus": status,
+                    "response": self._safe_attachment_response(response),
+                    "finishedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+                })
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = None
+                if self._attachment_response_is_pending(payload):
+                    tracker.backend_pending.append({
+                        "method": str(getattr(request, "method", "?")),
+                        "url": self._safe_attachment_url(getattr(request, "url", "")),
+                        "response": self._safe_attachment_response(response),
+                    })
                 if getattr(response, "ok", True) is False or (
                     isinstance(status, int) and status >= 400
                 ):
@@ -2564,6 +3533,13 @@ class ModuleSmokeDriver:
             tracker.failures.append(
                 f"{getattr(request, 'method', '?')} {path}: {failure}"
             )
+            tracker.events.append({
+                "event": "request_failed",
+                "method": str(getattr(request, "method", "?")),
+                "url": self._safe_attachment_url(getattr(request, "url", "")),
+                "reason": str(failure)[:500],
+                "finishedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
 
         tracker.callbacks = {
             "request": request_started,
@@ -2597,13 +3573,25 @@ class ModuleSmokeDriver:
                 break
             self.page.wait_for_timeout(100)
         else:
-            raise AssertionError(
+            message = (
                 f"{phase}请求未在 {timeout_ms / 1000:g} 秒内完成："
                 f"pending={len(tracker.pending)}"
             )
+            classification = (
+                "backend_task_processing_timeout"
+                if tracker.backend_pending else "network_request_timeout"
+            )
+            self._capture_attachment_failure(
+                tracker, classification=classification, message=message,
+            )
+            raise AssertionError(f"附件超时待诊断（{classification}）：{message}")
 
         if tracker.failures:
-            raise AssertionError(f"{phase}请求失败：{' | '.join(tracker.failures[-3:])}")
+            message = f"{phase}请求失败：{' | '.join(tracker.failures[-3:])}"
+            self._capture_attachment_failure(
+                tracker, classification="attachment_request_failed", message=message,
+            )
+            raise AssertionError(f"附件/存储服务明确失败：{message}")
         for response in tracker.responses:
             response_id = id(response)
             if response_id in tracker.validated_responses:
@@ -2617,7 +3605,11 @@ class ModuleSmokeDriver:
                 self._assert_business_success(payload, phase)
             except AssertionError as exc:
                 path = urlsplit(str(getattr(response, "url", "") or "")).path
-                raise AssertionError(f"{phase}请求业务失败：{path}: {exc}") from exc
+                message = f"{phase}请求业务失败：{path}: {exc}"
+                self._capture_attachment_failure(
+                    tracker, classification="attachment_backend_rejected", message=message,
+                )
+                raise AssertionError(f"附件/存储服务明确失败：{message}") from exc
         print(
             f"ATTACHMENT_LIFECYCLE phase={phase} "
             f"observed={len(tracker.requests)} pending={len(tracker.pending)}",
@@ -2633,15 +3625,19 @@ class ModuleSmokeDriver:
             self.page.remove_listener(event, callback)
         tracker.enabled = False
 
-    def _wait_for_file_upload(self, file_input, file_name: str) -> None:
+    def _wait_for_file_upload(
+        self, file_input, file_name: str,
+        *, tracker: AttachmentLifecycleTracker | None = None,
+    ) -> None:
         if not hasattr(file_input, "element_handle"):
             self.page.wait_for_timeout(800)
             return
         handle = file_input.element_handle()
         if handle is None:
             raise AssertionError("附件输入控件在上传期间已失效")
-        self.page.wait_for_function(
-            """({input, fileName}) => {
+        try:
+            self.page.wait_for_function(
+                """({input, fileName}) => {
                 const el = input;
                 const scope = el.closest('.el-form-item,.purvar_form_item,.ant-form-item') || el.parentElement;
                 if (!scope) return false;
@@ -2681,9 +3677,22 @@ class ModuleSmokeDriver:
                     '[data-upload-status="success"],[data-status="done"],[class*="upload-success"]';
                 return targetRows.some(row => hasState(row, successSelector));
             }""",
-            arg={"input": handle, "fileName": file_name},
-            timeout=30_000,
-        )
+                arg={"input": handle, "fileName": file_name},
+                timeout=30_000,
+            )
+        except PlaywrightTimeoutError as exc:
+            classification = self._attachment_timeout_classification(tracker) if tracker else (
+                "frontend_render_timeout"
+            )
+            if tracker is not None:
+                self._capture_attachment_failure(
+                    tracker,
+                    classification=classification,
+                    message=f"附件超时待诊断（{classification}）：{file_name}",
+                )
+            raise AssertionError(
+                f"附件组件在 30 秒内未完成：{file_name}; classification={classification}"
+            ) from exc
         failed = file_input.evaluate("""el => {
             const scope = el.closest('.el-form-item,.purvar_form_item,.ant-form-item') || el.parentElement;
             return !!scope?.querySelector(
@@ -3991,10 +5000,13 @@ class ModuleSmokeDriver:
         business_id: str,
         *,
         response_payload: Any = None,
+        display_identity_values: list[str] | None = None,
     ) -> None:
         try:
             row, _identity = self._find_unique_record_container(
-                business_id, echo_values
+                business_id,
+                echo_values,
+                display_identity_values=display_identity_values,
             )
         except AssertionError as exc:
             if response_payload is None:
@@ -4350,7 +5362,12 @@ class ModuleSmokeDriver:
         return bool(re.search(r"/detail(?:[/?#]|$)", str(url or "").lower()))
 
     def _find_unique_record_container(
-        self, business_id: str, markers: list[str], *, allow_search: bool = True,
+        self,
+        business_id: str,
+        markers: list[str],
+        *,
+        allow_search: bool = True,
+        display_identity_values: list[str] | None = None,
     ):
         containers = self.page.locator(
             ".el-table__row:visible,.ant-table-row:visible,"
@@ -4423,6 +5440,33 @@ class ModuleSmokeDriver:
         if len(prefix_matches) == 1:
             return prefix_matches[0]
         if not prefix_matches:
+            stable_values = {
+                self._normalize_record_text(marker)
+                for marker in (display_identity_values or ())
+                if self._normalize_record_text(marker)
+            }
+            if len(stable_values) >= 2:
+                stable_matches = []
+                for item in items:
+                    cells = item.locator("td,[role='cell']")
+                    texts = cells.all_inner_texts() if cells.count() else item.inner_text().splitlines()
+                    cell_texts = {
+                        self._normalize_record_text(text)
+                        for text in texts
+                        if self._normalize_record_text(text)
+                    }
+                    if all(
+                        self._auxiliary_display_value_matches(value, cell_texts)
+                        for value in stable_values
+                    ):
+                        stable_matches.append(item)
+                if len(stable_matches) == 1:
+                    return stable_matches[0], "保存字段组合"
+                if len(stable_matches) > 1:
+                    raise AssertionError(
+                        "保存字段组合精确匹配到 "
+                        f"{len(stable_matches)} 条记录，无法唯一打开"
+                    )
             if allow_search and self._search_record_list_by_markers(markers):
                 return self._find_unique_record_container(
                     business_id, markers, allow_search=False
@@ -4434,6 +5478,19 @@ class ModuleSmokeDriver:
         raise AssertionError(
             f"本次新增记录稳定前缀匹配到 {len(prefix_matches)} 条记录，"
             f"无法唯一打开：{markers}"
+        )
+
+    @classmethod
+    def _auxiliary_display_value_matches(
+        cls, expected: str, actual_values: set[str],
+    ) -> bool:
+        normalized = cls._normalize_record_text(expected)
+        if normalized in actual_values:
+            return True
+        expected_number = cls._decimal_readback_value(normalized)
+        return expected_number is not None and any(
+            cls._decimal_readback_value(actual) == expected_number
+            for actual in actual_values
         )
 
     def _search_record_list_by_markers(self, markers: list[str]) -> bool:
@@ -5424,6 +6481,8 @@ class ModuleSmokeDriver:
                 "pending": getattr(self, "last_attachment_report", AttachmentCompletionReport()).pending,
                 "requestsObserved": getattr(self, "last_attachment_report", AttachmentCompletionReport()).requests_observed,
                 "errors": getattr(self, "last_attachment_report", AttachmentCompletionReport()).errors,
+                "classification": getattr(self, "last_attachment_report", AttachmentCompletionReport()).classification,
+                "lifecycle": getattr(self, "last_attachment_report", AttachmentCompletionReport()).lifecycle,
             },
             "validationRepairs": getattr(self, "_validation_repairs", []),
             "submittedFieldCodes": sorted(submitted),

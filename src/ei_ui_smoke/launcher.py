@@ -23,6 +23,25 @@ from .common_field_cases import (
     plan_common_case_transactions,
     read_xlsx_records,
 )
+from .execution_guard import (
+    RuntimeVersion,
+    capture_runtime_version,
+    clear_launcher_process_record,
+    register_launcher_process,
+    runtime_version_changed,
+    runtime_version_mismatch_message,
+)
+from .environment_api import (
+    DEFAULT_PROBES_FILE,
+    DEFAULT_VERSION_STATE_FILE,
+    block_unavailable_commands,
+    load_environment_api_probes,
+    matching_probes,
+    probe_environment_apis,
+    source_revision,
+    update_version_mismatch_state,
+    write_environment_preflight_report,
+)
 from .menu_capture import capture_menu
 from .module_index import ModuleItem, discover_modules, modules_from_menu, search_modules
 from .project_layout import resolve_view_root
@@ -1167,6 +1186,37 @@ def format_failure_message(
     return f"共 {len(failures)} 个模块执行失败：\n\n{names}\n\n完整日志目录：{log_dir}{report_error}"
 
 
+def format_environment_block_message(blocks, warnings) -> str:
+    blocked_lines = [
+        f"- {block.target_name}: {block.probe_id} 返回 HTTP {block.status}（{block.url}）"
+        for block in blocks
+    ]
+    warning_lines = [f"- {warning}" for warning in warnings]
+    sections = []
+    if blocked_lines:
+        sections.append(
+            "环境版本不匹配，以下目标未执行且不计产品缺陷：\n" + "\n".join(blocked_lines)
+        )
+    if warning_lines:
+        sections.append("部署版本预警：\n" + "\n".join(warning_lines))
+    return "\n\n" + "\n\n".join(sections) if sections else ""
+
+
+def append_environment_preflight_summary(
+    sync_log_file: Path,
+    preflight_report: Path,
+    blocks: list,
+    warnings: list,
+) -> None:
+    """Append the preflight outcome after source synchronization succeeds."""
+    with sync_log_file.open("a", encoding="utf-8") as sync_log:
+        sync_log.write(
+            "\nENVIRONMENT_API_PREFLIGHT "
+            f"blocked={len(blocks)} warnings={len(warnings)} "
+            f"report={preflight_report}\n"
+        )
+
+
 class MultiSelectSheetMenu(tk.Frame):
     """Compact multi-select menu with stable internal option values."""
 
@@ -1237,6 +1287,14 @@ class Launcher(tk.Tk):
         self.geometry("1400x900")
         self.minsize(900, 650)
         self.project_root = Path(__file__).resolve().parents[2]
+        self.launch_version: RuntimeVersion | None = None
+        try:
+            self.launch_version = capture_runtime_version(self.project_root)
+        except RuntimeError:
+            # Execution performs the same check and shows the actionable error.
+            pass
+        register_launcher_process(self.project_root)
+        self.protocol("WM_DELETE_WINDOW", self._close_launcher)
         self.url_history_file = self.project_root / "artifacts" / "launcher-history.json"
         self.url_history = load_url_history(self.url_history_file)
         self.configured_codes = self._load_configured_codes()
@@ -1280,6 +1338,10 @@ class Launcher(tk.Tk):
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _close_launcher(self) -> None:
+        clear_launcher_process_record(self.project_root, pid=os.getpid())
+        self.destroy()
 
     def _configure_styles(self) -> None:
         self.configure(background="#F4F6F8")
@@ -1942,6 +2004,25 @@ class Launcher(tk.Tk):
         return resolve_selected_targets(self.items, selected_items)
 
     def run_selected(self) -> None:
+        if hasattr(self, "launch_version"):
+            launch_version = self.launch_version
+            if launch_version is None:
+                messagebox.showwarning(
+                    "无法校验代码版本",
+                    "启动器未能读取启动版本。请关闭启动器并重新运行 run_test.vbs 后再执行测试。",
+                )
+                return
+            try:
+                current_version = capture_runtime_version(self.project_root)
+            except RuntimeError as exc:
+                messagebox.showwarning("无法校验代码版本", str(exc))
+                return
+            if runtime_version_changed(launch_version, current_version):
+                messagebox.showwarning(
+                    "检测到旧启动器",
+                    runtime_version_mismatch_message(launch_version, current_version),
+                )
+                return
         targets = self._selected_targets()
         if not targets:
             messagebox.showwarning("请选择模块", "请选择一个或多个模块，父模块会自动包含其可执行子模块。")
@@ -2036,6 +2117,10 @@ class Launcher(tk.Tk):
             "EI_BASE_URL": aligned_url.rstrip("/"),
             "EI_HEADLESS": str(self.headless.get()).lower(), "EI_STORAGE_STATE": self.storage.get(),
             "EI_USERNAME": self.username.get(), "EI_PASSWORD": self.password.get(),
+            "EI_AUTOMATION_RUN_ID": (
+                f"{time.strftime('%Y%m%d%H%M%S')}{time.time_ns() % 1_000_000:06d}_"
+                f"{uuid.uuid4().hex[:8]}"
+            ),
         })
         commands = []
         preflight_errors = []
@@ -2107,18 +2192,61 @@ class Launcher(tk.Tk):
         submit_zentao: bool,
     ) -> None:
         failures = []
+        environment_blocks = []
+        environment_warnings = []
         failed_discovery_manifests: set[str] = set()
         log_dir = self.project_root / "artifacts" / "runs"
         try:
             allure_paths = create_allure_paths(self.project_root)
-            logical_target_names = command_target_names(commands)
-            write_environment(allure_paths.results, {
-                "base_url": base_url, "data_mode": mode, "headless": headless,
-                "module_count": len(logical_target_names) + len(preflight_errors),
-            })
             log_dir.mkdir(parents=True, exist_ok=True)
             progress_dir = log_dir / ".pytest-progress"
             progress_dir.mkdir(parents=True, exist_ok=True)
+            if commands:
+                self.after(0, self.status.set, "正在同步源码仓库...")
+                sync_log_file = log_dir / "source-sync.log"
+                try:
+                    sync_output = pull_latest_source(os.environ)
+                except SourceSyncError as exc:
+                    sync_log_file.write_text(str(exc) + "\n", encoding="utf-8")
+                    self.after(
+                        0, self._finish_execution_error,
+                        f"源码同步失败，未启动 pytest。\n\n{exc}\n\n完整日志：{sync_log_file}",
+                    )
+                    return
+                sync_log_file.write_text(sync_output + "\n", encoding="utf-8")
+                configured_probes = load_environment_api_probes(
+                    self.project_root / DEFAULT_PROBES_FILE
+                )
+                required_probes = {
+                    probe.id: probe
+                    for _target, command_env, _test_file in commands
+                    for probe in matching_probes(configured_probes, command_env)
+                }
+                storage_state = str(commands[0][1].get("EI_STORAGE_STATE", ""))
+                source_root = str(commands[0][1].get("EI_PARENT_ROOT", ""))
+                probe_results = probe_environment_apis(
+                    required_probes.values(), base_url=base_url,
+                    storage_state=storage_state,
+                )
+                commands, environment_blocks = block_unavailable_commands(
+                    commands, probe_results,
+                )
+                environment_warnings = update_version_mismatch_state(
+                    probe_results,
+                    source_version=source_revision(source_root),
+                    state_file=self.project_root / DEFAULT_VERSION_STATE_FILE,
+                )
+                preflight_report = log_dir / "environment-api-preflight.json"
+                write_environment_preflight_report(
+                    preflight_report, probe_results, environment_blocks, environment_warnings,
+                )
+                append_environment_preflight_summary(
+                    sync_log_file,
+                    preflight_report,
+                    environment_blocks,
+                    environment_warnings,
+                )
+
             command_entries = [
                 (str(index), target, command_env, test_file)
                 for index, (target, command_env, test_file) in enumerate(commands, 1)
@@ -2132,19 +2260,14 @@ class Launcher(tk.Tk):
                 if test_file == "tests/test_common_field_discovery.py"
             }
             completed_discovery_ids: set[str] = set()
-            if command_entries:
-                self.after(0, self.status.set, "正在同步源码仓库...")
-                sync_log_file = log_dir / "source-sync.log"
-                try:
-                    sync_output = pull_latest_source(os.environ)
-                except SourceSyncError as exc:
-                    sync_log_file.write_text(str(exc) + "\n", encoding="utf-8")
-                    self.after(
-                        0, self._finish_execution_error,
-                        f"源码同步失败，未启动 pytest。\n\n{exc}\n\n完整日志：{sync_log_file}",
-                    )
-                    return
-                sync_log_file.write_text(sync_output + "\n", encoding="utf-8")
+
+            logical_target_names = command_target_names(commands)
+            write_environment(allure_paths.results, {
+                "base_url": base_url, "data_mode": mode, "headless": headless,
+                "module_count": len(logical_target_names) + len(preflight_errors),
+                "environment_blocked_count": len(environment_blocks),
+                "environment_version_warnings": len(environment_warnings),
+            })
 
             def post_case_progress(*, running: bool = True) -> None:
                 completed_cases, total_cases = case_progress.snapshot()
@@ -2166,6 +2289,7 @@ class Launcher(tk.Tk):
                 failures.append((" / ".join(target.path) or target.name, error, log_file))
 
             for command_id, target, command_env, test_file in command_entries:
+                command_env["EI_AUTOMATION_TARGET_SEQUENCE"] = command_id
                 command_env["PYTHONUTF8"] = "1"
                 command_env["PYTHONIOENCODING"] = "utf-8"
                 command_env[DEFER_SKILL_GATE_ENV] = "true"
@@ -2393,7 +2517,8 @@ class Launcher(tk.Tk):
             self.after(0, self._finish_execution_error, str(exc))
             return
         self.after(
-            0, self._finish_execution, commands, failures, log_dir,
+            0, self._finish_execution, commands, failures, environment_blocks,
+            environment_warnings, log_dir,
             report_dir, report_error, allure_paths.results, zentao_result,
             *case_progress.snapshot(),
         )
@@ -2446,7 +2571,8 @@ class Launcher(tk.Tk):
         )
 
     def _finish_execution(
-        self, commands, failures, log_dir: Path, report_dir: Path | None,
+        self, commands, failures, environment_blocks, environment_warnings,
+        log_dir: Path, report_dir: Path | None,
         report_error: str, results_dir: Path, zentao_result: ZentaoRunResult,
         completed_cases: int, total_cases: int | None,
     ) -> None:
@@ -2460,7 +2586,18 @@ class Launcher(tk.Tk):
             messagebox.showerror(
                 "执行失败",
                 format_failure_message(failures, log_dir, report_error)
+                + format_environment_block_message(environment_blocks, environment_warnings)
                 + "\n\n" + zentao_result.summary(),
+            )
+        elif environment_blocks:
+            passed_names = command_target_names(commands)
+            self.status.set(
+                f"执行完成：{len(passed_names)} 个通过，{len(environment_blocks)} 个因环境版本不匹配被阻塞。"
+            )
+            messagebox.showwarning(
+                "环境版本不匹配",
+                format_environment_block_message(environment_blocks, environment_warnings)
+                + f"\n\nAllure：{report_dir or results_dir}{report_error}",
             )
         else:
             target_names = command_target_names(commands)

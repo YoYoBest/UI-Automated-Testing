@@ -22,6 +22,8 @@ from ei_ui_smoke.launcher import (
     default_storage_state,
     console_python_executable,
     format_failure_message,
+    format_environment_block_message,
+    append_environment_preflight_summary,
     group_action_commands,
     is_detail_page_target,
     is_executable_target,
@@ -60,6 +62,67 @@ from ei_ui_smoke.launcher import (
     DEFER_SKILL_GATE_ENV,
     Launcher,
 )
+from ei_ui_smoke.environment_api import EnvironmentBlock
+from ei_ui_smoke.execution_guard import RuntimeVersion, runtime_version_changed, runtime_version_mismatch_message
+
+
+def test_runtime_version_check_blocks_a_launcher_loaded_before_code_changed():
+    started = RuntimeVersion(commit="a" * 40, worktree_fingerprint="one")
+    current = RuntimeVersion(commit="b" * 40, worktree_fingerprint="two")
+
+    assert runtime_version_changed(started, current)
+    message = runtime_version_mismatch_message(started, current)
+    assert "已阻止本次执行" in message
+    assert "run_test.vbs" in message
+
+
+def test_environment_block_message_is_not_presented_as_a_product_failure():
+    message = format_environment_block_message(
+        [EnvironmentBlock("建设项目 / 重大调整", "major-adjustment", "https://env/api", 404)],
+        ["环境版本差异持续超过 24 小时：major-adjustment"],
+    )
+
+    assert "不计产品缺陷" in message
+    assert "HTTP 404" in message
+
+
+def test_environment_preflight_summary_appends_to_a_path_log(tmp_path):
+    sync_log = tmp_path / "source-sync.log"
+    sync_log.write_text("SOURCE_SYNC_OK\n", encoding="utf-8")
+    report = tmp_path / "environment-api-preflight.json"
+
+    append_environment_preflight_summary(
+        sync_log,
+        report,
+        [EnvironmentBlock("module", "probe", "https://env/api", 404)],
+        ["version warning"],
+    )
+
+    assert sync_log.read_text(encoding="utf-8") == (
+        "SOURCE_SYNC_OK\n\n"
+        f"ENVIRONMENT_API_PREFLIGHT blocked=1 warnings=1 report={report}\n"
+    )
+
+
+def test_runtime_version_check_accepts_the_exact_loaded_checkout():
+    version = RuntimeVersion(commit="a" * 40, worktree_fingerprint="stable")
+
+    assert not runtime_version_changed(version, version)
+
+
+def test_run_selected_blocks_a_real_launcher_without_a_startup_version(monkeypatch, tmp_path):
+    warnings = []
+    launcher = SimpleNamespace(launch_version=None, project_root=tmp_path)
+    monkeypatch.setattr(
+        launcher_module.messagebox, "showwarning",
+        lambda title, message: warnings.append((title, message)),
+    )
+
+    Launcher.run_selected(launcher)
+
+    assert warnings == [
+        ("无法校验代码版本", "启动器未能读取启动版本。请关闭启动器并重新运行 run_test.vbs 后再执行测试。")
+    ]
 
 
 def test_common_cases_sheet_prefers_current_then_add_then_first():

@@ -1962,31 +1962,58 @@ def test_form_session_closes_and_reopens_when_recovery_fails():
     executor.close_form_session()
 
 
-def test_shared_executor_rebinds_after_browser_page_recovery():
-    old_page = object()
-    new_page = object()
+def test_shared_executor_rebind_releases_unique_state_and_old_page_listener():
+    class Page:
+        def __init__(self):
+            self.listeners = []
+            self.removed = []
+
+        def on(self, event, listener):
+            self.listeners.append((event, listener))
+
+        def remove_listener(self, event, listener):
+            self.listeners.remove((event, listener))
+            self.removed.append((event, listener))
+
+    released = []
+
+    class Strategy:
+        @staticmethod
+        def release_unique_key(spec, key, *, page_scope=""):
+            released.append((spec, key, page_scope))
+
+    old_page = Page()
+    new_page = Page()
+    executor = CommonFieldExecutor(old_page, Strategy())
     closed = []
-    old_session = type("Session", (), {"close": lambda self: closed.append(True)})()
-    interactor = type("Interactor", (), {"page": old_page})()
-    driver = type(
-        "Driver", (), {
-            "page": old_page,
-            "interactor": interactor,
-            "_common_form_scope": object(),
-        },
+    executor._form_session = type(
+        "Session", (), {"close": lambda self: closed.append(True)}
     )()
-    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
-    executor.page = old_page
-    executor.driver = driver
-    executor._form_session = old_session
+    driver = executor.driver
+    driver._common_form_scope = object()
+    driver._start_unique_list_capture()
+    old_listener = driver._unique_list_listener
+    response = object()
+    driver._unique_list_responses.append(response)
+    spec = object()
+    key = ("四川板块", "2027")
+    driver._unique_occupied_snapshot = {"BUILD_NETASSETS_MAINTAIL": {key}}
+    driver._pending_unique_reservations.append((spec, key, "#/netAssets"))
 
     executor.bind_page(new_page)
 
     assert closed == [True]
     assert executor.page is new_page
     assert driver.page is new_page
-    assert interactor.page is new_page
+    assert driver.interactor.page is new_page
     assert driver._common_form_scope is None
+    assert old_page.removed == [("response", old_listener)]
+    assert old_page.listeners == []
+    assert driver._unique_list_listener is None
+    assert driver._unique_list_responses == []
+    assert driver._unique_occupied_snapshot == {}
+    assert driver._pending_unique_reservations == []
+    assert released == [(spec, key, "#/netAssets")]
     assert isinstance(executor._form_session, CommonFieldFormSession)
 
 
@@ -2014,6 +2041,135 @@ def test_pin_form_scope_returns_unique_stable_locator():
 
     assert executor._pin_form_scope(scope) is pinned
     assert scope.marker in selectors[0]
+
+
+def test_new_form_scope_skips_visible_empty_shell_before_real_editor(monkeypatch):
+    class Controls:
+        def __init__(self, visible):
+            self.visible = visible
+
+        def count(self):
+            return 1 if self.visible else 0
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self):
+            return self.visible
+
+    class Dialog:
+        def __init__(self, visible_controls):
+            self.visible_controls = visible_controls
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def get_attribute(_name):
+            return None
+
+        def locator(self, selector):
+            assert selector == executor_module.EDITABLE_FORM_CONTROL
+            return Controls(self.visible_controls)
+
+    class Dialogs:
+        def __init__(self):
+            self.items = [Dialog(False), Dialog(True)]
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Dialogs()
+
+        @staticmethod
+        def wait_for_timeout(_milliseconds):
+            return None
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: 0)
+
+    assert executor._wait_for_new_form_scope("old", timeout=1).visible_controls
+
+
+def test_scan_fields_rebinds_only_to_a_unique_live_form_after_rerender(monkeypatch):
+    stale = object()
+    rebound = object()
+
+    class Controls:
+        @staticmethod
+        def count():
+            return 1
+
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Candidate:
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def locator(_selector):
+            return Controls()
+
+    class Dialogs:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Candidate()
+
+    class Page:
+        url = "https://example.test/form"
+
+        @staticmethod
+        def locator(_selector):
+            return Dialogs()
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor.driver = type("Driver", (), {
+        "_runtime_identity_for_dom": staticmethod(
+            lambda dom, _index: (dom.field_code, dom.label, False)
+        ),
+    })()
+    executor._form_session = CommonFieldFormSession(executor)
+    executor._form_session.active = executor_module._ActiveCommonFieldForm(
+        stale, None, Page.url
+    )
+    executor._set_driver_form_scope = lambda scope: setattr(
+        executor, "bound_scope", scope
+    )
+    executor._pin_form_scope = lambda candidate: rebound
+    monkeypatch.setattr(
+        executor_module,
+        "scan_dom_fields",
+        lambda _page, scope: [] if scope is stale else [
+            DomField("assetYear", "年度", "year", "#year", required=True)
+        ],
+    )
+
+    fields = executor._scan_fields(stale)
+
+    assert [field.field_code for field in fields] == ["assetYear"]
+    assert executor._form_session.active.scope is rebound
+    assert executor.bound_scope is rebound
 
 
 def test_hidden_pinned_form_cleanup_does_not_close_another_dialog():
@@ -2430,6 +2586,43 @@ def test_current_field_uses_stable_prop_radio_group_when_scan_identity_mismatche
     assert field.kind == "radio"
 
 
+def test_current_field_rebinds_a_uniquely_matching_generated_id_suffix():
+    class Candidate:
+        def count(self):
+            return 1
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, name):
+            return "el-id-9021-46" if name == "id" else None
+
+    class Scope:
+        def locator(self, selector):
+            assert selector == 'input[id$="-46"]'
+            return Candidate()
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._scan_fields = lambda _scope=None: []
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._runtime_choice_field = lambda *_args: None
+    case = BoundCommonCase(
+        "ADD-051", "assetYear", "年度", "year", "#el-id-2512-46",
+        "选择年份", "", "accepted", "", "P1",
+    )
+
+    field = executor._current_field(case, Scope())
+
+    assert field.field_key == "assetYear"
+    assert field.selector == "#el-id-9021-46"
+    assert field.kind == "year"
+
+
 def test_wait_for_current_file_field_allows_late_edit_form_hydration():
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = _Page()
@@ -2469,6 +2662,51 @@ def test_wait_for_current_file_field_allows_late_edit_form_hydration():
     assert field.kind == "file"
 
 
+def test_empty_scan_diagnostic_lists_control_identity_without_values():
+    class Control:
+        def __init__(self, index):
+            self.index = index
+
+        def evaluate(self, script):
+            if "getBoundingClientRect" in script:
+                key = "assetYear" if self.index == 0 else "netAssetAmount"
+                return (
+                    f"input|text|el-id-1-{self.index}||{key}|"
+                    "display=block;visibility=visible;rect=100x32|hidden=|ariaHidden=|readonly=false"
+                )
+            if "tagName" in script:
+                return "input"
+            return "assetYear" if self.index == 0 else "netAssetAmount"
+
+        def get_attribute(self, name):
+            values = {
+                "type": "text",
+                "id": f"el-id-1-{self.index}",
+                "name": "",
+            }
+            return values.get(name)
+
+    class Controls:
+        def count(self):
+            return 2
+
+        def nth(self, index):
+            return Control(index)
+
+    class Scope:
+        def locator(self, selector):
+            assert selector == executor_module.EDITABLE_FORM_CONTROL
+            return Controls()
+
+    inventory = CommonFieldExecutor._editable_control_inventory(Scope())
+
+    assert "input|text|el-id-1-0||assetYear" in inventory
+    assert "input|text|el-id-1-1||netAssetAmount" in inventory
+    assert "rect=100x32" in inventory
+    assert "ariaHidden=" in inventory
+    assert "value" not in inventory
+
+
 def test_dom_scanner_uses_independent_label_and_never_edits_option_text():
     independent = DOM_FIELD_SCRIPT.index("const independentLabels")
     code_identity = DOM_FIELD_SCRIPT.index("const codeOf")
@@ -2480,6 +2718,18 @@ def test_dom_scanner_uses_independent_label_and_never_edits_option_text():
     assert "Compatibility fallback" not in DOM_FIELD_SCRIPT
     assert "optionLabels" not in DOM_FIELD_SCRIPT
     assert ".split(optionText)" not in DOM_FIELD_SCRIPT
+
+
+def test_dom_scanner_keeps_a_pinned_visible_form_when_its_wrapper_has_stale_aria_hidden():
+    assert "const ariaHidden = el.closest('[aria-hidden=\"true\"]');" in DOM_FIELD_SCRIPT
+    assert "!ariaHidden.contains(providedRoot)" in DOM_FIELD_SCRIPT
+    assert "if (el.closest('[hidden]')) return false;" in DOM_FIELD_SCRIPT
+
+
+def test_dom_scanner_uses_raw_controls_only_for_a_pinned_form_visibility_fallback():
+    assert "const rawControls = [...root.querySelectorAll(" in DOM_FIELD_SCRIPT
+    assert "const visibleControls = rawControls.filter(visibleControl);" in DOM_FIELD_SCRIPT
+    assert "visibleControls.length || !providedRoot ? visibleControls : rawControls" in DOM_FIELD_SCRIPT
 
 
 def test_dom_scanner_discovers_hidden_file_input_through_visible_upload_owner():
@@ -3570,6 +3820,118 @@ def test_submit_case_verifies_saved_record_when_form_remains_visible(monkeypatch
     assert len(verify_calls) == 1
 
 
+def _unique_lifecycle_submit_executor(save_result):
+    class SaveButton:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+
+        def on(self, event, listener):
+            self.listeners[event] = listener
+
+        def remove_listener(self, event, listener):
+            assert self.listeners.pop(event) is listener
+
+    class Driver:
+        def __init__(self):
+            self.lifecycle = []
+
+        @staticmethod
+        def _save_button(_scope):
+            return SaveButton()
+
+        @staticmethod
+        def _collect_record_identity_markers(_submitted, scope=None):
+            return ("AUTO_001",)
+
+        def commit_pending_unique_reservations(self):
+            self.lifecycle.append("commit")
+
+        def release_pending_unique_reservations(self):
+            self.lifecycle.append("release")
+
+    driver = Driver()
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor.driver = driver
+    executor._click_case_save_with_business_repairs = (
+        lambda *_args, **_kwargs: save_result
+    )
+    return executor, driver
+
+
+def _submit_lifecycle_case(executor):
+    return executor._submit_case(
+        _case("accepted"),
+        object(),
+        DiscoveredCommonField(
+            "name", "名称", "text", "text", "#name", FieldConstraints()
+        ),
+        {"recordName": "AUTO_001", "name": "合法名称"},
+        "合法名称",
+        "合法名称",
+        "旧值",
+    )
+
+
+def test_submit_case_commits_pending_unique_reservation_after_add_save(monkeypatch):
+    executor, driver = _unique_lifecycle_submit_executor((object(), False, ""))
+    executor._verify_saved_record = lambda *_args, **_kwargs: (
+        driver.lifecycle == ["commit"]
+        or pytest.fail("unique reservation was not committed before readback")
+    )
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    result = _submit_lifecycle_case(executor)
+
+    assert result.outcome == "saved_verified_and_retained"
+    assert driver.lifecycle == ["commit"]
+
+
+def test_submit_case_keeps_commit_when_add_readback_fails(monkeypatch):
+    executor, driver = _unique_lifecycle_submit_executor((object(), False, ""))
+
+    def fail_readback(*_args, **_kwargs):
+        assert driver.lifecycle == ["commit"]
+        raise AssertionError("回读找不到已保存记录")
+
+    executor._verify_saved_record = fail_readback
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    with pytest.raises(AssertionError, match="回读找不到已保存记录"):
+        _submit_lifecycle_case(executor)
+
+    assert driver.lifecycle == ["commit"]
+
+
+def test_submit_case_releases_pending_unique_reservation_when_add_save_fails(
+    monkeypatch,
+):
+    executor, driver = _unique_lifecycle_submit_executor((
+        None,
+        True,
+        "该板块对应年度的净资产已存在",
+    ))
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    with pytest.raises(AssertionError, match="没有捕获保存接口响应"):
+        _submit_lifecycle_case(executor)
+
+    assert driver.lifecycle == ["release"]
+
+
 def test_submit_case_accepts_truncated_value_when_retained_form_verifies(monkeypatch):
     class EmptyLocator:
         @property
@@ -3794,7 +4156,18 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
             if isinstance(body, dict) and body.get("code") not in (0, "0", 200, "200"):
                 raise AssertionError(body["message"])
 
-        def _repair_business_validation_message(self, message, submitted, attempt):
+        def _repair_business_validation_message(
+            self,
+            message,
+            submitted,
+            attempt,
+            *,
+            protected_codes=None,
+            retryable_unique_codes=None,
+            allow_unique_repair=True,
+        ):
+            assert allow_unique_repair is True
+            assert retryable_unique_codes == {"buildPeriodMonth"}
             self.repair_messages.append((message, submitted["matterName"], attempt))
             submitted["matterName"] = "AUTO_项目决策_S002"
             return {"matterName": "AUTO_项目决策_S002"}
@@ -3844,6 +4217,157 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
         ("事项名称已存在，请修改后再保存", "AUTO_项目决策_S001", 1)
     ]
     assert len(verify_calls) == 1
+
+
+def test_common_submit_keeps_filled_baseline_before_duplicate_response(monkeypatch):
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.driver = type("Driver", (), {
+        "_prepare_declared_unique_values": staticmethod(
+            lambda *_args, **_kwargs: pytest.fail("filled common baseline must not change")
+        ),
+    })()
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    assert executor._prepare_declared_unique_values(
+        object(),
+        {"belongSection": "四川板块", "assetYear": "2026"},
+        exclude_codes={"assetYear"},
+    ) == {}
+
+
+def test_edit_submit_explicitly_disables_duplicate_repair(monkeypatch):
+    class SaveButton:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+
+        def on(self, event, listener):
+            self.listeners[event] = listener
+
+        def remove_listener(self, event, listener):
+            assert self.listeners.pop(event) is listener
+
+    class Driver:
+        @staticmethod
+        def _save_button(_scope):
+            return SaveButton()
+
+        @staticmethod
+        def _collect_record_identity_markers(_submitted, scope=None):
+            return ("AUTO_001",)
+
+        @staticmethod
+        def release_pending_unique_reservations():
+            return None
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor.driver = Driver()
+    received = []
+
+    def click_with_repairs(*_args, **kwargs):
+        received.append(kwargs["allow_unique_repair"])
+        raise AssertionError("该板块对应年度的净资产已存在")
+
+    executor._click_case_save_with_business_repairs = click_with_repairs
+    executor._prepare_declared_unique_values = lambda *_args, **_kwargs: pytest.fail(
+        "edit must not preallocate a unique composite key"
+    )
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "编辑")
+
+    with pytest.raises(AssertionError, match="净资产已存在"):
+        executor._submit_case(
+            _case("accepted"),
+            object(),
+            DiscoveredCommonField(
+                "name", "名称", "text", "text", "#name", FieldConstraints()
+            ),
+            {"recordName": "AUTO_001", "name": "合法名称"},
+            "合法名称",
+            "合法名称",
+            "旧值",
+        )
+
+    assert received == [False]
+
+
+def test_save_click_does_not_call_duplicate_repair_when_explicitly_disabled():
+    class Scope:
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Response:
+        ok = True
+        status = 200
+        url = "https://example.test/netAsset/update"
+
+        @staticmethod
+        def json():
+            return {
+                "code": 500,
+                "message": "该板块对应年度的净资产已存在",
+            }
+
+    responses = []
+
+    class SaveButton:
+        def __init__(self):
+            self.clicks = 0
+
+        def click(self):
+            self.clicks += 1
+            responses.append(Response())
+
+    class Driver:
+        @staticmethod
+        def _find_save_response(observed, _submitted):
+            return observed[-1] if observed else None
+
+        @staticmethod
+        def _assert_business_success(body):
+            if body.get("code") != 0:
+                raise AssertionError(body["message"])
+
+        @staticmethod
+        def _repair_business_validation_message(*_args, **_kwargs):
+            raise AssertionError("edit must not invoke duplicate repair")
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor.driver = Driver()
+    executor._capture_submitted_display_values = lambda *_args: None
+    executor._original_scope_is_visible = lambda *_args: True
+    executor._visible_error_text = lambda *_args: ""
+    save = SaveButton()
+
+    with pytest.raises(AssertionError, match="净资产已存在"):
+        executor._click_case_save_with_business_repairs(
+            Scope(),
+            save,
+            responses,
+            {"belongSection": "四川板块", "assetYear": "2027"},
+            DiscoveredCommonField(
+                "assetYear", "年度", "year", "input", "#year", FieldConstraints()
+            ),
+            None,
+            expected_type="accepted",
+            allow_unique_repair=False,
+        )
+
+    assert save.clicks == 1
 
 
 def test_submit_command_response_matching_accepts_submit_endpoint():
@@ -5263,7 +5787,9 @@ def test_save_command_repairs_duplicate_business_response_and_retries():
                 raise AssertionError("保存接口返回业务失败")
 
         @staticmethod
-        def _repair_business_validation_message(message, current, attempt):
+        def _repair_business_validation_message(
+            message, current, attempt, **_kwargs
+        ):
             assert "已存在" in message
             repaired = {"matterName": f"{current['matterName']}_唯一_{attempt}"}
             repaired_values.append(repaired)
@@ -7510,6 +8036,17 @@ def test_wait_for_new_form_scope_ignores_marked_closing_dialog():
             assert name == "data-ei-form-generation"
             return self.marker
 
+        @staticmethod
+        def locator(_selector):
+            return type(
+                "Controls", (), {
+                    "count": staticmethod(lambda: 1),
+                    "first": type(
+                        "Control", (), {"is_visible": staticmethod(lambda: True)}
+                    )(),
+                }
+            )()
+
     class Dialogs:
         def __init__(self, items):
             self.items = items
@@ -7564,6 +8101,6 @@ def test_wait_for_new_form_scope_rejects_only_marked_old_dialog():
     try:
         executor._wait_for_new_form_scope("old-generation", timeout=1)
     except AssertionError as exc:
-        assert "没有出现新的表单实例" in str(exc)
+        assert "没有出现包含可编辑控件的新表单实例" in str(exc)
     else:
         raise AssertionError("expected stale Dialog rejection")

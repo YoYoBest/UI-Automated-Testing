@@ -286,16 +286,27 @@ def _record_detail_entry(record):
     return _record_name_link_action(record)
 
 
+def _record_business_id(record_identity) -> str:
+    """Return the authoritative persisted ID, never a display marker."""
+    if isinstance(record_identity, str | tuple | list | set):
+        return ""
+    return _normalized_action_text(
+        str(getattr(record_identity, "business_id", "") or "")
+    )
+
+
 def _normalized_record_identity_values(record_identity) -> tuple[str, ...]:
+    """Use a persisted business ID exclusively when one is available."""
     if record_identity is None:
         return ()
+    if business_id := _record_business_id(record_identity):
+        return (business_id,)
     if isinstance(record_identity, str):
         values = [record_identity]
     elif isinstance(record_identity, (tuple, list, set)):
         values = list(record_identity)
     else:
-        values = [getattr(record_identity, "business_id", "")]
-        values.extend(getattr(record_identity, "record_markers", ()) or ())
+        values = list(getattr(record_identity, "record_markers", ()) or ())
     return tuple(dict.fromkeys(
         normalized for value in values
         if (normalized := _normalized_action_text(str(value or "")))

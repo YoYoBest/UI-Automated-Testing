@@ -327,9 +327,7 @@ class CommonFieldExecutor:
         except Exception:
             pass
         self.page = page
-        self.driver.page = page
-        self.driver.interactor.page = page
-        self.driver._common_form_scope = None
+        self.driver.bind_page(page)
         self._reset_driver_nested_evidence()
         self._form_session = CommonFieldFormSession(self)
 
@@ -752,6 +750,11 @@ class CommonFieldExecutor:
         )
 
         def operation(scope):
+            # A framework rerender can replace the pinned dialog between form-open
+            # and the first case. Refresh before any baseline fill or save lookup.
+            if callable(getattr(scope, "evaluate", None)):
+                self._scan_fields(scope)
+                scope = self._active_form_scope() or scope
             recover = None
             if case.field_type == "dialog_title":
                 result = self._execute_dialog_title_case(case, scope)
@@ -777,7 +780,8 @@ class CommonFieldExecutor:
                 # than unrelated required-field validation.
                 self._apply_case_branch_conditions(case, scope)
                 submitted = self._fill_valid_baseline(scope)
-                current = self._current_field(case, scope)
+                current = self._wait_for_current_field(case, scope)
+                scope = self._active_form_scope() or scope
                 locator = self._locator(current)
                 before = self._input_value(locator)
                 requested = self._case_input_value(case, current, before)
@@ -876,7 +880,9 @@ class CommonFieldExecutor:
         try:
             shutil.copy2(source, temporary)
             file_input.set_input_files(str(temporary))
-            self.driver._wait_for_file_upload(file_input, temporary.name)
+            self.driver._wait_for_file_upload(
+                file_input, temporary.name, tracker=lifecycle_tracker,
+            )
             self.driver._wait_for_attachment_lifecycle(
                 lifecycle_tracker, phase="EDIT-004 附件上传"
             )
@@ -2269,7 +2275,12 @@ class CommonFieldExecutor:
             submitted.update(self._modify_form_for_command_save(scope))
         if any(value not in (None, "", []) for value in submitted.values()):
             self._ensure_unique_record_identity(scope, submitted)
-        submitted.update(self._prepare_declared_unique_values(scope, submitted))
+        form_action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
+        is_create = (
+            not form_action or form_action.startswith(COMMON_ADD_ACTION_PREFIXES)
+        )
+        if is_create:
+            submitted.update(self._prepare_declared_unique_values(scope, submitted))
         self._capture_submitted_display_values(submitted, scope)
         responses = []
         requests = []
@@ -2283,6 +2294,18 @@ class CommonFieldExecutor:
         self.page.on("response", listener)
         self.page.on("request", request_listener)
         self.page.on("requestfailed", request_failed_listener)
+        unique_reservation_committed = False
+
+        def commit_unique_reservation() -> None:
+            nonlocal unique_reservation_committed
+            if is_create and not unique_reservation_committed:
+                commit = getattr(
+                    self.driver, "commit_pending_unique_reservations", None
+                )
+                if callable(commit):
+                    commit()
+                unique_reservation_committed = True
+
         try:
             try:
                 scope_handle = scope.element_handle(timeout=1_000)
@@ -2314,6 +2337,7 @@ class CommonFieldExecutor:
                         attempt_responses(), submitted
                     )
                     if direct_matches:
+                        commit_unique_reservation()
                         form_hidden = self._wait_for_command_form_completion(
                             scope, scope_handle
                         )
@@ -2419,8 +2443,18 @@ class CommonFieldExecutor:
                         str(body.get("message") or body.get("msg") or body)
                         if isinstance(body, dict) else ""
                     )
+                    if not is_create:
+                        raise
                     repaired = self.driver._repair_business_validation_message(
-                        message, submitted, attempt
+                        message,
+                        submitted,
+                        attempt,
+                        protected_codes=(
+                            set()
+                            if case.field_type.endswith("_command")
+                            else {case.field_key}
+                        ),
+                        allow_unique_repair=is_create,
                     )
                     can_retry = (
                         repaired
@@ -2434,6 +2468,7 @@ class CommonFieldExecutor:
                         )
                         continue
                     raise
+                commit_unique_reservation()
                 form_hidden = self._wait_for_command_form_completion(scope, scope_handle)
                 if not form_hidden:
                     self._close_retained_form_before_readback(scope, scope_handle)
@@ -2474,6 +2509,12 @@ class CommonFieldExecutor:
                     ),
                 )
         finally:
+            if is_create and not unique_reservation_committed:
+                release = getattr(
+                    self.driver, "release_pending_unique_reservations", None
+                )
+                if callable(release):
+                    release()
             if hasattr(self.page, "remove_listener"):
                 self.page.remove_listener("response", listener)
                 self.page.remove_listener("request", request_listener)
@@ -3545,10 +3586,18 @@ class CommonFieldExecutor:
         *,
         exclude_codes: set[str] | None = None,
     ) -> dict[str, Any]:
+        # Common-field cases begin from an already-filled legal baseline. Keep
+        # those user-visible values intact; an explicit duplicate response can
+        # later authorize a retry of only the current target field.
+        if any(value not in (None, "", []) for value in submitted.values()):
+            return {}
         prepare = getattr(
             self.driver, "_prepare_declared_unique_values", None
         )
         if not callable(prepare):
+            return {}
+        action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
+        if action.startswith(COMMON_EDIT_ACTION_PREFIXES):
             return {}
         return prepare(
             scope,
@@ -3728,15 +3777,20 @@ class CommonFieldExecutor:
         responses = []
         if any(value not in (None, "", []) for value in submitted.values()):
             self._ensure_unique_record_identity(scope, submitted)
-        submitted.update(self._prepare_declared_unique_values(
-            scope,
-            submitted,
-            exclude_codes=(
-                set()
-                if case.field_type.endswith("_command")
-                else (required_codes or {case.field_key})
-            ),
-        ))
+        form_action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
+        is_create = (
+            not form_action or form_action.startswith(COMMON_ADD_ACTION_PREFIXES)
+        )
+        if is_create:
+            submitted.update(self._prepare_declared_unique_values(
+                scope,
+                submitted,
+                exclude_codes=(
+                    set()
+                    if case.field_type.endswith("_command")
+                    else (required_codes or {case.field_key})
+                ),
+            ))
         record_markers = self.driver._collect_record_identity_markers(
             submitted, scope=scope
         )
@@ -3794,6 +3848,18 @@ class CommonFieldExecutor:
         self.page.on("request", request_started)
         self.page.on("requestfinished", request_finished)
         self.page.on("requestfailed", request_failed)
+        unique_reservation_committed = False
+
+        def commit_unique_reservation() -> None:
+            nonlocal unique_reservation_committed
+            if is_create and not unique_reservation_committed:
+                commit = getattr(
+                    self.driver, "commit_pending_unique_reservations", None
+                )
+                if callable(commit):
+                    commit()
+                unique_reservation_committed = True
+
         try:
             try:
                 scope_handle = scope.element_handle(timeout=1_000)
@@ -3811,6 +3877,13 @@ class CommonFieldExecutor:
                     scope_handle,
                     expected_type=case.expected_type,
                     business_request_started=lambda: bool(observed_requests),
+                    protected_codes=(required_codes or {case.field_key}),
+                    retryable_unique_codes=(
+                        {case.field_key}
+                        if is_create and not case.field_type.endswith("_command")
+                        else set()
+                    ),
+                    allow_unique_repair=is_create,
                 )
             )
             if save_response is not None and attachment_lifecycle_tracker is not None:
@@ -3825,6 +3898,7 @@ class CommonFieldExecutor:
             control_rejected = str(actual) != str(requested)
             if case.expected_type == "field_error":
                 if control_rejected and save_response is not None:
+                    commit_unique_reservation()
                     if scope_visible:
                         self._close_retained_form_before_readback(
                             scope, scope_handle
@@ -3894,6 +3968,7 @@ class CommonFieldExecutor:
                     )
                 if scope_visible:
                     self._close_retained_form_before_readback(scope, scope_handle)
+                commit_unique_reservation()
                 self._verify_saved_record(
                     responses,
                     save_response,
@@ -3925,6 +4000,7 @@ class CommonFieldExecutor:
                 )
             if scope_visible:
                 self._close_retained_form_before_readback(scope, scope_handle)
+            commit_unique_reservation()
             self._verify_saved_record(
                 responses,
                 save_response,
@@ -3941,6 +4017,12 @@ class CommonFieldExecutor:
                 str(actual),
             )
         finally:
+            if is_create and not unique_reservation_committed:
+                release = getattr(
+                    self.driver, "release_pending_unique_reservations", None
+                )
+                if callable(release):
+                    release()
             if hasattr(self.page, "remove_listener"):
                 self.page.remove_listener("response", response_received)
                 self.page.remove_listener("request", request_started)
@@ -4053,6 +4135,7 @@ class CommonFieldExecutor:
                 probe_current,
                 scope_handle,
                 expected_type="accepted",
+                protected_codes=set(replacements),
             )
         )
         if probe_response is None:
@@ -4093,6 +4176,9 @@ class CommonFieldExecutor:
         *,
         expected_type: str,
         business_request_started: Callable[[], bool] | None = None,
+        protected_codes: set[str] | None = None,
+        retryable_unique_codes: set[str] | None = None,
+        allow_unique_repair: bool = True,
     ):
         """Save with bounded validation repairs and one no-dispatch self-repair."""
         max_attempts = max(1, int(os.getenv("EI_VALIDATION_SAVE_ATTEMPTS", "3")))
@@ -4218,8 +4304,15 @@ class CommonFieldExecutor:
                     and self._is_explicit_safe_content_rejection(last_message)
                 ):
                     return None, scope_visible, last_message
+                if not allow_unique_repair:
+                    raise
                 repaired = self.driver._repair_business_validation_message(
-                    last_message, submitted, attempt
+                    last_message,
+                    submitted,
+                    attempt,
+                    protected_codes=protected_codes,
+                    retryable_unique_codes=retryable_unique_codes,
+                    allow_unique_repair=allow_unique_repair,
                 )
                 can_retry = (
                     repaired
@@ -4525,6 +4618,16 @@ class CommonFieldExecutor:
                 entry_url = getattr(self, "entry_url", "")
                 if entry_url and self.page.url != entry_url:
                     self.page.goto(entry_url, wait_until="domcontentloaded")
+            if not os.getenv("EI_COMMON_FORM_ACTION", "").strip().startswith(
+                COMMON_EDIT_ACTION_PREFIXES
+            ):
+                prepare_unique = getattr(
+                    getattr(self, "driver", None),
+                    "prepare_unique_constraint_evidence",
+                    None,
+                )
+                if callable(prepare_unique):
+                    prepare_unique()
             return self.open_add_form(require_new=True)
         except SharedFormPreconditionError:
             raise
@@ -4557,15 +4660,17 @@ class CommonFieldExecutor:
             dialogs = self.page.locator(DIALOG)
             for index in range(dialogs.count() - 1, -1, -1):
                 candidate = dialogs.nth(index)
-                if (
-                    candidate.is_visible()
-                    and candidate.get_attribute("data-ei-form-generation")
-                    != previous_generation
-                ):
+                if not candidate.is_visible():
+                    continue
+                if candidate.get_attribute("data-ei-form-generation") == previous_generation:
+                    continue
+                controls = candidate.locator(EDITABLE_FORM_CONTROL)
+                if controls.count() and controls.first.is_visible():
                     return candidate
             self.page.wait_for_timeout(100)
         raise AssertionError(
-            "点击新增后没有出现新的表单实例；旧弹窗可能仍在关闭过渡状态"
+            "点击新增后没有出现包含可编辑控件的新表单实例；"
+            "旧弹窗可能仍在关闭过渡状态"
         )
 
     def close_form(self) -> None:
@@ -4625,6 +4730,9 @@ class CommonFieldExecutor:
         runtime_choice = self._runtime_choice_field(case, scope)
         if runtime_choice is not None:
             return runtime_choice
+        rebound_generated = self._rebind_generated_id_field(case, scope)
+        if rebound_generated is not None:
+            return rebound_generated
         if candidates:
             observed = ", ".join(
                 f"{field.label or field.field_key}/{field.field_type}/{field.kind}"
@@ -4648,8 +4756,109 @@ class CommonFieldExecutor:
                     FieldConstraints(),
                 )
             raise AssertionError(
-                f"当前表单无法定位字段：{case.field_key} ({case.field_label})"
+                f"当前表单无法定位字段：{case.field_key} ({case.field_label})；"
+                f"实际字段={self._runtime_field_inventory(fields)}"
             )
+
+    def _rebind_generated_id_field(self, case: BoundCommonCase, scope):
+        """Rebind a manifest-only Element Plus ID when its stable suffix is unique."""
+        selector = str(case.selector or "").strip()
+        match = re.fullmatch(r"#(el-id-[A-Za-z0-9_-]*?-(\d+))", selector)
+        if match is None:
+            return None
+        suffix = match.group(2)
+        try:
+            candidates = scope.locator(f'input[id$="-{suffix}"]')
+            if candidates.count() != 1 or not candidates.first.is_visible():
+                return None
+            current_id = candidates.first.get_attribute("id") or ""
+        except Exception:
+            return None
+        if not re.fullmatch(rf"el-id-[A-Za-z0-9_-]*-{re.escape(suffix)}", current_id):
+            return None
+        print(
+            "COMMON_FIELD_REBOUND "
+            f"field={case.field_key} generated_id_suffix=-{suffix}",
+            flush=True,
+        )
+        return DiscoveredCommonField(
+            case.field_key,
+            case.field_label,
+            case.field_type,
+            case.field_type,
+            f"#{current_id}",
+            FieldConstraints(),
+        )
+
+    def _runtime_field_inventory(self, fields: Iterable[DiscoveredCommonField]) -> str:
+        """Keep locator failures actionable without exposing form values."""
+        inventory = ", ".join(
+            f"{field.field_key}|{field.label}|{field.field_type}|{field.selector}"
+            for field in fields
+        )
+        return inventory or f"<none>; context={self._form_context_inventory()}"
+
+    def _form_context_inventory(self) -> str:
+        """Describe visible form containers without reading user-entered values."""
+        try:
+            dialogs = self.page.locator(DIALOG)
+            dialog_counts = []
+            for index in range(dialogs.count()):
+                dialog = dialogs.nth(index)
+                dialog_counts.append(
+                    str(dialog.locator(EDITABLE_FORM_CONTROL).count())
+                )
+            active = getattr(getattr(self, "_form_session", None), "active", None)
+            scope_count = (
+                active.scope.locator(EDITABLE_FORM_CONTROL).count()
+                if active is not None else 0
+            )
+            scoped_controls = self._editable_control_inventory(
+                active.scope if active is not None else None
+            )
+            return (
+                f"dialogs={dialogs.count()} editable={dialog_counts}; "
+                f"scopeEditable={scope_count}; "
+                f"pageEditable={self.page.locator(EDITABLE_FORM_CONTROL).count()}; "
+                f"visibleForms={self.page.locator('.el-form:visible,form:visible').count()}; "
+                f"scopeControls={scoped_controls}"
+            )
+        except Exception as exc:
+            return f"<unavailable:{type(exc).__name__}:{str(exc)[:180]}>"
+
+    @staticmethod
+    def _editable_control_inventory(scope, *, limit: int = 8) -> str:
+        """Report control identity only when field scanning unexpectedly returns none."""
+        if scope is None:
+            return "<none>"
+        controls = scope.locator(EDITABLE_FORM_CONTROL)
+        items = []
+        for index in range(min(controls.count(), limit)):
+            control = controls.nth(index)
+            try:
+                items.append(
+                    control.evaluate(
+                        """node => {
+                            const style = getComputedStyle(node);
+                            const rect = node.getBoundingClientRect();
+                            const hiddenAncestor = node.closest('[hidden]');
+                            const ariaHidden = node.closest('[aria-hidden="true"]');
+                            return [
+                                node.tagName.toLowerCase(), node.getAttribute('type') || '',
+                                node.id || '', node.getAttribute('name') || '',
+                                node.closest('.el-form-item,.purvar_form_item')?.getAttribute('prop') || '',
+                                `display=${style.display};visibility=${style.visibility};rect=${Math.round(rect.width)}x${Math.round(rect.height)}`,
+                                `hidden=${hiddenAncestor?.tagName.toLowerCase() || ''}`,
+                                `ariaHidden=${ariaHidden?.tagName.toLowerCase() || ''}`,
+                                `readonly=${node.readOnly ? 'true' : 'false'}`,
+                            ].join('|');
+                        }"""
+                    )
+                )
+            except Exception as exc:
+                items.append(f"<unavailable:{type(exc).__name__}>")
+        suffix = "+" if controls.count() > limit else ""
+        return ", ".join(items) + suffix
 
     def _wait_for_current_field(
         self,
@@ -4674,7 +4883,8 @@ class CommonFieldExecutor:
             if time.monotonic() >= deadline:
                 raise AssertionError(
                     f"当前表单在 {timeout_ms / 1000:g} 秒内未完成字段水合："
-                    f"{case.field_key} ({case.field_label})"
+                    f"{case.field_key} ({case.field_label})；"
+                    f"last={last_error or '<none>'}"
                 ) from last_error
             self.page.wait_for_timeout(100)
 
@@ -5381,6 +5591,10 @@ class CommonFieldExecutor:
             if active is not None:
                 scope = active.scope
         fields = scan_dom_fields(self.page, scope)
+        if not fields and scope is not None:
+            recovered_scope = self._recover_replaced_active_form_scope(scope)
+            if recovered_scope is not None:
+                fields = scan_dom_fields(self.page, recovered_scope)
         mapped = []
         for index, dom in enumerate(fields, 1):
             field_code, field_label, *_ = self.driver._runtime_identity_for_dom(
@@ -5388,6 +5602,68 @@ class CommonFieldExecutor:
             )
             mapped.append(replace(dom, field_code=field_code, label=field_label))
         return mapped
+
+    def _recover_replaced_active_form_scope(self, scope):
+        """Rebind only when a live form uniquely replaces an empty pinned scope."""
+        session = getattr(self, "_form_session", None)
+        active = getattr(session, "active", None)
+        if active is None or active.scope is not scope:
+            return None
+        candidates = []
+        try:
+            for selector in (DIALOG,):
+                containers = self.page.locator(selector)
+                for index in range(containers.count()):
+                    candidate = containers.nth(index)
+                    controls = candidate.locator(EDITABLE_FORM_CONTROL)
+                    if (
+                        candidate.is_visible()
+                        and controls.count()
+                        and controls.first.is_visible()
+                    ):
+                        candidates.append(candidate)
+        except Exception:
+            return None
+        if not candidates:
+            try:
+                containers = self.page.locator(".el-form:visible,form:visible")
+                for index in range(containers.count()):
+                    candidate = containers.nth(index)
+                    controls = candidate.locator(EDITABLE_FORM_CONTROL)
+                    if (
+                        candidate.is_visible()
+                        and controls.count()
+                        and controls.first.is_visible()
+                    ):
+                        candidates.append(candidate)
+            except Exception:
+                return None
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            try:
+                handle = candidate.element_handle()
+                identity = id(handle) if handle is not None else id(candidate)
+            except Exception:
+                identity = id(candidate)
+            if identity not in seen:
+                seen.add(identity)
+                unique_candidates.append(candidate)
+        if len(unique_candidates) != 1:
+            return None
+        rebound = self._pin_form_scope(unique_candidates[0])
+        try:
+            handle = rebound.element_handle()
+        except Exception:
+            handle = None
+        session.active = _ActiveCommonFieldForm(
+            scope=rebound,
+            handle=handle,
+            url=str(getattr(self.page, "url", "")),
+        )
+        self._set_driver_form_scope(rebound)
+        print("COMMON_FORM_SESSION context_rebound=framework_rerender", flush=True)
+        return rebound
 
     def _source_identity_safe_for_dom(
         self, dom, source_code: str, source_label: str

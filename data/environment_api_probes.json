@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "probes": [
+    {
+      "id": "build-project-major-adjustment",
+      "formCodes": ["BUILD_PROJ_MAJOR_ADJUSTMENT"],
+      "components": ["buildProject/before/projectChange/index"],
+      "method": "POST",
+      "readOnly": true,
+      "path": "/fi-service/projMajorAdjustment/listPage",
+      "body": {"currPage": 1, "pageSize": 1},
+      "versionHeader": "X-Source-Revision",
+      "versionMismatchAlertHours": 24
+    }
+  ]
+}

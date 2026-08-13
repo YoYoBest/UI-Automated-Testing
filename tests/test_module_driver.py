@@ -2,6 +2,7 @@ import pytest
 
 import ei_ui_smoke.module_driver as module_driver_module
 from ei_ui_smoke.interactions import FieldInteractor
+from ei_ui_smoke.data_pool import UniqueConstraintSpec
 from ei_ui_smoke.module_driver import (
     ADD_BUTTON, EDITABLE_FORM_CONTROL, INLINE_FORM, DynamicFieldContractError,
     FieldCompletionReport, ModuleSmokeDriver, ModuleSmokeResult, RecordNotDeletableError,
@@ -986,8 +987,12 @@ def test_successful_automation_create_is_registered_before_readback_failure(
     )
     assert registry["records"] == [
         {
+            "schema_version": 2,
+            "registry_key": "https://host/projects::record-1",
             "business_id": "record-1",
             "page_scope": "https://host/projects",
+            "run_id": "",
+            "sequence": None,
             "record_markers": ["AUTO_项目"],
             "submitted": {"name": "AUTO_项目"},
             "record_identity_payload": {
@@ -1058,6 +1063,37 @@ def test_registry_keeps_same_business_id_in_different_page_scopes(tmp_path):
         "https://host/investors",
         "https://host/projects",
     ]
+
+
+def test_registry_uses_scope_and_business_id_as_key_not_marker(tmp_path):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects"})()
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver._submitted_display_values = {}
+    first = ModuleSmokeResult(
+        mode="automation_create_succeeded", business_id="record-1",
+        submitted={"name": "UI自动化_20260812210539_1"},
+        record_markers=("UI自动化_20260812210539_1",),
+    )
+    second = ModuleSmokeResult(
+        mode="automation_create_succeeded", business_id="record-2",
+        submitted={"name": "UI自动化_20260812210539_1"},
+        record_markers=("UI自动化_20260812210539_1",),
+    )
+
+    driver._remember_automation_owned_record(first)
+    driver._remember_automation_owned_record(second)
+
+    registry = module_driver_module.json.loads(
+        driver.automation_record_registry.read_text(encoding="utf-8")
+    )
+    records = registry["records"]
+    assert [record["business_id"] for record in records] == ["record-2", "record-1"]
+    assert all(record["schema_version"] == 2 for record in records)
+    assert records[0]["registry_key"] == "https://host/projects::record-2"
+    assert records[0]["marker_conflict_business_ids"] == ["record-1"]
+    assert all(record["run_id"] == "20260812210539" for record in records)
+    assert all(record["sequence"] == 1 for record in records)
 
 
 def test_forget_registered_record_only_removes_current_page_scope(tmp_path):
@@ -2957,6 +2993,29 @@ def test_response_record_values_uniquely_associate_dom_row_without_row_id():
     assert "取得开工批复" in evidence
 
 
+def test_open_detail_uses_unique_submitted_display_values_without_name_marker():
+    target = RecordRow(
+        ["四川板块", "2031", "123,456.78"],
+        commands=[RecordCommand("查看")],
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["四川板块", "2032", "123,456.78"]),
+        target,
+    ])
+    driver.page.wait_for_timeout = lambda _timeout: None
+
+    row, identity = driver._find_unique_record_container(
+        "saved-id",
+        [],
+        allow_search=False,
+        display_identity_values=["四川板块", "2031", "123456.78"],
+    )
+
+    assert row is target
+    assert identity == "保存字段组合"
+
+
 def test_edit_response_association_uses_source_display_fields_not_hidden_technical_values():
     driver = object.__new__(ModuleSmokeDriver)
     target = RecordRow(["江西板块", "2041", "325,644.32", "编辑", "删除"])
@@ -3284,6 +3343,21 @@ def test_source_field_is_matched_by_visible_label_before_position():
     dom = DomField("el-id-1", "备注：", "textarea", "#el-id-1")
 
     assert driver._source_for_dom(dom, 1) == ("remark", "备注", False)
+
+
+def test_runtime_manifest_hint_stabilizes_generated_element_id_by_label():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [
+        ("belongSection", "板块", False),
+        ("assetYear", "年度", False),
+        ("netAssetAmount", "净资产金额（万元）", False),
+    ]
+
+    code, label, *_ = driver._runtime_identity_for_dom(
+        DomField("el-id-4604-45", "板块", "select", "#el-id-4604-45"), 1
+    )
+
+    assert (code, label) == ("belongSection", "板块")
 
 
 def test_generated_name_field_uses_semantic_label_before_position_fallback():
@@ -5124,16 +5198,35 @@ def test_declared_unique_constraint_updates_year_control_before_save(monkeypatch
     observed = []
 
     class Strategy:
-        @staticmethod
-        def declared_unique_repair_fields(submitted):
-            assert submitted["belongSection"] == "1"
-            return ("assetYear",)
+        spec = UniqueConstraintSpec(
+            form_code="BUILD_NETASSETS_MAINTAIL",
+            field_codes=("belongSection", "assetYear"),
+            repair_field="assetYear",
+            message_includes=("板块", "年度", "已存在"),
+            list_url_includes=("/netAsset/listPage",),
+            field_aliases=(("belongSection", ("belongSectionName",)),),
+        )
+
+        @classmethod
+        def declared_unique_constraints(cls, submitted=None):
+            assert submitted is None or submitted["belongSection"] == "1"
+            return (cls.spec,)
 
         @staticmethod
         def allocate_unique_value(definition, current):
             assert definition.props["domKind"] == "year"
             assert current == "2026"
-            return "2027", {"kind": "unique", "sequence": 1}
+            sequence = getattr(Strategy, "sequence", 0) + 1
+            Strategy.sequence = sequence
+            return str(2026 + sequence), {"kind": "unique", "sequence": sequence}
+
+        @staticmethod
+        def reserve_unique_key_if_available(spec, values, *, page_scope=""):
+            return True
+
+        @staticmethod
+        def unique_key_is_reserved(spec, values, *, page_scope=""):
+            return False
 
     class Interactor:
         @staticmethod
@@ -5144,6 +5237,20 @@ def test_declared_unique_constraint_updates_year_control_before_save(monkeypatch
     scope = object()
     driver.data_strategy = Strategy()
     driver.interactor = Interactor()
+    driver._pending_unique_reservations = []
+    driver._submitted_display_values = {}
+    driver._unique_list_responses = [JsonResponse(
+        "https://host/netAsset/listPage",
+        {
+            "data": {
+                "records": [
+                    {"belongSection": "1", "belongSectionName": "四川板块", "assetYear": year}
+                    for year in (2026, 2027, 2028, 2029)
+                ],
+                "total": 4,
+            }
+        },
+    )]
     driver._source_for_dom = lambda dom, index: (
         "assetYear", "年度", False, "assetYear", "年度", True
     )
@@ -5159,8 +5266,8 @@ def test_declared_unique_constraint_updates_year_control_before_save(monkeypatch
         {"belongSection": "1", "assetYear": "2026"},
     )
 
-    assert prepared == {"assetYear": "2027"}
-    assert observed == [("assetYear", "2027", scope)]
+    assert prepared == {"assetYear": "2030"}
+    assert observed == [("assetYear", "2030", scope)]
     assert driver._validation_repairs[0]["source"] == "declaredUniqueConstraint"
 
 
@@ -5184,6 +5291,367 @@ def test_declared_unique_constraint_does_not_override_target_field(monkeypatch):
         {"belongSection": "1", "assetYear": "2026"},
         exclude_codes={"assetYear"},
     ) == {}
+
+
+def test_duplicate_response_retries_declared_current_target_only_for_add(monkeypatch):
+    spec = UniqueConstraintSpec(
+        form_code="BUILD_NETASSETS_MAINTAIL",
+        field_codes=("belongSection", "assetYear"),
+        repair_field="assetYear",
+        alternate_repair_fields=("belongSection",),
+        message_includes=("板块", "年度", "已存在"),
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.data_strategy = type("Strategy", (), {
+        "repair_value": staticmethod(lambda *_args: ""),
+        "declared_unique_constraint_for_message": staticmethod(
+            lambda _message, _submitted: spec
+        ),
+    })()
+    driver._pending_unique_reservations = []
+    driver._release_pending_unique_reservations_for_spec = lambda _spec: None
+    captured = {}
+    driver._repair_declared_unique_constraint = lambda constraint, candidates, *_args, **kwargs: (
+        captured.update(constraint=constraint, candidates=candidates, protected=kwargs["protected_codes"])
+        or {"assetYear": "2028"}
+    )
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    repaired = driver._repair_business_validation_message(
+        "该板块对应年度的净资产已存在",
+        {"belongSection": "四川板块", "assetYear": "2027"},
+        1,
+        protected_codes={"assetYear"},
+        retryable_unique_codes={"assetYear"},
+    )
+
+    assert repaired == {"assetYear": "2028"}
+    assert captured == {
+        "constraint": spec,
+        "candidates": ("assetYear",),
+        "protected": set(),
+    }
+
+
+def test_duplicate_save_response_forces_new_value_when_list_snapshot_is_stale(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    spec = UniqueConstraintSpec(
+        form_code="BUILD_NETASSETS_MAINTAIL",
+        field_codes=("belongSection", "assetYear"),
+        repair_field="assetYear",
+        message_includes=("板块", "年度", "已存在"),
+    )
+    driver.page = object()
+    driver.data_strategy = type("Strategy", (), {
+        "allocate_unique_value": staticmethod(
+            lambda _definition, _old: ("2028", {"kind": "unique"})
+        ),
+        "reserve_unique_key_if_available": staticmethod(
+            lambda *_args, **_kwargs: True
+        ),
+        "unique_key_is_reserved": staticmethod(lambda *_args, **_kwargs: False),
+    })()
+    driver._validation_repairs = []
+    driver._pending_unique_reservations = []
+    driver._capture_submitted_display_values = lambda *_args: None
+    driver._occupied_unique_keys = lambda _spec: []
+    driver._dom_fields_by_code = lambda _scope: {
+        "assetYear": (
+            DomField("assetYear", "年度", "year", "#year", required=True), "年度",
+        ),
+    }
+    driver._automation_registry_scope = lambda: "https://host/netAssets"
+    driver._candidate_alias_values = lambda _spec, values, code, candidate: tuple(
+        frozenset({str(candidate if field_code == code else values[field_code])})
+        for field_code in _spec.field_codes
+    )
+    filled = []
+    driver.interactor = type("Interactor", (), {
+        "fill": staticmethod(lambda _resolved, value, **_kwargs: filled.append(value) or value),
+    })()
+    monkeypatch.setenv("EI_COMMON_FORM_ACTION", "新增")
+
+    repaired = driver._repair_declared_unique_constraint(
+        spec,
+        ("assetYear",),
+        {"belongSection": "四川板块", "assetYear": "2027"},
+        source="saveResponse",
+        protected_codes=set(),
+        message="该板块对应年度的净资产已存在",
+        scope=object(),
+    )
+
+    assert repaired == {"assetYear": "2028"}
+    assert filled == ["2028"]
+
+
+def _net_asset_unique_spec():
+    return UniqueConstraintSpec(
+        form_code="BUILD_NETASSETS_MAINTAIL",
+        field_codes=("belongSection", "assetYear"),
+        repair_field="belongSection",
+        message_includes=("板块", "年度", "已存在"),
+        list_url_includes=("/netAsset/listPage",),
+        record_paths=("data.records",),
+        field_aliases=(("belongSection", ("belongSectionName",)),),
+    )
+
+
+def _unique_page_response(records, total):
+    return JsonResponse(
+        "https://host/netAsset/listPage",
+        {"data": {"records": records, "total": total}},
+    )
+
+
+def _unique_paged_driver(monkeypatch, pages, *, captured_page=2, page_size=2):
+    calls = []
+
+    class PagingRequest:
+        method = "POST"
+        url = "https://host/netAsset/listPage"
+        post_data_json = {"pageNum": captured_page, "pageSize": page_size}
+
+    class RequestContext:
+        @staticmethod
+        def fetch(original_request, *, data):
+            assert original_request is captured.request
+            calls.append(data["pageNum"])
+            return pages[data["pageNum"]]
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"request": RequestContext()})()
+    captured = pages[captured_page]
+    captured.request = PagingRequest()
+    monkeypatch.delenv("EI_UNIQUE_LIST_MAX_PAGES", raising=False)
+    return driver, captured, calls
+
+
+def test_unique_snapshot_replays_authenticated_pagination_from_page_one(monkeypatch):
+    records = [
+        {"id": str(index), "belongSection": str(index), "assetYear": 2027}
+        for index in range(1, 6)
+    ]
+    pages = {
+        1: _unique_page_response(records[0:2], 5),
+        2: _unique_page_response(records[2:4], 5),
+        3: _unique_page_response(records[4:5], 5),
+    }
+    driver, captured, calls = _unique_paged_driver(
+        monkeypatch, pages, captured_page=2,
+    )
+
+    result = driver._complete_unique_list_records(
+        captured, _net_asset_unique_spec(),
+    )
+
+    assert calls == [1, 2, 3]
+    assert [record["id"] for record in result] == ["1", "2", "3", "4", "5"]
+
+
+def test_unique_snapshot_rejects_repeated_pages_that_only_reach_total_by_count(
+    monkeypatch,
+):
+    first_page = [
+        {"belongSection": "1", "assetYear": 2027},
+        {"belongSection": "2", "assetYear": 2027},
+    ]
+    pages = {
+        1: _unique_page_response(first_page, 4),
+        2: _unique_page_response(first_page, 4),
+    }
+    driver, captured, calls = _unique_paged_driver(
+        monkeypatch, pages, captured_page=2,
+    )
+
+    with pytest.raises(AssertionError):
+        driver._complete_unique_list_records(captured, _net_asset_unique_spec())
+
+    assert calls == [1, 2]
+
+
+def test_unique_snapshot_rejects_overlapping_duplicate_records(monkeypatch):
+    records = [
+        {"id": str(index), "belongSection": str(index), "assetYear": 2027}
+        for index in range(1, 4)
+    ]
+    pages = {
+        1: _unique_page_response(records[0:2], 4),
+        2: _unique_page_response(records[1:3], 4),
+    }
+    driver, captured, calls = _unique_paged_driver(
+        monkeypatch, pages, captured_page=2,
+    )
+
+    with pytest.raises(AssertionError):
+        driver._complete_unique_list_records(captured, _net_asset_unique_spec())
+
+    assert calls == [1, 2]
+
+
+def test_unique_snapshot_fails_closed_when_replayed_page_is_unauthorized(monkeypatch):
+    records = [
+        {"id": str(index), "belongSection": str(index), "assetYear": 2027}
+        for index in range(1, 3)
+    ]
+    unauthorized = _unique_page_response([], 4)
+    unauthorized.ok = False
+    unauthorized.status = 401
+    pages = {
+        1: _unique_page_response(records, 4),
+        2: unauthorized,
+    }
+    driver, captured, calls = _unique_paged_driver(
+        monkeypatch, pages, captured_page=1,
+    )
+
+    with pytest.raises(AssertionError, match="401"):
+        driver._complete_unique_list_records(captured, _net_asset_unique_spec())
+
+    assert calls == [1, 2]
+
+
+def test_unique_snapshot_prefers_business_id_over_equal_composite_key(monkeypatch):
+    records = [
+        {"id": "1", "belongSection": "1", "assetYear": 2027},
+        {"id": "2", "belongSection": "1", "assetYear": 2027},
+    ]
+    response = _unique_page_response(records, 2)
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"request": object()})()
+    monkeypatch.delenv("EI_UNIQUE_LIST_MAX_PAGES", raising=False)
+
+    assert driver._complete_unique_list_records(
+        response, _net_asset_unique_spec(),
+    ) == records
+
+
+def test_unique_snapshot_uses_complete_composite_key_for_records_without_id(
+    monkeypatch,
+):
+    records = [
+        {"belongSectionName": "四川板块", "assetYear": 2027},
+        {"belongSectionName": "四川板块", "assetYear": 2028},
+    ]
+    response = _unique_page_response(records, 2)
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"request": object()})()
+    monkeypatch.delenv("EI_UNIQUE_LIST_MAX_PAGES", raising=False)
+
+    assert driver._complete_unique_list_records(
+        response, _net_asset_unique_spec(),
+    ) == records
+
+
+def test_unique_snapshot_reads_total_from_selected_record_envelope(monkeypatch):
+    records = [
+        {"id": "1", "belongSection": "1", "assetYear": 2027},
+        {"id": "2", "belongSection": "2", "assetYear": 2027},
+    ]
+    response = JsonResponse(
+        "https://host/netAsset/listPage",
+        {
+            "unrelatedSummary": {"total": 999},
+            "data": {"records": records, "total": 2},
+        },
+        payload={"pageNum": 1, "pageSize": 2},
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"request": object()})()
+    monkeypatch.delenv("EI_UNIQUE_LIST_MAX_PAGES", raising=False)
+
+    assert driver._complete_unique_list_records(
+        response, _net_asset_unique_spec(),
+    ) == records
+
+
+def test_unique_snapshot_rejects_unrelated_total_when_record_envelope_has_none():
+    records = [
+        {"id": "1", "belongSection": "1", "assetYear": 2027},
+        {"id": "2", "belongSection": "2", "assetYear": 2027},
+    ]
+    response = JsonResponse(
+        "https://host/netAsset/listPage",
+        {"unrelatedSummary": {"total": 2}, "data": {"records": records}},
+        payload={"pageNum": 1, "pageSize": 2},
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"request": object()})()
+
+    with pytest.raises(AssertionError):
+        driver._complete_unique_list_records(response, _net_asset_unique_spec())
+
+
+def test_choice_actual_value_mismatch_releases_provisional_unique_reservation():
+    driver = object.__new__(ModuleSmokeDriver)
+    spec = _net_asset_unique_spec()
+    scope = object()
+    active = set()
+    released = []
+
+    class Strategy:
+        @staticmethod
+        def reserve_unique_key_if_available(_spec, values, *, page_scope=""):
+            claim = (values, page_scope)
+            if claim in active:
+                return False
+            active.add(claim)
+            return True
+
+        @staticmethod
+        def release_unique_key(_spec, values, *, page_scope=""):
+            claim = (values, page_scope)
+            released.append(claim)
+            active.discard(claim)
+
+        @staticmethod
+        def unique_key_is_reserved(_spec, values, *, page_scope=""):
+            return (values, page_scope) in active
+
+    driver.data_strategy = Strategy()
+    driver._validation_repairs = []
+    driver._pending_unique_reservations = []
+    driver._capture_submitted_display_values = lambda *_args: None
+    driver._occupied_unique_keys = lambda _spec: [
+        (frozenset({"1"}), frozenset({"2027"})),
+    ]
+    driver._dom_fields_by_code = lambda _scope: {
+        "belongSection": (
+            DomField(
+                "belongSection", "所属板块", "select", "#section", required=True,
+            ),
+            "所属板块",
+        ),
+    }
+    driver._automation_registry_scope = lambda: "https://host/netAssets"
+    driver._candidate_alias_values = lambda _spec, values, code, candidate: tuple(
+        frozenset({str(candidate if field_code == code else values[field_code])})
+        for field_code in _spec.field_codes
+    )
+    driver._available_choice_values = lambda *_args: [("2", 0)]
+    driver._select_by_label = lambda *_args, **_kwargs: "3"
+
+    prepared = driver._repair_declared_unique_constraint(
+        spec,
+        ("belongSection",),
+        {"belongSection": "1", "assetYear": "2027"},
+        source="declaredUniqueConstraint",
+        protected_codes=set(),
+        scope=scope,
+    )
+
+    wrong_key = (frozenset({"2"}), frozenset({"2027"}))
+    wrong_claim = (wrong_key, "https://host/netAssets")
+    assert wrong_claim in released
+    assert wrong_claim not in active
+    assert all(item[1] != wrong_key for item in driver._pending_unique_reservations)
+    assert prepared == {"belongSection": "3"}
+    actual_key = (frozenset({"3"}), frozenset({"2027"}))
+    actual_claim = (actual_key, "https://host/netAssets")
+    assert actual_claim in active
+    assert (spec, actual_key, "https://host/netAssets") in (
+        driver._pending_unique_reservations
+    )
 
 
 def test_default_readback_uses_collection_child_paths_not_wrapper_field():
@@ -6143,6 +6611,203 @@ def test_attachment_lifecycle_request_failure_fails_case():
         )
 
     assert "token=secret" not in str(exc.value)
+
+
+def test_attachment_lifecycle_records_sanitized_request_evidence():
+    class Response:
+        status = 500
+        ok = False
+        url = "https://host/foundation/oss/upload?token=secret"
+
+        @staticmethod
+        def json():
+            return {"code": 500, "message": "storage unavailable", "secret": "omit"}
+
+    class Request:
+        method = "POST"
+        url = Response.url
+        response = Response()
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+            self.url = "https://host/projects?token=secret"
+
+        def on(self, event, callback):
+            self.listeners[event] = callback
+
+        def remove_listener(self, event, _callback):
+            self.listeners.pop(event)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            pass
+
+        @staticmethod
+        def evaluate(*_args):
+            pass
+
+        @staticmethod
+        def screenshot(**_kwargs):
+            return b"png"
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    tracker = driver._start_attachment_lifecycle_tracking()
+    request = Request()
+    page.listeners["request"](request)
+    page.listeners["requestfinished"](request)
+
+    with pytest.raises(AssertionError, match="附件/存储服务明确失败"):
+        driver._wait_for_attachment_lifecycle(tracker, phase="附件上传", quiet_ms=0)
+
+    finished = tracker.events[-1]
+    assert finished["url"] == "https://host/foundation/oss/upload"
+    assert finished["httpStatus"] == 500
+    assert finished["response"] == {"code": "500", "message": "storage unavailable"}
+    assert getattr(page, "_ei_ui_failure_evidence").diagnostics["attachmentLifecycle"]["classification"] == "attachment_request_failed"
+
+
+def test_attachment_lifecycle_pending_request_is_network_timeout_with_evidence(monkeypatch):
+    class Request:
+        method = "POST"
+        url = "https://host/foundation/oss/upload?token=secret"
+
+    class Page:
+        url = "https://host/form?token=secret"
+
+        def __init__(self):
+            self.listeners = {}
+
+        def on(self, event, callback):
+            self.listeners[event] = callback
+
+        def remove_listener(self, event, _callback):
+            self.listeners.pop(event)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            pass
+
+        @staticmethod
+        def evaluate(*_args):
+            return []
+
+        @staticmethod
+        def screenshot(**_kwargs):
+            return b"png"
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    tracker = driver._start_attachment_lifecycle_tracking()
+    page.listeners["request"](Request())
+    monotonic = iter((0.0, 2.0))
+    monkeypatch.setattr("ei_ui_smoke.module_driver.time.monotonic", lambda: next(monotonic))
+
+    with pytest.raises(AssertionError, match="network_request_timeout"):
+        driver._wait_for_attachment_lifecycle(
+            tracker, phase="附件上传", timeout_ms=1, quiet_ms=0,
+        )
+
+    evidence = getattr(page, "_ei_ui_failure_evidence")
+    assert evidence.diagnostics["attachmentLifecycle"]["classification"] == "network_request_timeout"
+    assert evidence.diagnostics["attachmentLifecycle"]["events"][0]["url"] == "https://host/foundation/oss/upload"
+
+
+def test_attachment_pending_backend_task_is_diagnostic_not_explicit_failure(tmp_path):
+    attachment = tmp_path / "attachment.jpg"
+    attachment.write_bytes(b"image")
+
+    class Page:
+        url = "https://host/form"
+
+        def __init__(self):
+            self.listeners = {}
+
+        def on(self, event, callback):
+            self.listeners[event] = callback
+
+        def remove_listener(self, event, _callback):
+            self.listeners.pop(event)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            pass
+
+        @staticmethod
+        def evaluate(*_args):
+            return []
+
+        @staticmethod
+        def screenshot(**_kwargs):
+            return b"png"
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.default_upload_file = attachment
+    driver.page = page
+    driver._file_input_has_value = lambda _input: False
+    driver._wait_for_file_upload = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("upload component did not settle")
+    )
+    dialog = FileDialog([FileInput()])
+    tracker_holder = []
+    def start():
+        tracker = type("Tracker", (), {
+            "failures": [], "backend_pending": [{"status": "processing"}],
+            "pending": {}, "requests": [], "events": [], "enabled": False,
+            "final_classification": "",
+        })()
+        tracker_holder.append(tracker)
+        return tracker
+
+    driver._start_attachment_lifecycle_tracking = start
+    with pytest.raises(AssertionError, match="backend_task_processing_timeout") as exc:
+        driver._upload_default_attachments(dialog)
+
+    assert "明确失败" not in str(exc.value)
+    assert driver.last_attachment_report.classification == "backend_task_processing_timeout"
+    assert getattr(page, "_ei_ui_failure_evidence").diagnostics["attachmentLifecycle"]["classification"] == "backend_task_processing_timeout"
+
+
+def test_attachment_component_wait_timeout_is_frontend_diagnostic():
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    class Input:
+        @staticmethod
+        def element_handle():
+            return object()
+
+    class Page:
+        url = "https://host/form?token=secret"
+
+        @staticmethod
+        def wait_for_function(*_args, **_kwargs):
+            raise PlaywrightTimeoutError("component did not settle")
+
+        @staticmethod
+        def evaluate(*_args):
+            return []
+
+        @staticmethod
+        def screenshot(**_kwargs):
+            return b"png"
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    tracker = type("Tracker", (), {
+        "failures": [], "backend_pending": [], "pending": {}, "requests": [],
+        "events": [], "final_classification": "",
+    })()
+
+    with pytest.raises(AssertionError, match="frontend_render_timeout"):
+        driver._wait_for_file_upload(Input(), "attachment.jpg", tracker=tracker)
+
+    assert tracker.final_classification == "frontend_render_timeout"
+    assert getattr(page, "_ei_ui_failure_evidence").diagnostics["attachmentLifecycle"]["classification"] == "frontend_render_timeout"
 
 
 def test_field_completion_report_includes_fill_exception(monkeypatch):

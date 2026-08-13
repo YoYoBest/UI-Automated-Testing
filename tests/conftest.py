@@ -16,6 +16,12 @@ from ei_ui_smoke.common_field_cases import (
     save_common_case_coverage,
 )
 from ei_ui_smoke.allure_report import set_allure_module_metadata
+from ei_ui_smoke.browser_recovery import (
+    BrowserNavigationCircuit,
+    BrowserNavigationCircuitOpen,
+    BrowserRecoveryPolicy,
+    recover_fresh_browser_session,
+)
 from ei_ui_smoke.failure_evidence import consume_failure_evidence
 from ei_ui_smoke.qcc_browser import install_qcc_route
 from ei_ui_smoke.qcc_proxy import QccSearchService, QccSettings
@@ -176,6 +182,18 @@ def pytest_runtest_makereport(item, call):
         )
         allure.attach(_safe_url(failure_url), "失败页面 URL", allure.attachment_type.TEXT)
         allure.attach(screenshot, "失败页面截图", allure.attachment_type.PNG)
+        if evidence is not None and evidence.diagnostics:
+            allure.attach(
+                json.dumps(evidence.diagnostics, ensure_ascii=False, indent=2),
+                "失败结构化诊断",
+                allure.attachment_type.JSON,
+            )
+        if evidence is not None and evidence.dom_snapshot:
+            allure.attach(
+                json.dumps(evidence.dom_snapshot, ensure_ascii=False, indent=2),
+                "失败页面 DOM 结构快照",
+                allure.attachment_type.JSON,
+            )
     except Exception:
         pass
 
@@ -245,10 +263,43 @@ def browser_runtime(request):
     state = os.getenv("EI_STORAGE_STATE") or None
     with sync_playwright() as playwright:
         runtime = {"browser": None, "context": None, "page": None}
+        policy = BrowserRecoveryPolicy(
+            fresh_session_attempts=_positive_int_env(
+                "EI_BROWSER_NAVIGATION_ATTEMPTS", 2
+            ),
+            circuit_failure_threshold=_positive_int_env(
+                "EI_BROWSER_NAVIGATION_CIRCUIT_FAILURES", 3
+            ),
+        )
+        circuit = BrowserNavigationCircuit(policy)
 
-        def ensure_page():
-            browser = runtime["browser"]
-            if browser is None or not browser.is_connected():
+        def close_runtime_session(session=None):
+            active = session if isinstance(session, dict) else runtime
+            page = active.get("page")
+            context = active.get("context")
+            browser = active.get("browser")
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    if browser.is_connected():
+                        browser.close()
+                except Exception:
+                    pass
+            if active is runtime:
+                runtime.update(browser=None, context=None, page=None)
+
+        def open_ready_session():
+            session = {"browser": None, "context": None, "page": None}
+            try:
                 browser = playwright.chromium.launch(
                     headless=os.getenv("EI_HEADLESS", "true").lower() != "false"
                 )
@@ -266,11 +317,8 @@ def browser_runtime(request):
                     QccSearchService(qcc_settings),
                     backend_mode=qcc_mode == "backend",
                 )
-                runtime.update(browser=browser, context=context, page=None)
-
-            page = runtime["page"]
-            if page is None or page.is_closed():
-                page = runtime["context"].new_page()
+                page = context.new_page()
+                session.update(browser=browser, context=context, page=page)
                 page.goto(form_url, wait_until="domcontentloaded")
                 username = os.getenv("EI_USERNAME", "")
                 password = os.getenv("EI_PASSWORD", "")
@@ -281,23 +329,53 @@ def browser_runtime(request):
                     page.locator("button.submit,button:has-text('登录')").first.click()
                     page.wait_for_load_state("networkidle")
                     page.goto(form_url, wait_until="domcontentloaded")
-                runtime["page"] = page
-                print("BROWSER_SESSION_RECOVERED", flush=True)
+                page.locator("body").wait_for(state="visible", timeout=10_000)
+                page.wait_for_function(
+                    "() => (document.body?.innerText || '').trim().length > 0",
+                    timeout=20_000,
+                )
+                return session
+            except Exception:
+                close_runtime_session(session)
+                raise
+
+        def ensure_page():
+            browser = runtime["browser"]
+            page = runtime["page"]
+            if browser is None or not browser.is_connected() or page is None or page.is_closed():
+                close_runtime_session()
+                try:
+                    session, attempt = recover_fresh_browser_session(
+                        url=form_url,
+                        policy=policy,
+                        circuit=circuit,
+                        open_session=open_ready_session,
+                        close_session=close_runtime_session,
+                    )
+                except BrowserNavigationCircuitOpen as exc:
+                    pytest.skip(str(exc))
+                runtime.update(session)
+                page = runtime["page"]
+                print(
+                    "BROWSER_SESSION_RECOVERED "
+                    f"fresh_session_attempt={attempt} "
+                    f"consecutive_item_failures={circuit.consecutive_failures}",
+                    flush=True,
+                )
             return page
 
         yield ensure_page
 
-        context = runtime["context"]
-        browser = runtime["browser"]
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser is not None and browser.is_connected():
-            browser.close()
+        close_runtime_session()
 
 
 @pytest.fixture
 def browser_page(browser_runtime):
     return browser_runtime()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default

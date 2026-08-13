@@ -112,6 +112,11 @@ $env:ZENTAO_ASSIGNEE = '<assignee>'
 - 配置写入用户环境后必须关闭旧 Run Test 窗口并重新启动。验证时只报告变量是否存在，不输出账号、密码或实际值。
 - 不把凭据写入仓库、Skill、日志、草稿、Allure 附件、提交回执或 `auth-state.json`。
 
+## 证据隐私
+
+- Allure/禅道附件可包含失败截图、脱敏 URL、调用方显式提供的结构化诊断和无值 DOM 结构快照。结构快照仅允许选择器、数量、tag、class 和 ARIA 状态；禁止附加完整 DOM/HTML、文本内容、控件值、控制台、网络请求体、Cookie、Token 或 storage state。
+- Capture the viewport before recovery or form cleanup changes the failure state. A temporary on-screen error banner is allowed only for screenshot capture and must be removed immediately afterward; retain the sanitized URL, screenshot, and explicitly supplied safe diagnostics only.
+
 ## 验证
 
 修改 Allure 映射、正文、附件或提交字段后至少运行：

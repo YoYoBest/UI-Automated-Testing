@@ -10,6 +10,7 @@ from ei_ui_smoke.allure_report import (
     set_allure_common_case_metadata,
 )
 from ei_ui_smoke.common_field_executor import CommonFieldExecutor
+from ei_ui_smoke.common_field_cases import load_field_manifest
 from ei_ui_smoke.config import Settings
 from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
@@ -19,7 +20,7 @@ from ei_ui_smoke.source_form import discover_custom_form_fields
 
 
 @pytest.fixture(scope="module")
-def common_field_executor(browser_runtime):
+def common_field_executor(pytestconfig):
     project_root = Path(__file__).resolve().parents[1]
     settings = Settings.from_env()
     module_key = os.getenv("EI_MODULE_ID") or settings.form_code or "MODULE"
@@ -29,8 +30,24 @@ def common_field_executor(browser_runtime):
     source_fields = discover_custom_form_fields(
         settings.source_root, os.getenv("EI_COMPONENT", "")
     )
+    manifest_path = (
+        pytestconfig.getoption("--common-fields-manifest")
+        or os.getenv("EI_COMMON_FIELDS_MANIFEST", "")
+    ).strip()
+    if manifest_path:
+        source_codes = {str(code) for code, *_ in source_fields}
+        source_fields.extend(
+            (field.field_key, field.label, False)
+            for field in load_field_manifest(Path(manifest_path))
+            if (
+                field.field_key
+                and not field.field_key.startswith("__")
+                and not field.field_key.startswith("el-id-")
+                and field.field_key not in source_codes
+            )
+        )
     executor = CommonFieldExecutor(
-        browser_runtime(),
+        None,
         strategy,
         source_fields=source_fields,
         default_upload_file=pool.default_upload_file(),

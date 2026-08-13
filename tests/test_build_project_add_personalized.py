@@ -599,14 +599,14 @@ def _assert_radio_options(scope, field, expected: list[str]) -> None:
 
 
 @pytest.fixture(scope="module")
-def module_case_executor(browser_runtime):
+def module_case_executor():
     project_root = Path(__file__).resolve().parents[1]
     settings = Settings.from_env()
     module_key = os.getenv("EI_MODULE_ID") or settings.form_code or "MODULE"
     form_code = os.getenv("EI_FORM_CODE", "") or settings.form_code or module_key
     pool = GlobalDataPool.from_directory(project_root / "data")
     executor = CommonFieldExecutor(
-        browser_runtime(),
+        None,
         create_data_strategy("standard", pool, form_code),
         source_fields=discover_custom_form_fields(
             settings.source_root, os.getenv("EI_COMPONENT", "")

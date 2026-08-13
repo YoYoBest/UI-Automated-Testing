@@ -11,6 +11,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 ## Detail Data Preconditions
 
 - Detail actions must enter through a real parent-list record. If that list is stably loaded but empty, or every bounded existing candidate reaches the requested child module with a rendered `暂无数据` table, provision one automation-owned parent record using the normal add/save path before attempting detail navigation. Do not provision for permission, route, component, or other non-data navigation failures.
+- When an add or prior lookup has supplied a persisted business ID, detail navigation must use that ID as the sole record identity. Do not combine it with display markers or names, which can match an unrelated business record; markers remain a fallback only when no persisted ID exists.
 - Navigation after provisioning must use the returned business ID or automation marker to locate one exact parent row/card. Do not substitute the first visible business record; an absent or ambiguous match is a failed precondition.
 - Keep the provisioned result for subsequent detail actions in the same execution batch, so every action targets the same known record.
 - When a row-level edit/view action is unavailable on that provisioned parent because its target child table is empty, enter the same child module through its real Add action, create one automation-owned child record, then re-enter the exact parent and retry the requested action. This seed is only for the isolated automation parent; never create a child record under an existing business parent.
@@ -32,6 +33,44 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 - Until discovery has registered every dependent validation total, progress is intentionally unknown. Once registration completes, show the exact independent pytest/Allure item total and completed count.
 - Cover the pair in launcher regression tests: each eligible worksheet must plan discovery before validation, and the two environments must have identical manifest path, worksheet, selected IDs, and form action.
 - A parent-node click may cascade selection to its descendants, but the final execution plan must use the current selected executable node IDs. Do not re-expand selected parent paths during planning: a descendant that the user manually deselects, together with its own descendants, must not run. Cover both the full cascade and a manually removed child branch.
+
+## Browser Navigation Recovery
+
+- On a browser-test failure, attach the sanitized failure URL and screenshot as usual. When the executor captured structured diagnostics, attach their JSON and a bounded rendered-DOM snapshot to the same Allure result; use this for evidence collection only, not a persistent monitoring dashboard. Diagnostics must contain no URL query values, request bodies, cookies, tokens, or credentials.
+
+- Treat initial deployed-page navigation as a per-item browser/environment precondition. On failure, close the entire page, context, and browser, then retry once in a newly created browser session; do not retry inside the failed session.
+- Count only fully exhausted fresh-session recovery failures, not individual attempts. Let later parametrized items start their own fresh-session recovery so transient failures lose only the current item. Reset the consecutive-failure count only after navigation reaches a visible, non-empty page.
+- After the configured consecutive-item threshold (default three), open a module-local circuit and explicitly skip remaining items with the environment-precondition reason. Do not spend the navigation timeout for every remaining parameter or contaminate later modules. Do not eagerly obtain a page in a module-scoped executor fixture: construct it without a page and bind it only after the current function-scoped browser fixture has recovered, otherwise pytest caches one setup failure across the parameter set.
+- Require post-navigation page readiness in addition to HTTP/navigation completion. Record the URL, attempt count, consecutive failure count, error summary, and failure evidence for an exhausted current item. Keep `EI_BROWSER_NAVIGATION_ATTEMPTS` and `EI_BROWSER_NAVIGATION_CIRCUIT_FAILURES` positive and configurable.
+
+## Environment API Preflight
+
+- After source synchronization and before pytest collection, run only configured read-only API probes matched by the selected form code or component. `GET`/`HEAD` are allowed; `POST` requires an explicit `readOnly=true` declaration and a JSON body. Never probe a write endpoint.
+- Preflight probes may reuse the saved browser-session credentials only for the exact target host and must never emit authorization headers, cookies, or storage-state values to run logs, Allure, or diagnostics. A matching HTTP 404 blocks only its dependent commands as `environment-version-mismatch`; network/TLS probe failures remain preflight evidence, not an automatic product defect.
+- A concrete HTTP 404 blocks only the commands that depend on that probe, records an environment-preflight report, and must not be reclassified as a product defect. Other status codes remain ordinary execution evidence. Compare an optional deployed-version header with the selected source revision and warn only after a configured persistent mismatch period.
+- The launcher runs this preflight only after a successful source sync and before every pytest collection command, then writes `artifacts/runs/environment-api-preflight.json` and appends its blocked/warning counts to the source-sync log.
+- `source-sync.log` is a `pathlib.Path`, not an open stream. Rewrite the synchronization output with `write_text`, but append the preflight summary through `append_environment_preflight_summary`, which opens the path in append mode; never call `.write(...)` directly on the `Path`. Cover this with a temporary source-sync log regression.
+- Give every launcher batch one generated automation run ID and every dispatched pytest command a stable target sequence. The pair must be forwarded through the command environment so generated data and automation-owned-record evidence can distinguish simultaneous module executions.
+- Cover the probe manifest's read-only POST guard, per-command 404 blocking, non-404 pass-through, configured request payload, and delayed version-mismatch warning in `tests/test_environment_api.py`.
+- Probe matching must accept either the selected real form code or normalized component path. Missing probe configuration means no preflight target, not a failed test; malformed configuration must block before tests are scheduled.
+
+## Launcher Freshness Guard
+
+- `run_test.vbs` must clean only the process tree recorded by the previous launcher, never kill every Python, browser, or driver process by executable name.
+- Record the launcher PID together with its Windows creation time and refuse to terminate a reused PID whose creation time differs.
+- Capture a content fingerprint of every `src/ei_ui_smoke/**/*.py` file when the launcher starts. Before any selected test is scheduled, recompute and compare it; if it changed, block the run and require a launcher restart so old in-memory orchestration code cannot run. Read Git HEAD directly only as an optional display label: never depend on `git status`, global Git configuration, user ignore files, or an external Git process for this guard.
+- A temporary source-file read failure must not prevent the GUI from opening, but execution must retry the fingerprint and block with its actionable error rather than scheduling tests against unverifiable loaded code. Structural unit-test doubles that call `run_selected` without constructing a GUI may omit it, allowing the existing command-planning behavior to be tested without reading the checkout.
+- Preserve this guard with unit coverage for identical and changed fingerprints, and for stale process-record cleanup that cannot remove a newer launcher record.
+- Before `run_test.vbs` starts cleanup Python or the launcher, remove inherited `TortoiseSVN\bin` entries from that process's `PATH`. TortoiseSVN installations can ship an obsolete private `MSVCP140.dll`; allowing Python to load it can crash `pythonw.exe` with `0xc0000005`. Keep the system runtime and Git command directories available, and cover the launcher-script contract in `tests/test_execution_guard.py`.
+
+## Environment API Deployment Guard
+
+- Configure new-module deployment probes in `data/environment_api_probes.json`, matching the real `formCode` and/or normalized component path. Each probe must target a source-confirmed read-only endpoint; `POST` is accepted only with an explicit `readOnly: true` marker and a bounded query payload. Never probe save, delete, or other write endpoints.
+- Treat `readOnly: true` as necessary but insufficient: reject a probe path containing an explicit write verb such as save, create, update, delete, remove, submit, or upload. Only a successful `2xx` response may establish or advance a source-versus-deployment version mismatch; a 404 or other non-success response is not version-header evidence.
+- After source synchronization and before pytest collection, probe only the endpoints required by the selected commands using the saved browser-session cookies and the front-end-compatible `Authorization` token from storage state. A `404` blocks only matching commands as `environment-version-mismatch`; record the endpoint URL and status in `artifacts/runs/environment-api-preflight.json`, do not submit a product bug, and do not report the blocked command as passed.
+- Capture the selected run's storage state and source root before removing blocked commands. A batch in which every command is blocked must still emit the complete preflight and version-mismatch report without reading from an empty command list.
+- Authentication, TLS, network, and non-404 HTTP failures are not deployment evidence. Preserve their normal test behavior rather than reclassifying them as environment mismatch.
+- When an opted-in deployment response emits the configured source-revision header, persist its first observed mismatch. Warn only after the configured duration (default 24 hours); a version mismatch does not silently reroute an endpoint or downgrade a later 404 to success.
 
 # UI 冒烟测试
 
@@ -114,7 +153,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 1. 在项目根目录工作，确认 `.venv` 可用；依赖不完整时运行 `.\.venv\Scripts\python.exe -m pip install -e .`。
 2. 先运行 `.\.venv\Scripts\python.exe -m pytest -q`，验证本地契约测试没有回归。
 3. 执行已部署 UI 时，使用 `run_test.vbs` 打开图形启动器，或按测试要求设置 `EI_*` 环境变量后运行带 `--browser-smoke` 的 pytest。图形启动器可仅为同一活动批次的 pytest 子进程设置 `EI_DEFER_SKILL_MAINTENANCE_GATE=true`，并必须在批次结束后执行一次正常门禁检查；直接 pytest 仍在会话启动时执行门禁，不得绕过。
-4. 图形启动器每次正式启动 UI pytest 批次前，先同步业务源码仓库：默认扫描 `D:\Auto_Testing\Project_Purvar\SHZY` 下的直接子级 Git 工程（如 `ei-parent`、`fi-parent`），逐个执行 `git pull --ff-only`，成功或跳过信息写入 `artifacts/runs/source-sync.log`。同步失败时必须阻断本轮 pytest 并提示“源码同步失败，未启动 pytest”，不要继续使用可能过期的源码生成用例；临时关闭用 `EI_AUTO_PULL_SOURCE=false`，变更目录用 `EI_AUTO_PULL_SOURCE_ROOT`，调整单仓库超时用 `EI_AUTO_PULL_SOURCE_TIMEOUT_SECONDS`。
+4. 图形启动器每次正式启动 UI pytest 批次前，先同步业务源码仓库：默认扫描 `D:\Auto_Testing\Project_Purvar\SHZY` 下的直接子级 Git 工程（如 `ei-parent`、`fi-parent`），逐个执行 `git pull --ff-only`，成功或跳过信息写入 `artifacts/runs/source-sync.log`。同步失败时必须阻断本轮 pytest 并提示“源码同步失败，未启动 pytest”，不要继续使用可能过期的源码生成用例；临时关闭用 `EI_AUTO_PULL_SOURCE=false`，变更目录用 `EI_AUTO_PULL_SOURCE_ROOT`，调整单仓库超时用 `EI_AUTO_PULL_SOURCE_TIMEOUT_SECONDS`。批次执行完成后先生成并打开已有 Allure 结果，再执行一次正常 Skill 门禁检查；门禁失败必须显式展示，不能让已完成的运行无报告或伪装为成功。
 5. 一次执行只创建一个时间戳 Allure results 目录；多模块测试全部追加到该目录，禁止每个模块互相覆盖结果。
 6. 测试结束后生成报告，记录最新结果和报告路径。即使测试失败，也保留 Allure 原始结果与 `artifacts/runs` 日志。
 7. 报告生成后通过 `open_allure_report()` 或 `allure open <report-dir>` 启动本地 HTTP 服务。
@@ -237,6 +276,9 @@ exit $pytestExit
 
 ### 默认自修复闭环
 
+- 启动器、模块操作和公共字段入口向数据策略传递的必须是解析后的真实业务 `formCode`。序列化产生的空值字符串 `None`/`null`/`undefined` 一律按缺失处理，再从设置或运行时组件解析；不得把模块 ID、动作 ID 或字面量空值传给策略，否则页面专属唯一约束和数据覆盖会静默失效。删除用例创建前置数据时也必须遵守同一规则。
+- 字段定位失败必须在异常与字段诊断中输出当前表单的无值运行时库存：业务代码、标签、控件类型和当前选择器。用该证据先区分字段未渲染、身份映射错误和动态选择器失效；禁止要求人工先指出漏掉的字段，或用旧 `el-id-*` 猜测定位。
+- 部署页面浏览器初始导航失败时，以全新 browser/context/page 重试当前 pytest 项的有限次数，并关闭失败会话；成功即清零失败计数。连续失败达到模块级阈值才熔断后续项并标为浏览器/环境前置，不能把一次空白或超时会话归为字段定位、输入或产品保存失败。
 - 任一模块未通过时，除非用户明确只要求诊断，否则默认执行“读取本轮日志、Allure 与字段诊断 -> 写出可证伪根因 -> 修复公共根因 -> 运行定向回归 -> 复跑同一真实模块”的闭环。不得停在首次失败分析、只修本地测试，或跳过失败模块继续宣称批次完成。
 - 修复必须落在最小的通用职责层，并为根因补回归测试；禁止仅按模块名、动态 DOM ID、临时按钮位置或本次测试数据写硬编码。修复模块发现后复跑发现用例，修复字段/交互后复跑 CRUD 用例，修复编排后复跑启动器用例，最后运行完整 `pytest -q`。
 - 只有同一真实目标通过，或形成可复现且已排除自动化提交、权限、登录、版本、网络和测试数据问题的系统缺陷证据，才结束闭环。HTTP 5xx、“系统异常”、页面白屏或截图中的错误提示本身都不足以直接判定系统 Bug。
@@ -295,7 +337,12 @@ exit $pytestExit
 
 ## 安全边界
 
+- Failure attachments may include an explicit sanitized diagnostic object and a bounded DOM structure snapshot containing only selected visible-container selectors, counts, tag names, class names and ARIA state. Never retain full page DOM/HTML, text content, form values, console output, request bodies, credentials, Cookie, Token, or storage state.
+- Keep a failure-evidence regression proving that a diagnostic object survives capture/consumption while no DOM snapshot attribute is retained and no DOM-read evaluation is issued.
+
 - Runtime field location must use the same label-class vocabulary as DOM discovery. When a form exposes only a framework-specific `*label*` class, retain it in locator fallback coverage so required-validation evidence can resolve the same visible control.
+- Browser navigation recovery is a shared execution precondition: preserve the first navigation failure evidence, recover one fresh browser session through the navigation circuit, and stop the affected command when the circuit opens. Do not let each parametrized field retry a failed navigation independently, because one route outage would otherwise be reported as many unrelated field failures.
+- Cover failure evidence as part of the browser-runner contract: capture failures must tolerate screenshot or page-evaluation errors, and consuming evidence must clear the page-local cache so a later result cannot inherit an earlier screenshot.
 
 - 不把用户名、密码、Cookie、Token 或 storage state 内容写入 Allure 环境信息和附件。
 - 不清理历史报告，除非用户明确要求；使用新的时间戳目录。

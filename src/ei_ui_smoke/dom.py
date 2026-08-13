@@ -34,7 +34,13 @@ DOM_FIELD_SCRIPT = r"""
 (providedRoot) => {
   const visible = (el) => {
     if (!(el instanceof HTMLElement)) return false;
-    if (el.closest('[hidden], [aria-hidden="true"]')) return false;
+    if (el.closest('[hidden]')) return false;
+    const ariaHidden = el.closest('[aria-hidden="true"]');
+    // Element Plus may retain aria-hidden on a dialog wrapper while its pinned
+    // dialog is still geometrically visible and editable.  Ignore that stale
+    // wrapper state only for the supplied form root (or one of its ancestors);
+    // a hidden descendant inside the form must remain excluded.
+    if (ariaHidden && (!providedRoot || !ariaHidden.contains(providedRoot))) return false;
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
@@ -66,11 +72,17 @@ DOM_FIELD_SCRIPT = r"""
       node.matches(disabledStateSelector) || !!node.closest(disabledStateSelector)
     ));
   };
-  const controls = [...root.querySelectorAll(
+  const rawControls = [...root.querySelectorAll(
     `input:not([type="hidden"]),textarea,select,[contenteditable="true"],` +
     `[role="combobox"],[role="switch"],[role="checkbox"],[role="radio"],` +
     componentControlSelector
-  )].filter(visibleControl);
+  )];
+  const visibleControls = rawControls.filter(visibleControl);
+  // A pinned Playwright form root already proves the intended dialog contains
+  // editable controls. Some deployed Element Plus layers still make the
+  // in-page visibility predicate reject every descendant. Keep the fallback
+  // restricted to that pinned root; never apply it to a page-wide scan.
+  const controls = visibleControls.length || !providedRoot ? visibleControls : rawControls;
   const cleanLabel = (value) => (value || '').replace(/^\s*\*\s*/, '').replace(/\s+/g, ' ').trim();
   const optionLabelSelector = '.el-radio,.el-checkbox,.ant-radio-wrapper,.ant-checkbox-wrapper,[role="radio"],[role="checkbox"]';
   const componentPlaceholder = (el) => {

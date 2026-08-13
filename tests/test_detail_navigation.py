@@ -154,6 +154,45 @@ class _RecordWithNameLink:
         return _EmptyDetailAction()
 
 
+class _IdentityCells:
+    def __init__(self, values):
+        self.values = values
+
+    def count(self):
+        return len(self.values)
+
+    def all_inner_texts(self):
+        return self.values
+
+
+class _IdentityRecord:
+    def __init__(self, business_id, *values):
+        self.business_id = business_id
+        self.values = values
+
+    def get_attribute(self, name):
+        return self.business_id if name == "data-row-key" else ""
+
+    def locator(self, selector):
+        if selector == "td,[role='cell']":
+            return _IdentityCells(self.values)
+        return _EmptyDetailAction()
+
+    def inner_text(self):
+        return "\n".join(self.values)
+
+
+class _IdentityRecords:
+    def __init__(self, records):
+        self.records = records
+
+    def count(self):
+        return len(self.records)
+
+    def nth(self, index):
+        return self.records[index]
+
+
 def test_parent_list_readiness_ignores_stale_rows_behind_loading_mask():
     page = _StatePage([
         (True, ["stale row"]),
@@ -177,6 +216,22 @@ def test_detail_record_uses_business_name_link_when_no_detail_button():
     target = detail_navigation._record_detail_entry(record)
 
     assert target is record.link
+
+
+def test_persisted_parent_business_id_beats_a_duplicate_automation_marker():
+    target = _IdentityRecord("parent-2", "UI自动化_20260812210539_1")
+    duplicate = _IdentityRecord("parent-1", "UI自动化_20260812210539_1")
+    identity = SimpleNamespace(
+        business_id="parent-2", record_markers=("UI自动化_20260812210539_1",)
+    )
+
+    assert detail_navigation._normalized_record_identity_values(identity) == (
+        "parent-2",
+    )
+    assert detail_navigation._record_for_identity(
+        _IdentityRecords([duplicate, target]),
+        detail_navigation._normalized_record_identity_values(identity),
+    ) is target
 
 
 def test_detail_record_click_timeout_becomes_bounded_readiness_failure(monkeypatch):
