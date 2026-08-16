@@ -21,6 +21,7 @@ from ei_ui_smoke.detail_navigation import (
     visible_action as _visible_action,
 )
 from ei_ui_smoke.module_driver import ModuleSmokeDriver, RecordNotDeletableError
+from ei_ui_smoke.project_progress_preconditions import project_progress_parent_provisioner
 from ei_ui_smoke.module_resolver import resolve_form_code
 from ei_ui_smoke.source_form import discover_custom_form_fields
 from ei_ui_smoke.common_delete_cases import CommonDeleteCase, load_common_delete_cases
@@ -340,6 +341,9 @@ def _prepare_detail_action_context(
         record_identity=created,
         provision_record=provision_parent_record,
         provision_child_record=provision_child_record,
+        provision_eligible_record=project_progress_parent_provisioner(
+            browser_page, form_url, module_name,
+        ),
     )
 
 
@@ -1017,10 +1021,12 @@ def test_selected_page_action(browser_page, request, action_case):
 
 def _run_common_delete_case(browser_page, request, case):
     driver = _crud_driver(browser_page, request)
-    created = driver.find_reusable_automation_delete_record()
+    created = driver.find_available_delete_record()
     if created is None:
-        created = driver.run(provision_only=True)
-        assert created.mode == "add_provisioned"
+        driver.run(provision_only=True)
+        created = driver.find_available_delete_record()
+    if created is None:
+        raise RecordNotDeletableError("页面没有可用的删除记录")
     try:
         return _run_delete_case_behavior(driver, created, case)
     except RecordNotDeletableError:
@@ -1039,12 +1045,12 @@ def _run_delete_case_behavior(driver, record, case):
     return result
 
 
-def test_common_delete_reuses_owned_record_without_creating(monkeypatch):
-    reusable = SimpleNamespace(mode="delete_reusable_record", business_id="owned-1")
+def test_common_delete_uses_available_record_without_creating(monkeypatch):
+    reusable = SimpleNamespace(mode="delete_any_available", business_id="")
     calls = []
 
     class Driver:
-        def find_reusable_automation_delete_record(self):
+        def find_available_delete_record(self):
             return reusable
 
         def run(self, *, provision_only=False):
@@ -1065,20 +1071,19 @@ def test_common_delete_reuses_owned_record_without_creating(monkeypatch):
     assert calls == []
 
 
-def test_common_delete_creates_when_no_safe_reusable_record_exists(monkeypatch):
-    provisioned = SimpleNamespace(mode="add_provisioned", business_id="created-1")
+def test_common_delete_provisions_only_when_no_available_record_exists(monkeypatch):
     calls = []
 
     class Driver:
-        def find_reusable_automation_delete_record(self):
-            return None
+        def find_available_delete_record(self):
+            return None if not calls else SimpleNamespace(mode="delete_any_available")
 
         def run(self, *, provision_only=False):
             calls.append(provision_only)
-            return provisioned
+            return SimpleNamespace(mode="add_provisioned")
 
         def delete_created_record(self, record):
-            assert record is provisioned
+            assert record.mode == "delete_any_available"
             return SimpleNamespace(mode="add_and_delete_verified")
 
     monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())

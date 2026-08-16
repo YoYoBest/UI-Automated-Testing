@@ -460,6 +460,34 @@ def test_provision_only_forces_add_flow_when_current_detail_action_is_edit(monke
     assert called == ["add"]
 
 
+def test_explicit_submit_command_does_not_fall_back_to_save_button():
+    class MissingCommand:
+        @property
+        def last(self):
+            return self
+
+        def filter(self, **_kwargs):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class Scope:
+        @staticmethod
+        def locator(_selector):
+            return MissingCommand()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    selected = driver._save_button(Scope(), operation="提交")
+
+    assert selected.count() == 0
+
+
 def test_add_entry_skips_hidden_or_disabled_stale_buttons():
     hidden = AddEntry(visible=False)
     disabled = AddEntry(enabled=False)
@@ -1966,7 +1994,7 @@ def test_same_resource_detail_request_rejects_invalid_or_unassociated_response(r
     assert driver._request_same_resource_detail_response(save, "record-1") is None
 
 
-def test_saved_record_uses_same_resource_detail_only_after_exact_dom_miss(monkeypatch):
+def test_saved_record_uses_same_resource_detail_before_any_dom_lookup(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     api_response = ApiResponse(
         "https://host/fi-service/risk/detail/record-1",
@@ -1990,9 +2018,20 @@ def test_saved_record_uses_same_resource_detail_only_after_exact_dom_miss(monkey
         {"code": 200, "data": {"id": "record-1"}},
     )
     monkeypatch.setattr(driver, "_assert_nested_values_in_payload", lambda *args, **kwargs: None)
-    monkeypatch.setattr(driver, "_try_current_page_list_readback", lambda *args, **kwargs: False)
-    monkeypatch.setattr(driver, "_find_associated_detail_response", lambda *args: None)
-    monkeypatch.setattr(driver, "_can_uniquely_locate_current_record", lambda *args: False)
+    monkeypatch.setattr(
+        driver,
+        "_try_current_page_list_readback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("exact-ID detail readback must not inspect the DOM list")
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_find_associated_detail_response",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("exact-ID detail readback must not use list-response association")
+        ),
+    )
 
     result = driver.verify_saved_record(
         [save],
@@ -2004,6 +2043,53 @@ def test_saved_record_uses_same_resource_detail_only_after_exact_dom_miss(monkey
 
     assert result.mode == "add_and_detail_verified"
     assert result.detail_url.endswith("/risk/detail/record-1")
+
+
+def test_saved_record_fetches_exact_detail_after_incomplete_associated_list(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    associated_list = JsonResponse(
+        "https://host/fi-service/risk/listPage",
+        {"code": 200, "data": {"records": [{"id": "record-1"}]}},
+    )
+    exact_detail = ApiResponse(
+        "https://host/fi-service/risk/detail/record-1",
+        {
+            "code": 200,
+            "data": {"id": "record-1", "name": "AUTO_risk"},
+        },
+    )
+    driver.page = RequestPage([exact_detail])
+    driver._nested_evidence = []
+    save = JsonResponse(
+        "https://host/fi-service/risk/add",
+        {"code": 200, "data": {"id": "record-1"}},
+    )
+    monkeypatch.setattr(driver, "_assert_nested_values_in_payload", lambda *args, **kwargs: None)
+    monkeypatch.setattr(driver, "_try_current_page_list_readback", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        driver, "_find_associated_detail_response", lambda *args: associated_list,
+    )
+    monkeypatch.setattr(
+        driver,
+        "_detail_response_readback_or_fallback",
+        lambda response, *args, **kwargs: (
+            response.json() if response.url.endswith("/detail/record-1") else None
+        ),
+    )
+
+    result = driver.verify_saved_record(
+        [save, associated_list],
+        save,
+        {"name": "AUTO_risk"},
+        ("AUTO_risk",),
+        required_codes={"name"},
+    )
+
+    assert result.mode == "add_and_detail_verified"
+    assert result.detail_url.endswith("/risk/detail/record-1")
+    assert driver.page.request.urls == [
+        "https://host/fi-service/risk/detail/record-1"
+    ]
 
 
 def test_saved_record_same_resource_detail_rejects_field_mismatch(monkeypatch):
@@ -2993,6 +3079,368 @@ def test_response_record_values_uniquely_associate_dom_row_without_row_id():
     assert "取得开工批复" in evidence
 
 
+def test_latest_editable_candidate_skips_newer_ambiguous_record_and_uses_next_record():
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class EditAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class EditableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            assert exact is True
+            return EditAction() if role == "button" and name == "编辑" else NoAction()
+
+    unique_older = EditableRow(["竣工", "管理员", "2026-08-12", "编辑"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        EditableRow(["开工", "管理员", "2026-08-13", "编辑"]),
+        EditableRow(["开工", "管理员", "2026-08-13", "编辑"]),
+        unique_older,
+    ])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [
+            {
+                "id": "300", "progressTypeName": "开工",
+                "createByName": "管理员", "createDt": "2026-08-13 10:00:00",
+            },
+            {
+                "id": "200", "progressTypeName": "竣工",
+                "createByName": "管理员", "createDt": "2026-08-12 10:00:00",
+            },
+        ]}},
+    )
+
+    candidates = driver._latest_editable_response_candidates([response], "编辑")
+
+    assert [(business_id, container) for business_id, container, _evidence in candidates] == [
+        ("200", unique_older),
+    ]
+
+
+def test_latest_editable_candidate_uses_business_id_to_break_same_creation_time_tie():
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class EditAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class EditableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            return EditAction() if role == "button" and name == "编辑" and exact else NoAction()
+
+    older_id = EditableRow(["开工", "管理员甲", "2026-08-13", "编辑"])
+    newer_id = EditableRow(["竣工", "管理员乙", "2026-08-13", "编辑"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([older_id, newer_id])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [
+            {
+                "id": "19", "progressTypeName": "开工",
+                "createByName": "管理员甲", "createDt": "2026-08-13 10:00:00",
+            },
+            {
+                "id": "20", "progressTypeName": "竣工",
+                "createByName": "管理员乙", "createDt": "2026-08-13 10:00:00",
+            },
+        ]}},
+    )
+
+    candidates = driver._latest_editable_response_candidates([response], "编辑")
+
+    assert [business_id for business_id, _container, _evidence in candidates] == ["20", "19"]
+
+
+def test_latest_editable_candidate_matches_timestamp_to_rendered_date_and_modify_action():
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class ModifyAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class EditableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            return ModifyAction() if role == "button" and name == "修改" and exact else NoAction()
+
+    target = EditableRow(["竣工", "管理员", "2026-08-13", "修改"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([target])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [{
+            "id": "200", "progressTypeName": "竣工",
+            "createByName": "管理员", "createDt": "2026-08-13 10:00:00",
+        }]}},
+    )
+
+    candidates = driver._latest_editable_response_candidates([response], "编辑")
+
+    assert [(business_id, container) for business_id, container, _evidence in candidates] == [
+        ("200", target),
+    ]
+
+
+def test_latest_editable_candidate_rejects_record_without_creation_time():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([RecordRow(["开工", "管理员", "编辑"])])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [{
+            "id": "200", "progressTypeName": "开工", "createByName": "管理员",
+        }]}},
+    )
+
+    assert driver._latest_editable_response_candidates([response], "编辑") == []
+
+
+def test_open_latest_editable_record_form_falls_back_to_enabled_visible_row(monkeypatch):
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class EditAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class EditableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            return EditAction() if role == "button" and name == "编辑" and exact else NoAction()
+
+    row = EditableRow(["已存在项目进度", "编辑"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([row])
+    opened = []
+    monkeypatch.setattr(driver, "_refresh_list_after_delete", lambda: False)
+    monkeypatch.setattr(
+        driver,
+        "_open_record_container_action",
+        lambda container, identity, *_args, **_kwargs: opened.append((container, identity)),
+    )
+
+    assert driver.open_latest_editable_record_form("编辑") is True
+    assert opened == [(row, "当前可编辑记录（无需新增记录关联）")]
+
+
+def test_latest_delete_candidate_skips_newer_ambiguous_owned_record():
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class DeleteAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class DeletableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            return DeleteAction() if role == "button" and name == "删除" and exact else NoAction()
+
+    older = DeletableRow(["竣工", "管理员", "2026-08-12", "删除"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        DeletableRow(["开工", "管理员", "2026-08-13", "删除"]),
+        DeletableRow(["开工", "管理员", "2026-08-13", "删除"]),
+        older,
+    ])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [
+            {
+                "id": "300", "progressTypeName": "开工",
+                "createByName": "管理员", "createDt": "2026-08-13 10:00:00",
+            },
+            {
+                "id": "200", "progressTypeName": "竣工",
+                "createByName": "管理员", "createDt": "2026-08-12 10:00:00",
+            },
+        ]}},
+    )
+
+    candidates = driver._latest_automation_delete_response_candidates(
+        [response], allowed_business_ids={"300", "200"},
+    )
+
+    assert [(business_id, row) for _key, business_id, row, _evidence, _payload in candidates] == [
+        ("200", older),
+    ]
+
+
+def test_latest_delete_candidate_excludes_unregistered_newest_business_record():
+    class NoAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 0
+
+    class DeleteAction:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+    class DeletableRow(RecordRow):
+        def get_by_role(self, role, name, exact):
+            return DeleteAction() if role == "button" and name == "删除" and exact else NoAction()
+
+    owned = DeletableRow(["自动化进度", "管理员", "2026-08-12", "删除"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        DeletableRow(["业务进度", "管理员", "2026-08-13", "删除"]),
+        owned,
+    ])
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/listPage",
+        {"data": {"records": [
+            {
+                "id": "business-300", "progressTypeName": "业务进度",
+                "createByName": "管理员", "createDt": "2026-08-13 10:00:00",
+            },
+            {
+                "id": "auto-200", "progressTypeName": "自动化进度",
+                "createByName": "管理员", "createDt": "2026-08-12 10:00:00",
+            },
+        ]}},
+    )
+
+    candidates = driver._latest_automation_delete_response_candidates(
+        [response], allowed_business_ids={"auto-200"},
+    )
+
+    assert [business_id for _key, business_id, _row, _evidence, _payload in candidates] == ["auto-200"]
+
+
+def test_latest_delete_candidate_refuses_missing_json_evidence():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([RecordRow(["自动化进度", "删除"])])
+
+    assert driver._latest_automation_delete_response_candidates(
+        [], allowed_business_ids={"auto-200"},
+    ) == []
+
+
 def test_open_detail_uses_unique_submitted_display_values_without_name_marker():
     target = RecordRow(
         ["四川板块", "2031", "123,456.78"],
@@ -3314,6 +3762,89 @@ def test_file_type_detail_endpoint_is_accepted_as_detail_data():
 
 def test_mcname_is_recognized_as_qcc_company_field():
     assert ModuleSmokeDriver._is_company_remote("mcName", "el-id-949-68")
+
+
+def test_qcc_remote_select_uses_the_owned_element_plus_dropdown():
+    class EmptyLocator:
+        @staticmethod
+        def count():
+            return 0
+
+    class Option:
+        clicked = False
+
+        @staticmethod
+        def inner_text():
+            return "测试企业"
+
+        @staticmethod
+        def evaluate(_script):
+            return True
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def locator(_selector):
+            return EmptyLocator()
+
+        def click(self, **_kwargs):
+            self.clicked = True
+
+    option = Option()
+
+    class Options:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return option
+
+    class Popper:
+        selector = ""
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def locator(self, selector):
+            self.selector = selector
+            return Options()
+
+    popper = Popper()
+
+    class Page:
+        @staticmethod
+        def locator(selector):
+            assert selector == "#qcc-owned-popper"
+            return popper
+
+        @staticmethod
+        def wait_for_timeout(_milliseconds):
+            return None
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page()
+    driver._select_controls_id = lambda *_controls: "qcc-owned-popper"
+
+    selected = driver._select_business_value(
+        resolve_select_control=lambda: (None, None),
+        field_code="enterpriseName",
+        lookup_label="企业名称",
+        option_index=0,
+        is_company_remote=True,
+    )
+
+    assert selected == "测试企业"
+    assert ".el-select-dropdown__item:not(.is-disabled)" in popper.selector
+    assert option.clicked
 
 
 def test_entity_already_exists_prefers_only_remote_company_field():
@@ -4506,6 +5037,28 @@ def test_delete_row_accepts_unique_combination_of_saved_display_values():
 
     assert selected is target
     assert identity == "保存字段组合"
+
+
+def test_delete_row_allows_any_enabled_delete_command_when_authorized():
+    driver = object.__new__(ModuleSmokeDriver)
+    disabled = DeleteRow(
+        ["history"],
+        commands=[RecordCommand("删除", disabled="disabled")],
+    )
+    enabled = DeleteRow(
+        ["deletable"],
+        commands=[RecordCommand("删除")],
+    )
+
+    selected, identity = driver._find_unique_delete_row(
+        "missing-id",
+        ["AUTO_missing"],
+        rows=DeleteRows([disabled, enabled]),
+        allow_arbitrary_row=True,
+    )
+
+    assert selected is enabled
+    assert identity == "__arbitrary_delete_row__"
 
 
 def test_delete_confirmation_allows_hidden_row_id_only_for_unique_saved_values(monkeypatch):
@@ -6843,3 +7396,23 @@ def test_writes_machine_readable_field_diagnostics(monkeypatch, tmp_path):
     assert '"selector": "#name"' in content
     assert '"attachment"' in content
     assert (tmp_path / "latest.json").is_file()
+
+
+def test_record_container_reads_business_id_contract_attribute():
+    class EmptyCommands:
+        @staticmethod
+        def count():
+            return 0
+
+    class Row:
+        @staticmethod
+        def get_attribute(name):
+            return "2088154566317617153" if name == "data-business-id" else None
+
+        @staticmethod
+        def locator(_selector):
+            return EmptyCommands()
+
+    assert ModuleSmokeDriver._record_container_business_ids(Row()) == {
+        "2088154566317617153"
+    }

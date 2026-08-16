@@ -46,6 +46,7 @@ IMPLICIT_REQUIRED_NESTED_SECTION_RE = re.compile(
     r"(?:(?:预算|资金来源|费用|金额|款项).{0,12}明细|明细.{0,12}(?:预算|资金来源|费用|金额|款项))"
 )
 AUTOMATION_RECORD_PREFIXES = ("AUTO_", "UI自动化")
+ARBITRARY_DELETE_ROW_MARKER = "__arbitrary_delete_row__"
 
 DYNAMIC_COLLECTION_CONTRACT_SCRIPT = r"""
 root => [...root.querySelectorAll('[data-ei-collection-field]')].map((node) => ({
@@ -78,6 +79,7 @@ DETAIL_DISPLAY_ALIASES = {
     "parentId": ("parentName",),
     "projName": ("shortName",),
     "progressType": ("progressTypeName",),
+    "createBy": ("createByName",),
     "financeSources.*.sourceFrom": ("financeSources.*.sourceFromName",),
 }
 
@@ -307,16 +309,22 @@ class ModuleSmokeDriver:
             interactor.page = page
         self._common_form_scope = None
 
-    def run(self, *, provision_only: bool = False) -> ModuleSmokeResult:
+    def run(
+        self, *, provision_only: bool = False, submit: bool = False,
+    ) -> ModuleSmokeResult:
         try:
-            result = self._run_create(provision_only=provision_only)
+            result = self._run_create(
+                provision_only=provision_only, submit=submit,
+            )
         except Exception:
             self.release_pending_unique_reservations()
             raise
         self.commit_pending_unique_reservations()
         return result
 
-    def _run_create(self, *, provision_only: bool = False) -> ModuleSmokeResult:
+    def _run_create(
+        self, *, provision_only: bool = False, submit: bool = False,
+    ) -> ModuleSmokeResult:
         # Detail actions such as Edit do not themselves require an Add button,
         # but their isolated parent-data provisioner always does.  Do not let
         # the action's EI_REQUIRE_ADD setting turn that provisioner into a
@@ -370,9 +378,10 @@ class ModuleSmokeDriver:
         self.write_field_diagnostics(self.last_field_report, submitted, attempts)
         if not self._field_report_ok(self.last_field_report):
             raise AssertionError("保存前字段检查失败：" + self.last_field_report.message())
-        save = self._save_button(scope)
+        save = self._save_button(scope, operation="提交" if submit else "")
         if not save.count() or not save.is_visible():
-            raise AssertionError("新增表单已打开，但没有找到保存/确定按钮")
+            expected = "提交" if submit else "保存/确定"
+            raise AssertionError(f"新增表单已打开，但没有找到{expected}按钮")
         responses = []
         self.page.on("response", lambda response: responses.append(response))
         self._save_with_validation_repairs(scope, save, responses, submitted)
@@ -512,7 +521,50 @@ class ModuleSmokeDriver:
                     else set(submitted)
                 ),
             )
-        if self._try_current_page_list_readback(
+        # A successful save with an exact business ID is verified through the
+        # same resource's detail API before inspecting the rendered list.  A
+        # table can omit the ID, truncate values, or contain duplicate text;
+        # none of those conditions should invalidate an ID-addressed JSON
+        # readback.
+        detail_response = None
+        detail_body = None
+        associated_detail_body = None
+        if business_id:
+            requested_detail = self._request_same_resource_detail_response(
+                save_response, business_id
+            )
+            if requested_detail is not None:
+                detail_response = requested_detail
+                detail_body = self._detail_response_readback_or_fallback(
+                    requested_detail,
+                    submitted,
+                    required_codes=required_codes,
+                    business_id=business_id,
+                    record_markers=record_markers,
+                    save_payload=save_payload,
+                )
+                associated_detail_body = requested_detail.json()
+                if detail_body is not None and not rendered_text_expectations:
+                    return ModuleSmokeResult(
+                        mode="add_and_detail_verified",
+                        business_id=business_id,
+                        save_url=save_response.url,
+                        detail_url=requested_detail.url,
+                        submitted=submitted,
+                        record_markers=record_markers,
+                        record_identity_payload=associated_detail_body,
+                    )
+                if filtered_all_requested_codes and not explicit_empty_readback:
+                    return ModuleSmokeResult(
+                        mode="add_and_detail_verified",
+                        business_id=business_id,
+                        save_url=save_response.url,
+                        detail_url=requested_detail.url,
+                        submitted=submitted,
+                        record_markers=record_markers,
+                        record_identity_payload=associated_detail_body,
+                    )
+        if detail_body is None and self._try_current_page_list_readback(
             submitted,
             record_markers,
             business_id,
@@ -528,12 +580,11 @@ class ModuleSmokeDriver:
                 record_markers=record_markers,
                 record_identity_payload=record_identity_payload,
             )
-        detail_response = self._find_associated_detail_response(
-            responses, save_response, business_id
-        )
-        detail_body = None
-        associated_detail_body = None
-        if detail_response is not None:
+        if detail_body is None:
+            detail_response = self._find_associated_detail_response(
+                responses, save_response, business_id
+            )
+        if detail_response is not None and detail_body is None:
             detail_body = self._detail_response_readback_or_fallback(
                 detail_response,
                 submitted,
@@ -559,48 +610,6 @@ class ModuleSmokeDriver:
                     record_markers=record_markers,
                     record_identity_payload=associated_detail_body,
                 )
-        if (
-            detail_body is None
-            and associated_detail_body is None
-            and business_id
-            and not self._can_uniquely_locate_current_record(
-                echo_values, business_id
-            )
-        ):
-            requested_detail = self._request_same_resource_detail_response(
-                save_response, business_id
-            )
-            if requested_detail is not None:
-                detail_body = self._detail_response_readback_or_fallback(
-                    requested_detail,
-                    submitted,
-                    required_codes=required_codes,
-                    business_id=business_id,
-                    record_markers=record_markers,
-                    save_payload=save_payload,
-                )
-                associated_detail_body = requested_detail.json()
-                detail_response = requested_detail
-                if detail_body is not None and not rendered_text_expectations:
-                    return ModuleSmokeResult(
-                        mode="add_and_detail_verified",
-                        business_id=business_id,
-                        save_url=save_response.url,
-                        detail_url=requested_detail.url,
-                        submitted=submitted,
-                        record_markers=record_markers,
-                        record_identity_payload=associated_detail_body,
-                    )
-                if filtered_all_requested_codes and not explicit_empty_readback:
-                    return ModuleSmokeResult(
-                        mode="add_and_detail_verified",
-                        business_id=business_id,
-                        save_url=save_response.url,
-                        detail_url=requested_detail.url,
-                        submitted=submitted,
-                        record_markers=record_markers,
-                        record_identity_payload=associated_detail_body,
-                    )
         if filtered_all_requested_codes and not explicit_empty_readback:
             raise AssertionError(
                 "原回读字段全部是运行时生成 ID，且没有取得按本次业务 ID "
@@ -1455,6 +1464,10 @@ class ModuleSmokeDriver:
 
     def _open_delete_confirmation(self, result: ModuleSmokeResult, responses=None):
         submitted = result.submitted or {}
+        allow_arbitrary_row = (
+            result.mode == "delete_any_available"
+            or ARBITRARY_DELETE_ROW_MARKER in result.record_markers
+        )
         markers = list(result.record_markers) or self._submitted_identity_values(submitted)
         markers = self._automation_owned_markers(markers)
         # Dynamic fields can be discovered with a generated Element Plus key.
@@ -1466,7 +1479,7 @@ class ModuleSmokeDriver:
             )
         fallback_values = self._delete_display_identity_values(submitted, markers)
         response_payload = result.record_identity_payload
-        if not markers and not (
+        if not allow_arbitrary_row and not markers and not (
             result.business_id
             and (len(fallback_values) >= 2 or response_payload is not None)
         ):
@@ -1494,24 +1507,53 @@ class ModuleSmokeDriver:
                     loading.wait_for(state="hidden", timeout=20_000)
         except Exception as exc:
             raise AssertionError("删除前列表在 20 秒内未加载完成") from exc
-        rows = self.page.locator(".el-table__row:visible")
-        try:
-            rows.first.wait_for(state="visible", timeout=15_000)
-        except Exception:
-            pass
-        row, marker = self._find_unique_delete_row(
-            result.business_id,
-            markers,
-            fallback_values=fallback_values,
-            response_payload=response_payload,
-            rows=rows,
-        )
+        # A record created in this process still has a known business ID.  Use
+        # the same fresh-JSON-to-rendered-row proof as Edit when possible, but
+        # never substitute a newer record with a different ID.
+        if allow_arbitrary_row:
+            rows = self.page.locator(".el-table__row:visible")
+            try:
+                rows.first.wait_for(state="visible", timeout=15_000)
+            except Exception:
+                pass
+            row, marker = self._find_unique_delete_row(
+                "",
+                [],
+                rows=rows,
+                allow_arbitrary_row=True,
+            )
+        else:
+            candidate = self._latest_automation_delete_candidate(
+                allowed_business_ids={self._normalize_record_text(result.business_id)},
+            )
+            if candidate is not None:
+                _business_id, row, marker, candidate_payload = candidate
+                response_payload = candidate_payload
+            else:
+                rows = self.page.locator(".el-table__row:visible")
+                try:
+                    rows.first.wait_for(state="visible", timeout=15_000)
+                except Exception:
+                    pass
+                row, marker = self._find_unique_delete_row(
+                    result.business_id,
+                    markers,
+                    fallback_values=fallback_values,
+                    response_payload=response_payload,
+                    rows=rows,
+                    allow_arbitrary_row=True,
+                )
+
+        arbitrary_row = marker == ARBITRARY_DELETE_ROW_MARKER
+        if arbitrary_row:
+            markers = [*markers, ARBITRARY_DELETE_ROW_MARKER]
 
         delete = self._pin_delete_row(
             row,
-            result.business_id,
+            "" if arbitrary_row else result.business_id,
             allow_missing_id=(
-                marker.startswith("响应关联字段=")
+                arbitrary_row
+                or marker.startswith("响应关联字段=")
                 or marker == "保存字段组合"
             ),
         ).get_by_role("button", name="删除", exact=True).first
@@ -1526,6 +1568,24 @@ class ModuleSmokeDriver:
         confirm.wait_for(state="visible", timeout=10_000)
         return submitted, markers, fallback_values, confirm
 
+    def find_available_delete_record(self) -> ModuleSmokeResult | None:
+        """Return one rendered record with an enabled row-local Delete action."""
+        rows = self.page.locator(".el-table__row:visible")
+        try:
+            rows.first.wait_for(state="visible", timeout=15_000)
+        except Exception:
+            pass
+        try:
+            self._find_unique_delete_row(
+                "", [], rows=rows, allow_arbitrary_row=True,
+            )
+        except AssertionError:
+            return None
+        return ModuleSmokeResult(
+            mode="delete_any_available",
+            record_markers=(ARBITRARY_DELETE_ROW_MARKER,),
+        )
+
     def find_reusable_automation_delete_record(self) -> ModuleSmokeResult | None:
         """Return one registry-owned record that remains uniquely provable on screen."""
         loading_matches = self.page.locator(
@@ -1539,8 +1599,35 @@ class ModuleSmokeDriver:
         except Exception as exc:
             raise AssertionError("复用删除记录前列表在 20 秒内未加载完成") from exc
 
+        registered = self._registered_automation_records()
+        entries_by_id = {
+            self._normalize_record_text(entry.get("business_id")): entry
+            for entry in registered
+            if self._normalize_record_text(entry.get("business_id"))
+        }
+        candidate = self._latest_automation_delete_candidate(
+            allowed_business_ids=set(entries_by_id),
+        )
+        if candidate is not None:
+            business_id, row, identity, response_payload = candidate
+            entry = entries_by_id[business_id]
+            submitted = entry.get("submitted") if isinstance(entry.get("submitted"), dict) else {}
+            markers = self._automation_owned_markers(entry.get("record_markers") or [])
+            self._pin_delete_row(
+                row,
+                business_id,
+                allow_missing_id=identity.startswith("响应关联字段="),
+            )
+            return ModuleSmokeResult(
+                mode="delete_reusable_record",
+                business_id=business_id,
+                submitted=submitted,
+                record_markers=tuple(markers),
+                record_identity_payload=response_payload,
+            )
+
         rows = self.page.locator(".el-table__row:visible")
-        for entry in self._registered_automation_records():
+        for entry in registered:
             business_id = self._normalize_record_text(entry.get("business_id"))
             markers = self._automation_owned_markers(entry.get("record_markers") or [])
             submitted = entry.get("submitted") if isinstance(entry.get("submitted"), dict) else {}
@@ -1588,6 +1675,104 @@ class ModuleSmokeDriver:
                 record_identity_payload=response_payload,
             )
         return None
+
+    def _latest_automation_delete_candidate(
+        self,
+        *,
+        allowed_business_ids: set[str],
+    ) -> tuple[str, Any, str, dict[str, Any]] | None:
+        """Find the newest owned record whose JSON data proves one deletable row.
+
+        Deletion must never use the general Edit fallback: the allowed IDs are
+        supplied by the caller and are either this transaction's returned ID
+        or current-scope registry ownership entries.
+        """
+        allowed_ids = {
+            self._normalize_record_text(business_id)
+            for business_id in allowed_business_ids
+            if self._normalize_record_text(business_id)
+        }
+        if not allowed_ids:
+            return None
+        responses: list[Any] = []
+        listener = lambda response: responses.append(response)
+        listening = hasattr(self.page, "on") and hasattr(self.page, "remove_listener")
+        if listening:
+            self.page.on("response", listener)
+        try:
+            refreshed = self._refresh_list_after_delete()
+            if refreshed and hasattr(self.page, "wait_for_timeout"):
+                self.page.wait_for_timeout(500)
+        finally:
+            if listening:
+                self.page.remove_listener("response", listener)
+
+        candidates = self._latest_automation_delete_response_candidates(
+            responses,
+            allowed_business_ids=allowed_ids,
+        )
+        if not candidates:
+            return None
+        _key, business_id, row, identity, payload = candidates[0]
+        print(
+            "DELETE_RECORD_CANDIDATE_SELECTED "
+            f"business_id={business_id} evidence={identity}",
+            flush=True,
+        )
+        return business_id, row, identity, payload
+
+    def _latest_automation_delete_response_candidates(
+        self,
+        responses: Iterable[Any],
+        *,
+        allowed_business_ids: set[str],
+    ) -> list[tuple[tuple[int, int, str], str, Any, str, dict[str, Any]]]:
+        """Rank only registry-owned JSON records that prove one deletable row."""
+        allowed_ids = {
+            self._normalize_record_text(business_id)
+            for business_id in allowed_business_ids
+            if self._normalize_record_text(business_id)
+        }
+        records_by_id: dict[str, dict[str, Any]] = {}
+        for response in responses:
+            if not self._is_json_collection_response(response):
+                continue
+            try:
+                payload = response.json()
+            except Exception:
+                continue
+            for record in self._collect_dicts(payload):
+                business_id = self._direct_record_business_id(record)
+                if (
+                    business_id not in allowed_ids
+                    or not self._record_create_time_key(record)
+                ):
+                    continue
+                previous = records_by_id.get(business_id)
+                if previous is None or self._record_recency_key(record) > self._record_recency_key(previous):
+                    records_by_id[business_id] = record
+
+        candidates: list[tuple[tuple[int, int, str], str, Any, str, dict[str, Any]]] = []
+        for business_id, record in records_by_id.items():
+            payload = {"data": {"records": [record]}}
+            try:
+                row, identity = self._find_response_associated_record_container(
+                    payload,
+                    business_id,
+                    display_field_codes=self._visible_response_field_codes(record),
+                )
+            except AssertionError:
+                continue
+            if not any(
+                self._record_container_has_enabled_action(row, action)
+                for action in ("删除", "移除")
+            ):
+                continue
+            candidates.append((
+                self._record_recency_key(record), business_id, row, identity, payload,
+            ))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates
 
     def _registered_automation_records(self) -> list[dict[str, Any]]:
         """Read registry records whose authoritative scope/ID key is intact."""
@@ -1902,12 +2087,13 @@ class ModuleSmokeDriver:
             raise AssertionError("删除确认框没有取消按钮")
         cancel.click()
         confirm.wait_for(state="hidden", timeout=10_000)
-        self._find_unique_delete_row(
-            result.business_id,
-            markers,
-            fallback_values=fallback_values,
-            response_payload=result.record_identity_payload,
-        )
+        if ARBITRARY_DELETE_ROW_MARKER not in markers:
+            self._find_unique_delete_row(
+                result.business_id,
+                markers,
+                fallback_values=fallback_values,
+                response_payload=result.record_identity_payload,
+            )
         return ModuleSmokeResult(
             mode="delete_confirmation_cancelled", business_id=result.business_id,
             save_url=result.save_url, submitted=submitted, record_markers=tuple(markers),
@@ -1921,7 +2107,10 @@ class ModuleSmokeDriver:
         confirm_button = confirm.get_by_role("button", name="确定", exact=True).last
         if not confirm_button.count() or not confirm_button.is_visible():
             raise AssertionError("删除确认框没有确定按钮")
-        blocked_delete_urls = self._install_delete_request_guard(result.business_id)
+        arbitrary_row = ARBITRARY_DELETE_ROW_MARKER in markers
+        blocked_delete_urls = (
+            [] if arbitrary_row else self._install_delete_request_guard(result.business_id)
+        )
         confirm_button.click()
         confirm.wait_for(state="hidden", timeout=10_000)
         if blocked_delete_urls:
@@ -1940,7 +2129,11 @@ class ModuleSmokeDriver:
             raise AssertionError("确认删除后没有捕获到删除接口响应")
         delete_response = delete_responses[-1]
         actual_delete_id = self._delete_request_business_id(delete_response.request)
-        if result.business_id and actual_delete_id != str(result.business_id):
+        if (
+            not arbitrary_row
+            and result.business_id
+            and actual_delete_id != str(result.business_id)
+        ):
             raise AssertionError(
                 "删除接口目标与本次记录不一致："
                 f"expected={result.business_id}; actual={actual_delete_id or 'unknown'}; "
@@ -1953,19 +2146,23 @@ class ModuleSmokeDriver:
         except ValueError:
             pass
         self._refresh_list_after_delete()
-        self._wait_for_deleted_record_absent(
-            result.business_id,
-            markers,
-            fallback_values=fallback_values,
-            response_payload=result.record_identity_payload,
-            responses=responses,
-            after_response=delete_response,
-        )
-        self._forget_automation_owned_record(result.business_id)
+        if not arbitrary_row:
+            self._wait_for_deleted_record_absent(
+                result.business_id,
+                markers,
+                fallback_values=fallback_values,
+                response_payload=result.record_identity_payload,
+                responses=responses,
+                after_response=delete_response,
+            )
+            self._forget_automation_owned_record(result.business_id)
         return ModuleSmokeResult(
-            mode="add_and_delete_verified", business_id=result.business_id,
+            mode="add_and_delete_verified",
+            business_id=actual_delete_id if arbitrary_row else result.business_id,
             save_url=result.save_url, detail_url=delete_response.url, submitted=submitted,
-            record_markers=tuple(markers),
+            record_markers=tuple(
+                marker for marker in markers if marker != ARBITRARY_DELETE_ROW_MARKER
+            ),
         )
 
     def verify_nested_operation(self) -> ModuleSmokeResult:
@@ -3283,6 +3480,7 @@ class ModuleSmokeDriver:
             ).filter(has_text=exact).last
             if command.count() and command.is_visible():
                 return command
+            return command
         scoped = scope.locator("button:has-text('保存'),button:has-text('确定')").last
         if scoped.count() and scoped.is_visible():
             return scoped
@@ -4567,6 +4765,7 @@ class ModuleSmokeDriver:
         fallback_values: list[str] | None = None,
         response_payload: Any = None,
         rows=None,
+        allow_arbitrary_row: bool = False,
     ):
         rows = rows if rows is not None else self.page.locator(".el-table__row:visible")
         row_items = [rows.nth(index) for index in range(rows.count())]
@@ -4638,6 +4837,20 @@ class ModuleSmokeDriver:
                         f"{len(fallback_matches)} 条记录，禁止删除：{sorted(normalized_fallbacks)}"
                     )
         if not marker_matches:
+            if allow_arbitrary_row:
+                for row in row_items:
+                    commands = row.locator("button,[role='button']")
+                    for index in range(commands.count()):
+                        command = commands.nth(index)
+                        if self._normalize_record_text(command.inner_text()) != "删除":
+                            continue
+                        if str(command.get_attribute("disabled") or "").lower() in {
+                            "disabled", "true"
+                        }:
+                            continue
+                        if str(command.get_attribute("aria-disabled") or "").lower() == "true":
+                            continue
+                        return row, ARBITRARY_DELETE_ROW_MARKER
             raise AssertionError(
                 "未找到单元格文本精确匹配的本次自动化记录，且本次保存响应业务 ID、"
                 "自动化标识或保存字段组合均无法唯一定位，"
@@ -4660,7 +4873,8 @@ class ModuleSmokeDriver:
     def _record_container_business_ids(cls, container) -> set[str]:
         """Read stable record IDs from a row/card and its command nodes."""
         attributes = (
-            "data-key", "data-row-key", "data-id", "data-record-id", "row-key",
+            "data-business-id", "data-key", "data-row-key", "data-id",
+            "data-record-id", "row-key",
         )
         identities: set[str] = set()
         for attribute in attributes:
@@ -5056,6 +5270,200 @@ class ModuleSmokeDriver:
             allow_row_click=allow_row_click,
         )
 
+    def open_latest_editable_record_form(self, action: str) -> bool:
+        """Open the newest safely mapped row-level editor from a fresh list response.
+
+        Prefer the newest response-mapped row, ranked by creation time and
+        business ID. Detail sub-tables can hide their child IDs and omit enough
+        display fields to make that mapping impossible. For an Edit/Modify
+        case, the operation only needs to exercise an available editor rather
+        than prove it is the record created by this run, so then use any
+        currently visible row with an enabled row-local editor.
+
+        ``False`` means no row-level action exists, so a caller may still use
+        a page-level edit action.
+        """
+        responses: list[Any] = []
+        listener = lambda response: responses.append(response)
+        listening = hasattr(self.page, "on") and hasattr(self.page, "remove_listener")
+        if listening:
+            self.page.on("response", listener)
+        try:
+            refreshed = self._refresh_list_after_delete()
+            if refreshed and hasattr(self.page, "wait_for_timeout"):
+                # Let the refreshed list response arrive after the loading
+                # layer clears; it remains the source of ordering, not DOM order.
+                self.page.wait_for_timeout(500)
+        finally:
+            if listening:
+                self.page.remove_listener("response", listener)
+
+        candidates = self._latest_editable_response_candidates(responses, action)
+        if candidates:
+            business_id, container, evidence = candidates[0]
+            self._open_record_container_action(
+                container,
+                f"最新可编辑记录 ID={business_id}; {evidence}",
+                [],
+                action_names=self._row_edit_action_names(action),
+                allow_row_click=False,
+            )
+            print(
+                "EDIT_RECORD_CANDIDATE_SELECTED "
+                f"business_id={business_id} evidence={evidence}",
+                flush=True,
+            )
+            return True
+
+        fallback_container = self._first_visible_record_container_with_enabled_action(
+            action
+        )
+        if fallback_container is not None:
+            self._open_record_container_action(
+                fallback_container,
+                "当前可编辑记录（无需新增记录关联）",
+                [],
+                action_names=self._row_edit_action_names(action),
+                allow_row_click=False,
+            )
+            print(
+                "EDIT_RECORD_CANDIDATE_SELECTED "
+                "evidence=visible-enabled-row-fallback",
+                flush=True,
+            )
+            return True
+        return False
+
+    def _latest_editable_response_candidates(
+        self,
+        responses: Iterable[Any],
+        action: str,
+    ) -> list[tuple[str, Any, str]]:
+        """Return row-local editable candidates ordered by ``createDt``, then ID."""
+        records_by_id: dict[str, dict[str, Any]] = {}
+        for response in responses:
+            if not self._is_json_collection_response(response):
+                continue
+            try:
+                payload = response.json()
+            except Exception:
+                continue
+            for record in self._collect_dicts(payload):
+                business_id = self._direct_record_business_id(record)
+                if not business_id or not self._record_create_time_key(record):
+                    continue
+                previous = records_by_id.get(business_id)
+                if previous is None or self._record_recency_key(record) > self._record_recency_key(previous):
+                    records_by_id[business_id] = record
+
+        candidates: list[tuple[tuple[int, int, str], str, Any, str]] = []
+        for business_id, record in records_by_id.items():
+            display_codes = self._visible_response_field_codes(record)
+            try:
+                container, evidence = self._find_response_associated_record_container(
+                    {"data": {"records": [record]}},
+                    business_id,
+                    display_field_codes=display_codes,
+                )
+            except AssertionError:
+                continue
+            if not any(
+                self._record_container_has_enabled_action(container, name)
+                for name in self._row_edit_action_names(action)
+            ):
+                continue
+            candidates.append((
+                self._record_recency_key(record), business_id, container, evidence,
+            ))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [
+            (business_id, container, evidence)
+            for _key, business_id, container, evidence in candidates
+        ]
+
+    @classmethod
+    def _is_json_collection_response(cls, response: Any) -> bool:
+        request = getattr(response, "request", None)
+        if (
+            not getattr(response, "ok", False)
+            or getattr(request, "resource_type", "xhr") not in {"xhr", "fetch"}
+            or "json" not in str(
+                getattr(response, "headers", {}).get("content-type", "application/json")
+            ).lower()
+        ):
+            return False
+        try:
+            return cls._payload_has_record_collection(response.json())
+        except Exception:
+            return False
+
+    @classmethod
+    def _record_create_time_key(cls, record: dict[str, Any]) -> int:
+        """Normalize an audit creation timestamp without treating it as an ID."""
+        lowered = {str(key).lower(): value for key, value in record.items()}
+        value = lowered.get("createdt")
+        if value in (None, ""):
+            return 0
+        digits = re.sub(r"\D", "", str(value))
+        return int(digits) if digits else 0
+
+    @classmethod
+    def _record_recency_key(cls, record: dict[str, Any]) -> tuple[int, int, str]:
+        business_id = cls._direct_record_business_id(record)
+        numeric_id = int(business_id) if business_id.isdecimal() else 0
+        return cls._record_create_time_key(record), numeric_id, business_id
+
+    @classmethod
+    def _visible_response_field_codes(cls, record: dict[str, Any]) -> tuple[str, ...]:
+        """Keep response fields that can be tested against current row cells."""
+        return tuple(
+            str(code)
+            for code, value in record.items()
+            if str(code)
+            and not cls._direct_record_business_id({str(code): value})
+            and not isinstance(value, (dict, list, bool))
+            and value not in (None, "")
+        )
+
+    @staticmethod
+    def _row_edit_action_names(action: str) -> tuple[str, ...]:
+        if action in {"编辑", "修改"}:
+            return ("编辑", "修改")
+        return (action,)
+
+    @staticmethod
+    def _record_container_has_enabled_action(container, action: str) -> bool:
+        for role in ("button", "link"):
+            try:
+                candidate = container.get_by_role(role, name=action, exact=True).first
+                if candidate.count() and candidate.is_visible() and candidate.is_enabled():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _has_visible_row_action(self, action: str) -> bool:
+        return self._first_visible_record_container_with_enabled_action(action) is not None
+
+    def _first_visible_record_container_with_enabled_action(self, action: str):
+        """Return one current row with an enabled requested row-level action."""
+        containers = self.page.locator(
+            ".el-table__row:visible,.ant-table-row:visible,"
+            ".mujijin-cardBox:visible,.platform-card:visible,.fund-card:visible,"
+            ".category-item:visible,.el-tree-node__content:visible"
+        )
+        try:
+            for index in range(containers.count()):
+                container = containers.nth(index)
+                if any(
+                    self._record_container_has_enabled_action(container, name)
+                    for name in self._row_edit_action_names(action)
+                ):
+                    return container
+        except Exception:
+            pass
+        return None
+
     def _open_record_container_action(
         self,
         container,
@@ -5262,6 +5670,12 @@ class ModuleSmokeDriver:
         cls, expected: str, cell_values: list[str]
     ) -> bool:
         if expected in cell_values:
+            return True
+        # List endpoints commonly return an audit timestamp while a table
+        # intentionally renders only its date component.  This is still an
+        # exact displayed value comparison, not a fuzzy time-range match.
+        date_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:[ T].*)?", expected)
+        if date_match and date_match.group(1) in cell_values:
             return True
         expected_number = cls._decimal_readback_value(expected)
         return expected_number is not None and any(
@@ -7083,9 +7497,10 @@ class ModuleSmokeDriver:
             wrapper.scroll_into_view_if_needed()
             wrapper.click(force=True)
         return self._select_business_value(
-            resolve_select_control=(
-                resolve_select_control if not is_company_remote else None
-            ),
+            # QccSelect is an Element Plus remote el-select.  Keep its control
+            # resolver so options are scoped to the popper owned by this field
+            # instead of looking only for legacy table/tree result widgets.
+            resolve_select_control=resolve_select_control,
             field_code=field_code,
             lookup_label=lookup_label,
             option_index=option_index,
@@ -7116,35 +7531,37 @@ class ModuleSmokeDriver:
             wrapper = None
             popper = None
             popper_visible = False
-            if is_company_remote:
+            try:
+                scanned, wrapper = resolve_select_control()
+                controls_id = self._select_controls_id(scanned, wrapper)
+                if controls_id:
+                    popper = self.page.locator(f"#{controls_id}")
+                    popper_visible = bool(
+                        popper.count() and popper.is_visible()
+                    )
+                else:
+                    popper = self.page.locator(
+                        ".el-popper:visible,.el-popover:visible"
+                    ).last
+                    popper_visible = bool(
+                        popper.count() and popper.is_visible()
+                    )
+            except Exception:
+                wrapper = None
+
+            if popper_visible and popper is not None:
+                options = popper.locator(option_selector)
+            elif is_company_remote:
+                # Older deployed QccSelect variants render results as a table
+                # or tree.  This fallback is deliberately used only when the
+                # current select has no owned visible popper.
                 options = self.page.locator(
                     ".el-dialog:visible .el-table__row,"
                     ".el-popover:visible .el-table__row,"
                     ".el-popper:visible .el-tree-node__content"
                 )
             else:
-                try:
-                    scanned, wrapper = resolve_select_control()
-                    controls_id = self._select_controls_id(scanned, wrapper)
-                    if controls_id:
-                        popper = self.page.locator(f"#{controls_id}")
-                        popper_visible = bool(
-                            popper.count() and popper.is_visible()
-                        )
-                    else:
-                        popper = self.page.locator(
-                            ".el-popper:visible,.el-popover:visible"
-                        ).last
-                        popper_visible = bool(
-                            popper.count() and popper.is_visible()
-                        )
-                except Exception:
-                    wrapper = None
-                options = (
-                    popper.locator(option_selector)
-                    if popper_visible and popper is not None
-                    else self.page.locator(".__ei_no_select_options__")
-                )
+                options = self.page.locator(".__ei_no_select_options__")
 
             valid_options = []
             try:

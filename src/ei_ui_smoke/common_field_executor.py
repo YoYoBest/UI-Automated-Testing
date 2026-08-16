@@ -37,6 +37,7 @@ from .module_driver import (
     DIALOG,
     DynamicFieldContractError,
     EDITABLE_FORM_CONTROL,
+    INLINE_FORM,
     ModuleSmokeDriver,
 )
 from .dynamic_collections import DynamicCollectionSpec
@@ -4561,10 +4562,15 @@ class CommonFieldExecutor:
             print("COMMON_FORM_OPEN mode=reuse", flush=True)
             return dialog
         generation = f"ei-before-add-{uuid.uuid4().hex}"
-        existing = self.page.locator(DIALOG)
+        existing = self.page.locator(f"{DIALOG},{INLINE_FORM}")
         for index in range(existing.count()):
             candidate = existing.nth(index)
-            if candidate.is_visible():
+            controls = candidate.locator(EDITABLE_FORM_CONTROL)
+            if (
+                candidate.is_visible()
+                and controls.count()
+                and controls.first.is_visible()
+            ):
                 candidate.evaluate(
                     "(node, marker) => node.setAttribute('data-ei-form-generation', marker)",
                     generation,
@@ -4577,6 +4583,18 @@ class CommonFieldExecutor:
         return scope
 
     def open_action_form(self, action: str):
+        if action.startswith(COMMON_EDIT_ACTION_PREFIXES):
+            open_latest = getattr(
+                self.driver, "open_latest_editable_record_form", None
+            )
+            if callable(open_latest) and open_latest(action):
+                scope = self.driver._wait_for_form_scope()
+                self.driver._wait_for_form_ready(scope)
+                print(
+                    f"COMMON_FORM_OPEN mode=latest-edit-candidate action={action}",
+                    flush=True,
+                )
+                return scope
         target = visible_action(self.page, action, timeout=15_000)
         if target is None:
             raise AssertionError(f"页面要求执行{action}，但没有找到可见且可用的操作入口")
@@ -4618,8 +4636,8 @@ class CommonFieldExecutor:
                 entry_url = getattr(self, "entry_url", "")
                 if entry_url and self.page.url != entry_url:
                     self.page.goto(entry_url, wait_until="domcontentloaded")
-            if not os.getenv("EI_COMMON_FORM_ACTION", "").strip().startswith(
-                COMMON_EDIT_ACTION_PREFIXES
+            if os.getenv("EI_COMMON_FORM_ACTION", "").strip().startswith(
+                COMMON_ADD_ACTION_PREFIXES
             ):
                 prepare_unique = getattr(
                     getattr(self, "driver", None),
@@ -4657,9 +4675,9 @@ class CommonFieldExecutor:
     def _wait_for_new_form_scope(self, previous_generation: str, timeout: int = 15_000):
         deadline = time.monotonic() + timeout / 1000
         while time.monotonic() < deadline:
-            dialogs = self.page.locator(DIALOG)
-            for index in range(dialogs.count() - 1, -1, -1):
-                candidate = dialogs.nth(index)
+            candidates = self.page.locator(f"{DIALOG},{INLINE_FORM}")
+            for index in range(candidates.count() - 1, -1, -1):
+                candidate = candidates.nth(index)
                 if not candidate.is_visible():
                     continue
                 if candidate.get_attribute("data-ei-form-generation") == previous_generation:

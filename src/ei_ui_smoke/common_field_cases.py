@@ -118,6 +118,22 @@ class BoundCommonReportItem:
         return self.case.pytest_id
 
 
+@dataclass(frozen=True, slots=True)
+class NotApplicableCommonReportItem:
+    """A selected Excel row with no matching rendered form capability."""
+
+    case_id: str
+    control: str
+    scenario: str
+    source_row: int
+    status: str
+    reason: str
+
+    @property
+    def pytest_id(self) -> str:
+        return f"not-applicable-{self.source_row}-{self.case_id}"
+
+
 MERGEABLE_PERSISTENCE_FIELD_TYPES = {
     "text", "textarea", "number",
 }
@@ -644,7 +660,7 @@ def _transaction_scenario_family(case: BoundCommonCase) -> str:
 
 def expand_common_case_report_items(
     transactions: Iterable[BoundCommonTransaction],
-) -> list[BoundCommonReportItem]:
+) -> list[BoundCommonReportItem | NotApplicableCommonReportItem]:
     """Expand every logical field for reporting without adding executions."""
     result: list[BoundCommonReportItem] = []
     for transaction in transactions:
@@ -858,7 +874,23 @@ def plan_common_field_report_items(
     cases = load_bound_common_cases(
         workbook_path, manifest_path, sheet_name=sheet_name, case_ids=case_ids,
     )
-    return expand_common_case_report_items(plan_common_case_transactions(cases))
+    bound_items = expand_common_case_report_items(plan_common_case_transactions(cases))
+    coverage = build_common_case_coverage(
+        workbook_path, manifest_path, sheet_name=sheet_name, case_ids=case_ids,
+    )
+    not_applicable = [
+        NotApplicableCommonReportItem(
+            case_id=str(item["case_id"]),
+            control=str(item["control"]),
+            scenario=str(item["scenario"]),
+            source_row=int(item["source_row"]),
+            status=str(item["status"]),
+            reason=str(item["reason"]),
+        )
+        for item in coverage["items"]
+        if item["status"] != "executed"
+    ]
+    return [*bound_items, *not_applicable]
 
 
 def count_common_field_report_items(

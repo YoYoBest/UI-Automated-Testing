@@ -1,7 +1,10 @@
+import json
 import os
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 
 from ei_ui_smoke.urls import detail_parent_url
 
@@ -19,6 +22,17 @@ _PARENT_PAGINATION_SELECTOR = ".table_pagination:visible,.el-pagination:visible"
 _PARENT_PAGE_JUMP_SELECTOR = (
     "input[aria-label='页'],.el-pagination__editor input[type='number']"
 )
+_PROJECT_LIST_MORE_SELECTOR = ".search-more button:visible"
+_PROJECT_STATUS_FILTER_SELECTOR = (
+    ".search-more-list .el-form-item:has-text('项目状态'):visible"
+)
+_PROJECT_LIST_QUERY_SELECTOR = ".search-button button:visible"
+_PROJECT_LIST_EMPTY_SELECTOR = ".fund-card-list:has-text('暂无建设项目数据'):visible"
+# The status filter accepts one value per request.  The server permits project
+# progress creation only from these post-decision states; completed and
+# terminated projects are later in the lifecycle but are not writable.
+_PROJECT_PROGRESS_ELIGIBLE_STATUSES = ("项目决策", "项目实施")
+_PROJECT_PROGRESS_STATUS_LABEL = "项目决策及后续可新增状态"
 _RECORD_DETAIL_ACTION_TEXTS = {
     "详情", "查看", "编辑", "修改", "删除", "移除", "清空", "新增", "添加", "新建",
     "保存", "确定", "取消", "关闭", "提交", "导出", "下载", "打印", "刷新",
@@ -38,6 +52,165 @@ class ParentListEmptyError(ParentListNotReadyError):
 
 class ParentRecordIdentityUnavailableError(AssertionError):
     """The cached parent business identity is no longer present in the list."""
+
+
+class DetailActionUnavailableError(AssertionError):
+    """The selected detail module is rendered but has no usable requested action."""
+
+
+@dataclass(frozen=True)
+class ProjectProgressParentContext:
+    """One verified project-detail route shared by a project-progress batch."""
+
+    business_id: str
+    detail_url: str
+
+
+def _is_project_progress_module(module_name: str) -> bool:
+    normalized_module = _normalized_action_text(module_name)
+    return any(label in normalized_module for label in ("项目进度", "实施进度"))
+
+
+def _is_project_progress_add(module_name: str, action: str) -> bool:
+    """Whether this detail action is subject to the project-progress add gate."""
+    normalized_action = _normalized_action_text(action)
+    return (
+        normalized_action in {"新增", "添加", "新建"}
+        and _is_project_progress_module(module_name)
+    )
+
+
+def _project_progress_context_path() -> Path:
+    configured = os.getenv("EI_PROJECT_PROGRESS_PARENT_CONTEXT_PATH", "").strip()
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[2] / "artifacts" / "project-progress-parent-context.json"
+
+
+def _project_progress_context_key(detail_url: str, module_name: str) -> str:
+    run_id = os.getenv("EI_AUTOMATION_RUN_ID", "").strip()
+    if not run_id or not _is_project_progress_module(module_name):
+        return ""
+    labels = detail_navigation_labels(module_name, "")
+    progress_label = next(
+        (label for label in labels if _is_project_progress_module(label)),
+        "项目进度",
+    )
+    return "|".join((run_id, detail_parent_url(detail_url), progress_label))
+
+
+def _load_project_progress_parent_context(
+    detail_url: str, module_name: str,
+) -> ProjectProgressParentContext | None:
+    key = _project_progress_context_key(detail_url, module_name)
+    path = _project_progress_context_path()
+    if not key or not path.is_file():
+        return None
+    try:
+        item = json.loads(path.read_text(encoding="utf-8")).get("contexts", {}).get(key, {})
+        business_id = _normalized_action_text(str(item.get("business_id", "")))
+        saved_url = str(item.get("detail_url", "")).strip()
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not business_id or not saved_url:
+        return None
+    return ProjectProgressParentContext(business_id, saved_url)
+
+
+def _store_project_progress_parent_context(
+    detail_url: str,
+    module_name: str,
+    context: ProjectProgressParentContext,
+) -> None:
+    key = _project_progress_context_key(detail_url, module_name)
+    if not key or not context.business_id or not context.detail_url:
+        return
+    path = _project_progress_context_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        payload = {}
+    contexts = payload.get("contexts") if isinstance(payload, dict) else None
+    if not isinstance(contexts, dict):
+        contexts = {}
+    contexts[key] = {
+        "business_id": context.business_id,
+        "detail_url": context.detail_url,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({"contexts": contexts}, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError as exc:
+        raise ParentListNotReadyError(
+            "无法保存项目进度批次父项目上下文"
+        ) from exc
+
+
+def _project_progress_context_from_page(page, selected_identity) -> object | None:
+    match = re.search(r"[?&](?:id|projId)=([^&#]+)", str(getattr(page, "url", "")), re.I)
+    if not match:
+        return selected_identity
+    return ProjectProgressParentContext(match.group(1), str(page.url))
+
+
+def _open_project_progress_parent_context(
+    page,
+    context: ProjectProgressParentContext,
+    module_name: str,
+    action: str,
+    *,
+    navigation_labels: list[str],
+    provision_child_record: Callable[[], object] | None = None,
+) -> ProjectProgressParentContext:
+    page.goto(context.detail_url, wait_until="domcontentloaded")
+    current_url = str(getattr(page, "url", ""))
+    current_id = re.search(r"[?&](?:id|projId)=([^&#]+)", current_url, re.I)
+    if (
+        current_url.rstrip("/").endswith("#/404")
+        or current_id is None
+        or current_id.group(1) != context.business_id
+    ):
+        raise ParentRecordIdentityUnavailableError(
+            "项目进度已固定父项目无法恢复到原详情页："
+            f"expected_business_id={context.business_id}, url={current_url}"
+        )
+    try:
+        navigate_detail_module(
+            page, module_name, action, navigation_labels=navigation_labels,
+        )
+    except DetailActionUnavailableError:
+        if not provision_child_record or not _detail_action_needs_child_record(action):
+            raise
+        seed_module_name = _module_name_for_seed_action(module_name, action)
+        navigate_detail_module(
+            page,
+            seed_module_name,
+            "新增",
+            navigation_labels=detail_navigation_labels(seed_module_name, "新增"),
+        )
+        child = provision_child_record()
+        if not _normalized_record_identity_values(child):
+            raise AssertionError(
+                "项目进度子记录前置创建未返回业务 ID 或自动化标识"
+            )
+        page.goto(context.detail_url, wait_until="domcontentloaded")
+        recovered_id = re.search(
+            r"[?&](?:id|projId)=([^&#]+)", str(getattr(page, "url", "")), re.I,
+        )
+        if recovered_id is None or recovered_id.group(1) != context.business_id:
+            raise ParentRecordIdentityUnavailableError(
+                "项目进度子记录前置创建后未回到固定父项目："
+                f"expected_business_id={context.business_id}, url={page.url}"
+            )
+        navigate_detail_module(
+            page, module_name, action, navigation_labels=navigation_labels,
+        )
+    return context
 
 
 def _parent_list_loading(page) -> bool:
@@ -451,6 +624,169 @@ def _goto_parent_record_page(
     )
 
 
+def _find_parent_record_by_identity(page, candidates, identities: tuple[str, ...]):
+    """Find one persisted parent ID across the rendered parent-list pages."""
+    try:
+        return _record_for_identity(candidates, identities)
+    except ParentRecordIdentityUnavailableError as first_error:
+        total_records = _parent_total_record_count(page)
+        page_size = candidates.count()
+        if total_records is None or page_size <= 0:
+            raise first_error
+
+        page_count = (total_records + page_size - 1) // page_size
+        previous_snapshot = _record_snapshot(candidates)
+        for page_number in range(2, page_count + 1):
+            candidates = _goto_parent_record_page(
+                page, page_number, previous_snapshot,
+            )
+            previous_snapshot = _record_snapshot(candidates)
+            try:
+                return _record_for_identity(candidates, identities)
+            except ParentRecordIdentityUnavailableError:
+                continue
+        raise ParentRecordIdentityUnavailableError(
+            "详情父列表所有分页均未找到自动化创建记录；"
+            f"identities={identities!r}, pages_checked={page_count}"
+        ) from first_error
+
+
+def _open_parent_list_record(page, record, candidates) -> object | None:
+    """Open a known rendered record and retain a stable identity for later reuse."""
+    selected_identity = _stable_identity_for_record(record, candidates) or None
+    target = _record_detail_entry(record) or record
+    before_url = page.url
+    try:
+        target.click(timeout=10_000)
+    except Exception as exc:
+        raise ParentListNotReadyError(
+            "详情父列表记录在点击前持续刷新或被加载遮罩阻挡；"
+            f"loading={_parent_list_loading(page)}, url={page.url}"
+        ) from exc
+    try:
+        page.wait_for_function(
+            "before => location.href !== before && !location.hash.endsWith('/404')",
+            arg=before_url,
+            timeout=20_000,
+        )
+    except Exception as exc:
+        raise AssertionError(
+            f"已点击父列表记录，但未进入有效详情页；当前地址：{page.url}"
+        ) from exc
+    assert not page.url.rstrip("/").endswith("#/404"), (
+        f"详情记录上下文无效，页面跳转到 404：{page.url}"
+    )
+    return selected_identity
+
+
+def _click_exact_text(locator, text: str, *, timeout: int = 10_000):
+    exact = re.compile(rf"^\s*{re.escape(text)}\s*$")
+    target = locator.locator(
+        "button:visible,[role='button']:visible,label:visible,a:visible,span:visible"
+    ).filter(has_text=exact).first
+    try:
+        target.wait_for(state="visible", timeout=timeout)
+        target.click(timeout=timeout)
+    except Exception as exc:
+        raise ParentListNotReadyError(f"项目列表筛选控件不可用：{text}") from exc
+
+
+def _wait_for_project_decision_results(
+    page,
+    *,
+    status: str = _PROJECT_PROGRESS_STATUS_LABEL,
+    timeout: int = 15_000,
+):
+    """Wait for the filtered project list, including its rendered empty state."""
+    deadline = time.monotonic() + max(1, timeout) / 1000
+    previous: tuple[str, ...] = ()
+    stable_count = 0
+    while time.monotonic() < deadline:
+        candidates = page.locator(_PARENT_RECORD_SELECTOR)
+        snapshot = _record_snapshot(candidates)
+        if not _parent_list_loading(page):
+            if snapshot:
+                stable_count = stable_count + 1 if snapshot == previous else 1
+                previous = snapshot
+                if stable_count >= 2:
+                    return candidates
+            elif page.locator(_PROJECT_LIST_EMPTY_SELECTOR).count():
+                raise ParentListEmptyError(f"项目状态“{status}”查询结果为空")
+        else:
+            previous = ()
+            stable_count = 0
+        page.wait_for_timeout(200)
+    raise ParentListNotReadyError(f"项目状态“{status}”查询后列表未就绪")
+
+
+def _click_project_list_query(
+    page,
+    *,
+    status: str = _PROJECT_PROGRESS_STATUS_LABEL,
+) -> None:
+    """Click 查询 and wait for the list request initiated by that click."""
+    query = page.locator(_PROJECT_LIST_QUERY_SELECTOR)
+    expect_response = getattr(page, "expect_response", None)
+    if not callable(expect_response):
+        _click_exact_text(query, "查询")
+        return
+    try:
+        with expect_response(
+            lambda response: (
+                getattr(response, "request", None) is not None
+                and str(getattr(response.request, "method", "")).upper() == "POST"
+                and str(getattr(response, "url", "")).split("?", 1)[0].endswith(
+                    "/fi-service/projInfo/listPage"
+                )
+            ),
+            timeout=15_000,
+        ) as response_info:
+            _click_exact_text(query, "查询")
+        if not bool(getattr(response_info.value, "ok", False)):
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询请求失败："
+                f"HTTP {getattr(response_info.value, 'status', 0)}"
+            )
+    except ParentListNotReadyError:
+        raise
+    except Exception as exc:
+        raise ParentListNotReadyError(
+            f"项目状态“{status}”查询未捕获项目列表响应"
+        ) from exc
+
+
+def _enter_project_progress_decision_parent(page, detail_url: str) -> object | None:
+    """Open the first parent in a currently eligible post-decision state.
+
+    The UI exposes one project-status value per search. Query the eligible
+    lifecycle states in their declared order instead of falling back to an
+    unfiltered list or probing detail pages one by one.
+    """
+    page.goto(detail_parent_url(detail_url), wait_until="domcontentloaded")
+    status_filter = page.locator(_PROJECT_STATUS_FILTER_SELECTOR).first
+    if not _locator_visible(status_filter):
+        _click_exact_text(page.locator(_PROJECT_LIST_MORE_SELECTOR), "···")
+        try:
+            status_filter.wait_for(state="visible", timeout=10_000)
+        except Exception as exc:
+            raise ParentListNotReadyError("项目列表未展示项目状态筛选条件") from exc
+    empty_statuses: list[str] = []
+    for status in _PROJECT_PROGRESS_ELIGIBLE_STATUSES:
+        _click_exact_text(status_filter, status)
+        _click_project_list_query(page, status=status)
+        try:
+            candidates = _wait_for_project_decision_results(page, status=status)
+        except ParentListEmptyError:
+            empty_statuses.append(status)
+            continue
+        selected_identity = _open_parent_list_record(page, candidates.nth(0), candidates)
+        return _project_progress_context_from_page(page, selected_identity)
+    raise ParentListEmptyError(
+        "项目状态“项目决策及后续可新增状态”查询结果为空："
+        + "、".join(empty_statuses)
+    )
+
+
 def enter_detail_record(
     page, detail_url: str, record_index: int = 0, *, record_identity=None,
 ) -> object | None:
@@ -461,8 +797,7 @@ def enter_detail_record(
 
     identities = _normalized_record_identity_values(record_identity)
     if identities:
-        record = _record_for_identity(candidates, identities)
-        selected_identity = record_identity
+        record = _find_parent_record_by_identity(page, candidates, identities)
     else:
         page_size = candidates.count()
         total_records = _parent_total_record_count(page)
@@ -489,31 +824,8 @@ def enter_detail_record(
                 f"无法尝试第 {record_index + 1} 条"
             )
         record = candidates.nth(local_index)
-        selected_identity = _stable_identity_for_record(record, candidates) or None
-    target = _record_detail_entry(record) or record
-    before_url = page.url
-    try:
-        target.click(timeout=10_000)
-    except Exception as exc:
-        raise ParentListNotReadyError(
-            "详情父列表记录在点击前持续刷新或被加载遮罩阻挡："
-            f"record_index={record_index + 1}, loading={_parent_list_loading(page)}, "
-            f"url={page.url}"
-        ) from exc
-    try:
-        page.wait_for_function(
-            "before => location.href !== before && !location.hash.endsWith('/404')",
-            arg=before_url,
-            timeout=20_000,
-        )
-    except Exception as exc:
-        raise AssertionError(
-            f"已点击父列表记录，但未进入有效详情页；当前地址：{page.url}"
-        ) from exc
-    assert not page.url.rstrip("/").endswith("#/404"), (
-        f"详情记录上下文无效，页面跳转到 404：{page.url}"
-    )
-    return selected_identity
+    selected_identity = _open_parent_list_record(page, record, candidates)
+    return record_identity if identities else selected_identity
 
 
 def detail_navigation_labels(module_name: str, action: str) -> list[str]:
@@ -580,7 +892,7 @@ def navigate_detail_module(
         ).all_inner_texts()
         visible_buttons = page.locator("button:visible").all_inner_texts()
         component_text = page.locator(".component-box:visible").last.inner_text()[:500]
-        raise AssertionError(
+        raise DetailActionUnavailableError(
             f"已点击详情菜单“{' / '.join(labels)}”，但目标页面未渲染操作：{action}；"
             f"活动菜单={active_items!r}；可见按钮={visible_buttons!r}；"
             f"组件内容={component_text!r}"
@@ -649,6 +961,7 @@ def enter_available_detail_module(
     record_identity=None,
     provision_record: Callable[[], object] | None = None,
     provision_child_record: Callable[[], object] | None = None,
+    provision_eligible_record: Callable[[], object] | None = None,
 ) -> object | None:
     if max_records is None:
         try:
@@ -668,19 +981,69 @@ def enter_available_detail_module(
         f"operation={action}",
         flush=True,
     )
+    if _is_project_progress_module(module_name):
+        if isinstance(record_identity, ProjectProgressParentContext):
+            return _open_project_progress_parent_context(
+                page,
+                record_identity,
+                module_name,
+                action,
+                navigation_labels=navigation_labels,
+                provision_child_record=provision_child_record,
+            )
+        try:
+            selected_identity = _enter_project_progress_decision_parent(
+                page, detail_url,
+            )
+            if isinstance(selected_identity, ProjectProgressParentContext):
+                return _open_project_progress_parent_context(
+                    page,
+                    selected_identity,
+                    module_name,
+                    action,
+                    navigation_labels=navigation_labels,
+                    provision_child_record=provision_child_record,
+                )
+            navigate_detail_module(
+                page, module_name, action, navigation_labels=navigation_labels,
+            )
+            return selected_identity
+        except ParentListEmptyError:
+            if not _is_project_progress_add(module_name, action):
+                raise
+            provisioner = provision_eligible_record or provision_record
+            if provisioner is None:
+                raise
+            provisioned = provisioner()
+            if not _normalized_record_identity_values(provisioned):
+                raise AssertionError(
+                    "项目进度前置创建未返回业务 ID 或自动化标识"
+                )
+            selected_identity = _open_provisioned_detail_module(
+                page,
+                detail_url,
+                module_name,
+                action,
+                provisioned,
+                navigation_labels=navigation_labels,
+                provision_child_record=provision_child_record,
+            )
+            return _project_progress_context_from_page(page, selected_identity)
     identities = _normalized_record_identity_values(record_identity)
-    if identities:
-        return _open_provisioned_detail_module(
-            page,
-            detail_url,
-            module_name,
-            action,
-            record_identity,
-            navigation_labels=navigation_labels,
-            provision_child_record=provision_child_record,
-        )
-
     failures = []
+    if identities:
+        try:
+            return _open_provisioned_detail_module(
+                page,
+                detail_url,
+                module_name,
+                action,
+                record_identity,
+                navigation_labels=navigation_labels,
+                provision_child_record=provision_child_record,
+            )
+        except AssertionError:
+            raise
     for record_index in range(max_records):
         selected_identity = None
         try:
@@ -692,9 +1055,10 @@ def enter_available_detail_module(
             )
             return selected_identity
         except ParentListEmptyError:
-            if provision_record is None:
+            provisioner = provision_record
+            if provisioner is None:
                 raise
-            provisioned = provision_record()
+            provisioned = provisioner()
             provisioned_identities = _normalized_record_identity_values(provisioned)
             if not provisioned_identities:
                 raise AssertionError(
@@ -728,8 +1092,10 @@ def enter_available_detail_module(
             failures.append(str(exc))
             if "父列表只有" in str(exc):
                 break
-    if provision_record is not None and _detail_precondition_is_missing(failures):
-        provisioned = provision_record()
+    should_provision = _detail_precondition_is_missing(failures)
+    provisioner = provision_record
+    if provisioner is not None and should_provision:
+        provisioned = provisioner()
         provisioned_identities = _normalized_record_identity_values(provisioned)
         if not provisioned_identities:
             raise AssertionError(
@@ -752,6 +1118,7 @@ def enter_available_detail_module(
 
 def detail_context_preparer_from_env(
     provision_record: Callable[[], object] | None = None,
+    provision_eligible_record: Callable[[object, str, str], Callable[[], object]] | None = None,
 ) -> Callable[[object], object | None] | None:
     """Build the common-form context hook for a detail-module test command."""
     if os.getenv("EI_REQUIRES_BUSINESS_ID", "").lower() != "true":
@@ -764,7 +1131,9 @@ def detail_context_preparer_from_env(
             "详情模块通用用例缺少 EI_FORM_URL、EI_MODULE_NAME 或 EI_ACTION 上下文"
         )
 
-    cached_parent_identity = None
+    cached_parent_identity = _load_project_progress_parent_context(
+        detail_url, module_name,
+    )
 
     def provision_parent(page):
         nonlocal cached_parent_identity
@@ -778,6 +1147,11 @@ def detail_context_preparer_from_env(
         parent_provisioner = (
             (lambda: provision_parent(page)) if provision_record is not None else None
         )
+        eligible_parent_provisioner = (
+            provision_eligible_record(page, detail_url, module_name)
+            if provision_eligible_record is not None
+            else None
+        )
         try:
             selected_identity = enter_available_detail_module(
                 page,
@@ -787,8 +1161,11 @@ def detail_context_preparer_from_env(
                 record_identity=cached_parent_identity,
                 provision_record=parent_provisioner,
                 provision_child_record=provision_record,
+                provision_eligible_record=eligible_parent_provisioner,
             )
         except ParentRecordIdentityUnavailableError:
+            if isinstance(cached_parent_identity, ProjectProgressParentContext):
+                raise
             if cached_parent_identity is None:
                 raise
             print(
@@ -805,9 +1182,14 @@ def detail_context_preparer_from_env(
                 record_identity=None,
                 provision_record=parent_provisioner,
                 provision_child_record=provision_record,
+                provision_eligible_record=eligible_parent_provisioner,
             )
         if _normalized_record_identity_values(selected_identity):
             cached_parent_identity = selected_identity
+            if isinstance(cached_parent_identity, ProjectProgressParentContext):
+                _store_project_progress_parent_context(
+                    detail_url, module_name, cached_parent_identity,
+                )
             print(
                 "DETAIL_PARENT_IDENTITY_CACHED "
                 f"identities={_normalized_record_identity_values(cached_parent_identity)!r}",

@@ -6,6 +6,7 @@ import pytest
 
 from ei_ui_smoke.common_field_cases import (
     BoundCommonCase,
+    NotApplicableCommonReportItem,
     CommonFieldRule,
     count_common_field_report_items,
     DiscoveredCommonField,
@@ -1427,6 +1428,15 @@ def test_coverage_reports_executed_not_applicable_and_unsupported_cases(tmp_path
     assert [item["case_id"] for item in selected["items"]] == ["EMAIL"]
     assert selected["items"][0]["source_row"] == 3
     assert selected["template_cases"] == 1
+
+    report_items = plan_common_field_report_items(workbook, manifest)
+    skipped = [
+        item for item in report_items
+        if isinstance(item, NotApplicableCommonReportItem)
+    ]
+    assert [(item.case_id, item.status) for item in skipped] == [
+        ("EMAIL", "not_applicable"), ("BUTTON", "not_applicable"),
+    ]
 
 
 def test_edit_attachment_rule_binds_to_rendered_file_field(tmp_path):

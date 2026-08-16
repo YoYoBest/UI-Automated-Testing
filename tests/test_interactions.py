@@ -51,6 +51,178 @@ def test_fill_fails_fast_for_genuinely_readonly_text_control(monkeypatch):
     assert locator.fill_calls == []
 
 
+def test_fill_routes_date_to_picker_without_manual_input(monkeypatch):
+    locator = FakeLocator()
+    interactor = FieldInteractor(object())
+    monkeypatch.setattr(interactor, "locate", lambda _field: locator)
+    monkeypatch.setattr(interactor, "_select_date", lambda _control, value: f"picked:{value}")
+    field = ResolvedField(FieldDefinition("dueDate", "Due date", "DATE"))
+
+    assert interactor.fill(field, "2026-08-15") == "picked:2026-08-15"
+    assert locator.fill_calls == []
+
+
+def test_date_picker_clicks_matching_day_and_verifies_value(monkeypatch):
+    class Text:
+        def __init__(self, value):
+            self.value = value
+
+        @property
+        def first(self):
+            return self
+
+        def inner_text(self):
+            return self.value
+
+    class Items:
+        def __init__(self, items=()):
+            self.items = list(items)
+
+        @property
+        def first(self):
+            return self.items[0] if self.items else Missing()
+
+        @property
+        def last(self):
+            return self.items[-1] if self.items else Missing()
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    class Missing:
+        @property
+        def first(self):
+            return self
+
+        @property
+        def last(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Input:
+        def __init__(self):
+            self.value = ""
+
+        def input_value(self):
+            return self.value
+
+    class Cell:
+        def __init__(self, day, target, panel):
+            self.day = day
+            self.target = target
+            self.panel = panel
+            self.clicked = False
+
+        def is_visible(self):
+            return True
+
+        def locator(self, _selector):
+            return Text(str(self.day))
+
+        def click(self, **_kwargs):
+            self.clicked = True
+            self.target.value = "2026-08-15"
+            self.panel.visible = False
+
+    class Panel:
+        def __init__(self, target):
+            self.visible = True
+            self.cells = Items([Cell(14, target, self), Cell(15, target, self)])
+
+        @property
+        def last(self):
+            return self
+
+        def wait_for(self, **_kwargs):
+            return None
+
+        def is_visible(self):
+            return self.visible
+
+        def locator(self, selector):
+            if "header-label" in selector:
+                return Items([Text("2026"), Text("8")])
+            if "el-date-table" in selector:
+                return self.cells
+            return Items()
+
+    class Page:
+        def __init__(self, panel):
+            self.panel = panel
+
+        def locator(self, _selector):
+            return self.panel
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    class Wrapper:
+        def click(self, **_kwargs):
+            return None
+
+    target = Input()
+    panel = Panel(target)
+    interactor = FieldInteractor(Page(panel))
+    monkeypatch.setattr(interactor, "_date_picker", lambda _locator: Wrapper())
+
+    assert interactor._select_date(target, "2026-08-15") == "2026-08-15"
+    assert panel.cells.nth(1).clicked
+
+
+def test_date_picker_uses_escape_when_selection_does_not_auto_close():
+    class Missing:
+        @property
+        def last(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Panel:
+        def __init__(self):
+            self.visible = True
+
+        def is_visible(self):
+            return self.visible
+
+        def locator(self, _selector):
+            return Missing()
+
+    class Keyboard:
+        def __init__(self, panel):
+            self.panel = panel
+            self.presses = []
+
+        def press(self, key):
+            self.presses.append(key)
+            self.panel.visible = False
+
+    class Page:
+        def __init__(self, panel):
+            self.keyboard = Keyboard(panel)
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+    panel = Panel()
+    page = Page(panel)
+    FieldInteractor(page)._close_date_picker(panel)
+
+    assert page.keyboard.presses == ["Escape"]
+    assert not panel.visible
+
+
 def test_locate_select_falls_back_to_normalized_prompt_label():
     class Locator:
         def __init__(self, selector="", *, visible=False, tag="div", role=""):

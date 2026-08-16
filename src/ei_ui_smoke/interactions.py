@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import re
+from datetime import date as CalendarDate
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from .contracts import field_kind
 from .models import FieldDefinition, ResolvedField
+
+DATE_VALUE_RE = re.compile(
+    r"(?<!\d)(?P<year>\d{4})\D+(?P<month>\d{1,2})\D+(?P<day>\d{1,2})(?!\d)"
+)
 
 if TYPE_CHECKING:
     from playwright.sync_api import Locator, Page
@@ -102,9 +107,11 @@ class FieldInteractor:
         select_like = tag == "select" or role == "combobox" or "select__input" in classes
         if field.dom is not None and field.dom.kind == "year":
             return self._select_year(locator, value)
+        if kind in {"date", "datetime"}:
+            return self._select_date(locator, value)
         if select_like and kind not in {"select", "multi_select", "user_select", "org_select", "tree_select"}:
             return self._select(locator, value)
-        if kind in {"text", "textarea", "number", "date", "datetime", "time"}:
+        if kind in {"text", "textarea", "number", "time"}:
             if locator.get_attribute("readonly") is not None or not locator.is_editable():
                 raise AssertionError(
                     f"Field is not editable: {definition.field_code} ({definition.field_name})"
@@ -209,6 +216,143 @@ class FieldInteractor:
             navigation.click(force=True)
             self.page.wait_for_timeout(150)
         raise AssertionError(f"Year picker has no enabled year {target_year}")
+
+    def _select_date(self, locator: "Locator", value: Any) -> str:
+        target = self._parse_date_value(value)
+        picker = self._date_picker(locator)
+        picker.click(force=True)
+        panel = self.page.locator(
+            ".el-picker-panel:visible:has(.el-date-table)"
+        ).last
+        try:
+            panel.wait_for(state="visible", timeout=5_000)
+        except Exception as exc:
+            raise AssertionError("Date picker panel did not open") from exc
+
+        for _ in range(120):
+            displayed = self._displayed_picker_month(panel)
+            if displayed != (target.year, target.month):
+                self._navigate_date_picker(panel, displayed, target)
+                self.page.wait_for_timeout(100)
+                continue
+            cells = panel.locator(
+                ".el-date-table td.available:not(.prev-month):not(.next-month):"
+                "not(.disabled):not(.is-disabled)"
+            )
+            for index in range(cells.count()):
+                cell = cells.nth(index)
+                if not cell.is_visible():
+                    continue
+                day = (cell.locator("span").first.inner_text() or "").strip()
+                if day != str(target.day):
+                    continue
+                cell.click(force=True)
+                self._close_date_picker(panel)
+                self._wait_for_date_value(locator, target)
+                return str(value)
+            raise AssertionError(
+                f"Date picker has no enabled day {target.isoformat()}"
+            )
+        raise AssertionError(
+            f"Date picker could not navigate to {target.isoformat()}"
+        )
+
+    @staticmethod
+    def _parse_date_value(value: Any) -> CalendarDate:
+        match = DATE_VALUE_RE.search(str(value or ""))
+        if not match:
+            raise AssertionError(f"Invalid date value: {value!r}")
+        try:
+            return CalendarDate(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            )
+        except ValueError as exc:
+            raise AssertionError(f"Invalid date value: {value!r}") from exc
+
+    @staticmethod
+    def _date_picker(locator: "Locator") -> "Locator":
+        picker = locator.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),' el-date-editor ')][1]"
+        ).first
+        if not picker.count() or not picker.is_visible():
+            raise AssertionError("Date picker wrapper was not found")
+        return picker
+
+    @staticmethod
+    def _displayed_picker_month(panel: "Locator") -> tuple[int, int]:
+        labels = panel.locator(".el-date-picker__header-label")
+        values = [
+            (labels.nth(index).inner_text() or "").strip()
+            for index in range(labels.count())
+        ]
+        year = next(
+            (
+                int(match.group()) for text in values
+                if (match := re.search(r"(?<!\d)\d{4}(?!\d)", text))
+            ),
+            None,
+        )
+        month = next(
+            (
+                int(match.group()) for text in values
+                if (match := re.search(r"(?<!\d)(?:1[0-2]|0?[1-9])(?!\d)", text))
+            ),
+            None,
+        )
+        if year is None or month is None:
+            raise AssertionError("Date picker current month is not readable")
+        return year, month
+
+    def _navigate_date_picker(
+        self,
+        panel: "Locator",
+        displayed: tuple[int, int],
+        target: CalendarDate,
+    ) -> None:
+        direction = "arrow-left" if displayed > (target.year, target.month) else "arrow-right"
+        navigation = panel.locator(f"button.{direction},.{direction}").first
+        if not navigation.count() or not navigation.is_visible():
+            raise AssertionError(
+                f"Date picker cannot navigate from {displayed[0]:04d}-{displayed[1]:02d}"
+            )
+        navigation.click(force=True)
+
+    def _wait_for_date_value(self, locator: "Locator", target: CalendarDate) -> None:
+        for _ in range(20):
+            actual = (locator.input_value() or "").strip()
+            match = DATE_VALUE_RE.search(actual)
+            if match and (
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            ) == (target.year, target.month, target.day):
+                return
+            self.page.wait_for_timeout(100)
+        raise AssertionError(
+            f"Date picker selected {target.isoformat()} but did not update its value"
+        )
+
+    def _close_date_picker(self, panel: "Locator") -> None:
+        if not panel.is_visible():
+            return
+        confirm = panel.locator(
+            ".el-picker-panel__footer button:has-text('确定'),"
+            ".el-picker-panel__footer button:has-text('OK')"
+        ).last
+        if confirm.count() and confirm.is_visible():
+            confirm.click(force=True)
+        for _ in range(10):
+            if not panel.is_visible():
+                return
+            self.page.wait_for_timeout(50)
+        self.page.keyboard.press("Escape")
+        for _ in range(10):
+            if not panel.is_visible():
+                return
+            self.page.wait_for_timeout(50)
+        raise AssertionError("Date picker remained open after date selection")
 
     @staticmethod
     def _year_picker(locator: "Locator") -> "Locator":

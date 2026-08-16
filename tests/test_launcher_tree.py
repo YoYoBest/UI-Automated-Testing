@@ -15,8 +15,11 @@ from ei_ui_smoke.launcher import (
     common_cases_dialog_defaults,
     common_case_sheet_family,
     common_case_sheet_matches_target,
+    common_case_target_family,
+    common_field_form_context,
     common_field_discovery_identity,
     common_field_batch_timeout_seconds,
+    clear_discovery_manifest,
     default_common_cases_workbook,
     default_module_cases_workbook,
     default_storage_state,
@@ -195,6 +198,9 @@ def test_pytest_commands_forward_selected_case_ids_and_target_only_business_test
         "python.exe", "tests/test_common_detail_validation.py", detail_env,
         "standard", tmp_path,
     )
+    assert any(item.endswith(
+        "test_common_detail_validation.py::test_selected_common_detail_case"
+    ) for item in detail)
     assert detail[detail.index("--common-case-ids") + 1] == '["VIEW-001"]'
     assert "--common-fields-manifest" not in detail
 
@@ -469,6 +475,15 @@ def test_failed_discovery_omits_every_validation_for_the_same_form():
         command_entries, discovery_env, tracker,
     ) == 2
     assert tracker.snapshot() == (0, 1)
+
+
+def test_clear_discovery_manifest_removes_prior_run_output(tmp_path):
+    manifest = tmp_path / "prior-run.json"
+    manifest.write_text("[]", encoding="utf-8")
+
+    clear_discovery_manifest({"EI_COMMON_FIELDS_MANIFEST": str(manifest)})
+
+    assert not manifest.exists()
 
 
 def test_manifest_discovery_runs_before_unrelated_page_actions():
@@ -938,7 +953,7 @@ def test_delete_sheet_uses_delete_execution_not_field_discovery(tmp_path, monkey
     assert "EI_COMMON_FIELDS_MANIFEST" not in environment
 
 
-def test_nested_add_action_does_not_get_outer_form_common_field_checks(
+def test_nested_add_action_gets_one_outer_form_common_field_context(
     tmp_path, monkeypatch,
 ):
     nested = ModuleItem(
@@ -965,7 +980,46 @@ def test_nested_add_action_does_not_get_outer_form_common_field_checks(
         project_root=tmp_path,
     )
 
-    assert expanded == base
+    assert [test_file for _target, _env, test_file in expanded] == [
+        "tests/test_module_action.py",
+        "tests/test_common_field_discovery.py",
+        "tests/test_common_field_validation.py",
+    ]
+    for form_target, form_env, _test_file in expanded[1:]:
+        assert form_target.id == "DECISION::form::新增"
+        assert form_target.operation == "新增"
+        assert form_target.operation_path == ()
+        assert form_env["EI_COMMON_FORM_ACTION"] == "新增"
+        assert form_env["EI_REQUIRE_ADD"] == "true"
+
+
+def test_nonstandard_edit_form_action_keeps_real_click_and_uses_edit_rules(
+    tmp_path, monkeypatch,
+):
+    preparation = ModuleItem(
+        "POOL::action::8", "立项准备", ("资源池", "立项准备"),
+        route="/pool", component="pool/index", operation="立项准备",
+    )
+    monkeypatch.setattr(
+        launcher_module, "list_xlsx_case_ids",
+        lambda _path: [("新增", "ADD-001"), ("编辑", "EDIT-002")],
+    )
+
+    assert common_case_target_family(preparation) == "edit"
+    assert common_field_form_context(preparation, {"EI_ACTION": "立项准备"}) == (
+        preparation, {"EI_ACTION": "立项准备"},
+    )
+    expanded = add_standard_common_field_commands(
+        [(preparation, {"EI_ACTION": "立项准备"}, "tests/test_module_action.py")],
+        mode="standard", workbook="rules.xlsx",
+        case_ids=["ADD-001（新增）", "EDIT-002（编辑）"], project_root=tmp_path,
+    )
+
+    common_commands = [item for item in expanded if "common_field" in item[2]]
+    assert [item[1]["EI_COMMON_CASES_SHEET"] for item in common_commands] == [
+        "编辑", "编辑",
+    ]
+    assert all(item[1]["EI_COMMON_FORM_ACTION"] == "立项准备" for item in common_commands)
 
 
 def test_detail_module_outer_add_gets_contextual_common_field_checks(

@@ -10,6 +10,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 ## Detail Data Preconditions
 
+- For a project-progress batch, select its parent only once. The first project-progress action expands the project-list search criteria and queries the writable lifecycle statuses in order, currently `项目决策` followed by `项目实施`; the source-confirmed lifecycle continues through `项目竣工` and `已终止`, but the progress Add backend rejects those two states. Enter the first rendered result from the first non-empty eligible query, record its business ID and verified detail URL under this `EI_AUTOMATION_RUN_ID`, parent-list route, and project-progress menu, then reuse that exact context for every later Add/Edit/Delete command, including separate pytest subprocesses. Later actions must open that saved detail URL and verify its ID; an unavailable, redirected, or mismatched parent is a blocked precondition, never a reason to query or choose another project. If an Edit/Delete action has no usable row-level action in the fixed parent's child table, create one child record through that same parent's Add form, return to the saved parent URL, and retry exactly once. Only the first Add action may provision a parent when both eligible queries are empty; it must then submit project decision through the UI and cache that exact parent. Keep the normal Add execution responsible for the actual Add click.
+- For project-operation/project-running-information Add, Edit, and Delete prerequisites, a visible `新增` button is not eligibility evidence. Call the source-confirmed read-only `projRegularReport/preAdd/{projId}` gate for the selected parent and proceed only when `canAdd=true`; an ordinary newly created parent at `立项论证` lacks the required approved finish node and cannot seed a report row. When the child table is empty and the gate rejects the parent, select or provision a parent that satisfies the approved finish and reporting-window contract before opening the Add form. Preserve the first gate reason as the shared prerequisite failure and skip the remaining parametrized Delete rules instead of repeating the same form timeout.
 - Detail actions must enter through a real parent-list record. If that list is stably loaded but empty, or every bounded existing candidate reaches the requested child module with a rendered `暂无数据` table, provision one automation-owned parent record using the normal add/save path before attempting detail navigation. Do not provision for permission, route, component, or other non-data navigation failures.
 - When an add or prior lookup has supplied a persisted business ID, detail navigation must use that ID as the sole record identity. Do not combine it with display markers or names, which can match an unrelated business record; markers remain a fallback only when no persisted ID exists.
 - Navigation after provisioning must use the returned business ID or automation marker to locate one exact parent row/card. Do not substitute the first visible business record; an absent or ambiguous match is a failed precondition.
@@ -21,6 +23,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 - Execute only worksheet rows whose feature is `页面`/`详情`/`查看` and whose control is `对话框名称` as native read-only detail checks, including the selected `VIEW-001` contract. After entering the real detail context, check whether a visible Dialog/Drawer/modal actually presents that detail. When the application uses the list itself as the detail carrier and no independent dialog exists, skip `VIEW-001` with the explicit no-dialog reason; do not relabel it as a page-name assertion or fail because the list has no dialog title. Split a selected `详情` worksheet by its `功能` column before dispatch: 新增/取消关闭 rows go to the add flow, 编辑/修改 rows go to the edit flow, and 提交 rows go to the submit flow. Do not pass the full sheet to any one operation; unsupported rows are reported as not applicable only when their required workflow was not selected.
 - A detail-sheet row may use an add, edit, or submit flow as its precondition, but its Allure child suite must remain `详情`. Pass `EI_ALLURE_SUB_SUITE=详情` on every dispatched detail-sheet command so the report separates detail verification from the precondition action.
 - A shared read-only detail rule such as `VIEW-001` is intentionally run once for each selected detail module. Before navigation or any possible skip, set its Allure title to the full module path plus the rule ID and hide the `detail_case` pytest parameter; never leave several different modules as the indistinguishable `test_selected_common_detail_case[VIEW-001]` title under the same `详情` sub-suite. A list-backed detail that skips because it has no independent dialog must keep that same contextual title.
+- The launcher must invoke `tests/test_common_detail_validation.py::test_selected_common_detail_case`, not the entire test file. File-level unit regressions are framework checks and must not appear as passed/failed business-detail cases in a live Allure report.
 - The browser fixture must prefer `EI_ENTRY_URL` over `EI_FORM_URL` as its initial route. A detail form URL can be a synthesized route that the deployed application cannot open directly; enter the real parent list first and use the record-scoped navigation flow.
 - Detail action lookup retains the ordinary rendering wait while the selected content is absent or loading. Once visible target content stays unchanged through a short grace window and the requested action remains absent, raise the existing missing-action contract failure immediately rather than repeating the full action timeout for every candidate parent record. This must not preflight dynamic-collection roots, because conditional form fields can render only after baseline linkage.
 - Cover both branches in `tests/test_detail_navigation.py`: a stable rendered target without the action exits after the grace window, while an absent target container consumes the normal bounded timeout.
@@ -30,6 +33,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 - Schedule every common-field validation command as a two-stage pair: `test_common_field_discovery.py` followed by `test_common_field_validation.py`. Both commands must receive the same manifest path, target context, worksheet, and selected case IDs.
 - Run and prioritize discovery before validation. The launcher must register the validation total only from that run's discovered manifest; do not use a previous manifest, Excel-row count, or partial collected-command count as a progress denominator.
+- Before a discovery command starts, remove its target manifest. A discovery failure must omit every dependent validation command and cannot read or display a prior run's manifest count.
+- Pagination regressions for persisted parent lookup must model the rendered collection's `count()`, `nth()`, and text snapshot contract, so later-page exact-ID lookup remains covered without a live browser.
 - Until discovery has registered every dependent validation total, progress is intentionally unknown. Once registration completes, show the exact independent pytest/Allure item total and completed count.
 - Cover the pair in launcher regression tests: each eligible worksheet must plan discovery before validation, and the two environments must have identical manifest path, worksheet, selected IDs, and form action.
 - A parent-node click may cascade selection to its descendants, but the final execution plan must use the current selected executable node IDs. Do not re-expand selected parent paths during planning: a descendant that the user manually deselects, together with its own descendants, must not run. Cover both the full cascade and a manually removed child branch.
@@ -136,6 +141,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 把企查查作为数据源能力识别，不绑定模块名、单个字段码或中文标签。源码使用 `QccSelect`、DOM 明确包含企查查提示，或运行时使用 `dataManager/entSearch` 时，统一执行：输入关键词、等待搜索响应、过滤无效企业、点击真实候选项，并使用控件最终选中值作为提交预期。字段码和标签别名只作为旧页面兼容兜底。
 
+- Qcc 部署页回归只验证“打开新增、搜索并选择真实候选”，不点击保存；实际模块入口通过 `EI_FORM_URL`、`EI_QCC_ADD_BUTTON` 和 `EI_QCC_FIELD_LABEL` 传入，避免把已废弃的页面或某一个业务模块写死到通用检查中。
+
 随机值和核对结果可以写入 Allure 附件或运行日志，但必须排除用户名、密码、Cookie、Token 和 storage state 内容。
 
 浏览器用例失败时，Allure 只附加两项：移除 query 参数后的失败页面 URL，以及一张失败页面截图。有异常现场缓存时使用清理前的当前视口截图，没有时回退到失败时全页截图。不要附加阶段截图、控制台日志、页面脚本异常、网络请求、请求头、请求体、Cookie 或 Token。
@@ -182,14 +189,16 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 公共字段批次把逻辑报告条目数、物理保存事务数和浏览器会话数分开统计。一次选择只建立一个 pytest/browser session；先把兼容的不同字段正向用例规划为物理事务，事务内只打开和保存一次新增表单，再把事务展开为每个绑定字段一个独立 pytest/Allure 条目。各条目标题显示自己的字段、场景和用例 ID，并通过隐藏事务 ID 共享同一份执行结果缓存；成功和失败都不得触发第二次保存。同字段的不同场景及负向、选择和命令用例保持独立事务。整页必填单次提交仍保留一个报告条目，并在条目内列出全部字段结果。
 
-通用 Excel 用例页签要和执行目标的操作语义匹配。给新增页面或新增操作追加公共字段发现/验证时，只运行“新增/添加/新建”页签以及不带明确操作语义的通用页签；明确属于“编辑/修改”或“删除/移除/清空”的页签必须留给对应操作目标。`详情/查看` 页签只挂到 `requires_business_id=true`、没有 `operation_path`、且会打开表单的详情外层操作（如编辑、立项准备、入库申请、跟进），不得挂到取消、关闭、查询、重置、刷新、导出、下载、打印或删除类动作。禁止把 `EDIT-*` 用例挂到新增目标上，否则 Allure 会显示编辑用例但实际只在新增表单上执行。
+通用 Excel 用例页签要和执行目标的操作语义匹配。给新增页面或新增操作追加公共字段发现/验证时，只运行“新增/添加/新建”页签以及不带明确操作语义的通用页签；明确属于“编辑/修改”或“删除/移除/清空”的页签必须留给对应操作目标。`详情/查看` 页签只挂到 `requires_business_id=true`、没有 `operation_path`、且会打开表单的详情外层操作（如编辑、立项准备、入库申请、跟进），不得挂到取消、关闭、查询、重置、刷新、导出、下载、打印或删除类动作。非新增/编辑名称但已确认会打开可编辑业务表单的操作，保留真实操作名作为 `EI_COMMON_FORM_ACTION` 点击入口，并按“编辑”生命周期匹配 `EDIT-*`；禁止把 `EDIT-*` 用例挂到新增表单上。
 
 - 删除/移除/清空页签不是字段发现或字段填写用例：启动器和直接命令行都必须传递选中的删除用例 ID 到删除专用参数化执行器，不能设置 `EI_COMMON_FORM_ACTION=删除` 后运行通用字段发现，否则会把确认框误判为新增表单。删除专用命令覆盖原始删除操作时，只移除不带删除用例配置的原始命令，保留删除专用命令；Allure 每条删除用例均独立展示用例 ID 和最终结果。
 - 同一删除专用命令中的参数化规则共享详情前置条件。首条规则无法进入详情或无法建立自动化子记录时，保留该条的原始失败；同一模块后续删除规则必须以“删除共享前置条件未满足”跳过，不得再次尝试创建数据或重复相同失败。每条规则仍保留独立 Allure 标题和用例 ID。
 
-标准自动化只为普通新增页面或没有 `operation_path` 的外层新增操作追加通用字段发现与验证。带完整 `operation_path` 的对话框分区新增只执行该嵌套操作链；不得再把外层新增表单绑定到整套通用字段用例，否则会在目标分区操作已经完成后继续创建无关的外层业务数据。嵌套行字段与父表单保存闭环由 `module_action` 的共享嵌套执行器负责。
+标准自动化先把已选嵌套 `operation_path` 归一为其外层表单上下文，再追加一次通用字段发现与验证；外层上下文按页面、组件、表单码和外层动作去重，嵌套按钮本身仍只在共享嵌套执行器中执行一次。禁止为每个嵌套按钮重复打开外层表单，也禁止在归一化之前直接丢弃嵌套选择，导致外层字段用例没有计划。
 
-详情子模块中没有 `operation_path` 的外层新增或表单型外层操作可以追加页面级通用字段发现/验证，但命令必须保留 `requires_business_id=true`、详情 URL、完整模块路径和外层操作名。通用执行器每次需要新表单时，先按统一详情导航恢复“父列表选记录 -> 进入详情 -> 逐级进入子模块”上下文；新增类操作继续定位该子模块的外层新增，编辑等表单型操作必须通过 `EI_COMMON_FORM_ACTION` 点击目标操作打开表单，禁止直接回到父列表后误点父级新增。带完整 `operation_path` 的嵌套操作仍不追加外层通用用例。模块专属 Excel 用例除业务名称外还必须按稳定组件身份匹配，禁止仅凭祖先路径含模块名就绑定到详情子模块。启动器回归同时断言详情外层新增和详情编辑类操作生成上下文化通用命令、取消/关闭类动作和嵌套新增不生成，并保留真实父级新增覆盖。
+详情子模块中没有 `operation_path` 的外层新增或表单型外层操作可以追加页面级通用字段发现/验证，但命令必须保留 `requires_business_id=true`、详情 URL、完整模块路径和外层操作名。通用执行器每次需要新表单时，先按统一详情导航恢复“父列表选记录 -> 进入详情 -> 逐级进入子模块”上下文；新增类操作继续定位该子模块的外层新增，编辑等表单型操作必须通过 `EI_COMMON_FORM_ACTION` 点击目标操作打开表单，禁止直接回到父列表后误点父级新增。嵌套操作的外层上下文同样适用前述归一化和去重规则。模块专属 Excel 用例除业务名称外还必须按稳定组件身份匹配，禁止仅凭祖先路径含模块名就绑定到详情子模块。启动器回归同时断言详情外层新增和详情编辑类操作生成上下文化通用命令、取消/关闭类动作不生成，并保留真实父级新增覆盖。
+
+每条用户选择的 Excel 行都必须在 Allure 有独立结果：已绑定字段输出执行结果；没有渲染控件、确认能力或执行器支持的行输出带具体原因的 `not_applicable`/`unsupported` 跳过项。禁止仅把这些行写入 coverage JSON 后从报告中静默消失；进度总数也必须包含这些显式结果。
 
 图形启动器已经完成第 4 至第 6 步。修改执行流程时继续复用这些方法：
 
@@ -235,7 +244,7 @@ exit $pytestExit
 - 只在对应操作成功后更新输入历史，失败、取消或空输入不得污染缓存。使用临时文件替换方式写入 JSON，损坏或缺失的缓存按空历史处理；只保存业务地址等非敏感值，禁止缓存账号、密码、Token、Cookie、请求头或 storage state 内容。
 - 树形控件的展开热区应覆盖父节点的层级单元格，且只有真实存在子节点的行显示展开指示器。具体菜单建模和层级规则以 `skills/runtime-module-discovery/SKILL.md` 为准。
 - 登录、菜单接口、详情树和按钮权限等耗时采集不得阻塞 Tk 主线程。用工作线程执行采集，只通过 `after(...)` 回到主线程更新控件、状态和弹窗；开始时禁用重复触发，成功或失败后恢复按钮，避免窗口假死和并发采集覆盖状态。
-- 操作节点执行时传递 `EI_ACTION`；嵌套对话框操作同时传递序列化的 `EI_ACTION_PATH`。新增类操作（包括带路径的分区新增）走完整新增与详情回读测试；删除、移除、清空优先复用当前列表中同时具有 `AUTO_`/`UI自动化` 标识和可验证业务 ID 的记录，找不到或候选不可删才创建并稳定定位本用例的自动化记录。只确认删除该记录并验证接口成功及记录消失，禁止删除已有业务数据。无法创建或定位自有记录时失败，不得点击任意既有行。
+- 操作节点执行时传递 `EI_ACTION`；嵌套对话框操作同时传递序列化的 `EI_ACTION_PATH`。新增类操作（包括带路径的分区新增）走完整新增与详情回读测试；删除、移除、清空默认复用可验证的自动化记录。用户明确授权“有符合的数据即可删除”时，删除专用用例改为优先选择当前列表任一启用的行级删除按钮；确认、取消和实际删除都复用该选择，验证确认框和删除响应，但不将无关记录与新增 ID 比对。没有可删行才创建一条前置数据后重试。
 - 批量动作序列化时，缺失的可选 `form_code` 可能变成字符串 `None`、`null` 或 `undefined`。执行器必须把这些哨兵视作未提供，回退到本次目标的真实表单编码；不得让它们覆盖数据策略、动态字段契约或声明式组合唯一约束。
 - 表单编码回退仅影响缺失值解析；已有真实编码仍原样传递，并且同一解析结果必须同时用于数据策略和动态集合契约，避免一个执行路径已应用组合唯一键、另一条路径静默失效。
 - 当动作工作表没有提供表单编码且环境中也没有有效编码时，按当前组件的顶层视图目录从已同步源码解析唯一的 `FORM_CODE` 后再创建数据策略；解析失败才回退模块 ID。此规则确保删除等独立动作命令仍能应用已声明的组合唯一约束。
@@ -328,6 +337,10 @@ exit $pytestExit
 将失败结果录入缺陷系统或判断严重程度、优先级时，读取 `skills/bug-severity-priority/SKILL.md`，并以 `src/ei_ui_smoke/bug_priority.py` 的自动判级结果作为初始建议；需要人工复核时不得自动宣称最终定级。
 
 将 Allure 失败项正式录入禅道，或修改产品、项目、模块、正文截图、附件和保存校验逻辑时，读取 `skills/zentao-bug-submission/SKILL.md`。不要在本 Skill 重复维护禅道内部接口细节。
+
+## Date Picker Interaction Contract
+
+- Interaction-unit coverage for a date picker must prove that date fields route to picker selection instead of input `fill()`, the requested date cell is clicked and read back, and an open picker is closed before subsequent commands.
 
 ## Parametrized Common-field Reporting
 

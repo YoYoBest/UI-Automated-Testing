@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -74,6 +75,10 @@ NON_FORM_ACTION_PREFIXES = (
     *DELETE_ACTION_PREFIXES,
     "取消", "关闭", "查询", "重置", "刷新", "导出", "下载", "打印",
 )
+# These actions are known to open editable business forms without being named
+# "新增" or "编辑".  Their data lifecycle is an update of an existing record,
+# so they reuse the edit worksheet while retaining the real click target.
+NONSTANDARD_EDIT_FORM_ACTIONS = ("立项准备", "入库申请", "跟进")
 RUN_BUTTON_IDLE_TEXT = "开始执行"
 ZENTAO_REQUIRED_SETTINGS = ("ZENTAO_URL", "ZENTAO_USERNAME", "ZENTAO_PASSWORD")
 DEFER_SKILL_GATE_ENV = "EI_DEFER_SKILL_MAINTENANCE_GATE"
@@ -267,6 +272,13 @@ def common_field_discovery_identity(command_env) -> tuple[str, ...] | None:
         "EI_REQUIRE_ADD",
     )
     return (manifest, *(str(command_env.get(key, "")).strip() for key in context_keys))
+
+
+def clear_discovery_manifest(command_env) -> None:
+    """Prevent a failed discovery from being counted through a stale manifest."""
+    manifest = str(command_env.get("EI_COMMON_FIELDS_MANIFEST", "")).strip()
+    if manifest:
+        Path(manifest).unlink(missing_ok=True)
 
 
 def common_field_validation_item_count(command_env) -> int:
@@ -650,7 +662,11 @@ def build_pytest_command(
         else (
             f"{test_file}::test_build_project_add_personalized"
             if test_file == "tests/test_build_project_add_personalized.py"
-            else test_file
+            else (
+                f"{test_file}::test_selected_common_detail_case"
+                if test_file == "tests/test_common_detail_validation.py"
+                else test_file
+            )
         )
     )
     command = [
@@ -785,27 +801,42 @@ def add_standard_common_field_commands(
         list_xlsx_case_ids(workbook_path), selected_case_ids
     )
     expanded = []
+    scheduled_form_contexts: set[tuple[str, str, str, str, str]] = set()
     for target, command_env, test_file in commands:
         expanded.append((target, command_env, test_file))
-        # Nested dialog operations own their own focused smoke cycle.  Common
-        # field checks belong only to the outer Add form, including detail
-        # modules whose test command restores parent-record navigation first.
-        if target.requires_business_id and target.operation_path:
+        context = common_field_form_context(target, command_env)
+        if context is None:
+            continue
+        form_target, form_env = context
+        context_key = (
+            form_target.route,
+            form_target.component,
+            form_target.form_code,
+            form_target.operation,
+            str(form_target.requires_business_id),
+        )
+        if context_key in scheduled_form_contexts:
+            continue
+        scheduled_form_contexts.add(context_key)
+        case_family = common_case_target_family(form_target)
+        if not case_family:
             continue
         manifest = project_root / "artifacts" / "common-fields" / (
-            Path(safe_run_log_name(target.id)).stem + ".json"
+            Path(safe_run_log_name(form_target.id)).stem + ".json"
         )
         for selected_sheet, sheet_case_ids in selected_groups:
-            if not common_case_sheet_matches_target(target, selected_sheet):
+            if not common_case_sheet_matches_target(
+                form_target, selected_sheet, case_family=case_family,
+            ):
                 continue
             family = common_case_sheet_family(selected_sheet)
             if family == "detail":
                 sheet_case_ids = detail_case_ids_for_target(
-                    workbook_path, selected_sheet, sheet_case_ids, target
+                    workbook_path, selected_sheet, sheet_case_ids, form_target
                 )
                 if not sheet_case_ids:
                     continue
-            common_env = command_env.copy()
+            common_env = form_env.copy()
             if common_case_sheet_family(selected_sheet) == "delete":
                 common_env.update({
                     "EI_COMMON_DELETE_CASES_EXCEL": str(workbook_path),
@@ -814,7 +845,7 @@ def add_standard_common_field_commands(
                         sheet_case_ids, ensure_ascii=False
                     ),
                 })
-                expanded.append((target, common_env, "tests/test_module_action.py"))
+                expanded.append((form_target, common_env, "tests/test_module_action.py"))
                 continue
             common_env.update({
                 "EI_COMMON_CASES_EXCEL": str(workbook_path),
@@ -826,62 +857,112 @@ def add_standard_common_field_commands(
             })
             if family == "detail":
                 common_env["EI_ALLURE_SUB_SUITE"] = "详情"
-            if family == "detail" and not target.operation:
+            if family == "detail" and not form_target.operation:
                 # A detail module is already the destination page.  It has no
                 # synthetic "详情" button to click, so use the navigation
                 # sentinel and a read-only detail-case entry point.
                 common_env["EI_ACTION"] = "详情"
                 common_env.pop("EI_COMMON_FORM_ACTION", None)
                 expanded.append(
-                    (target, common_env, "tests/test_common_detail_validation.py")
+                    (form_target, common_env, "tests/test_common_detail_validation.py")
                 )
                 continue
-            if target.operation:
-                common_env["EI_COMMON_FORM_ACTION"] = target.operation
+            if form_target.operation:
+                common_env["EI_COMMON_FORM_ACTION"] = form_target.operation
             else:
                 common_env.pop("EI_COMMON_FORM_ACTION", None)
             # Discovery produces this run's manifest before validation is
             # counted or executed.  Reusing the same environment guarantees
             # both stages bind the identical action, worksheet, and selection.
-            expanded.append((target, common_env.copy(), "tests/test_common_field_discovery.py"))
+            expanded.append((form_target, common_env.copy(), "tests/test_common_field_discovery.py"))
             # Parametrized report items share one browser/transaction cache, so
             # every bound field has an independent pytest/Allure result without
             # reopening the form or repeating a save.
-            expanded.append((target, common_env, "tests/test_common_field_validation.py"))
+            expanded.append((form_target, common_env, "tests/test_common_field_validation.py"))
     return expanded
 
 
-def common_case_sheet_matches_target(target: ModuleItem, sheet_name: str) -> bool:
+def common_field_form_context(
+    target: ModuleItem, command_env,
+) -> tuple[ModuleItem, dict[str, str]] | None:
+    """Return the actual outer form used for common-field validation.
+
+    A nested button is still exercised by its focused action test.  Its parent
+    form is separately represented once here so selected field rules bind to
+    the real Add/Edit dialog instead of being lost before action coalescing.
+    """
+    operation = (target.operation or "").strip()
+    if target.operation_path:
+        operation = str(target.operation_path[0] or "").strip()
+        if not operation:
+            return None
+        try:
+            outer_index = target.path.index(operation)
+        except ValueError:
+            outer_path = target.path
+        else:
+            outer_path = target.path[:outer_index + 1]
+        base_id = target.id.split("::action::", 1)[0]
+        form_target = replace(
+            target,
+            id=f"{base_id}::form::{operation}",
+            name=operation,
+            path=outer_path,
+            operation=operation,
+            operation_path=(),
+        )
+        form_env = command_env.copy()
+        form_env.update({
+            "EI_MODULE_ID": form_target.id,
+            "EI_MODULE_NAME": "/".join(form_target.path),
+            "EI_ACTION": operation,
+        })
+        form_env.pop("EI_ACTION_PATH", None)
+        form_env.pop("EI_ACTION_PATHS_JSON", None)
+        if operation.startswith(ADD_ACTION_PREFIXES):
+            form_env["EI_REQUIRE_ADD"] = "true"
+        else:
+            form_env.pop("EI_REQUIRE_ADD", None)
+        return form_target, form_env
+    if not common_case_target_family(target):
+        return None
+    return target, command_env.copy()
+
+
+def common_case_target_family(target: ModuleItem) -> str:
+    """Classify an operation by form lifecycle, not only its display name."""
+    operation = (target.operation or "").strip()
+    if not operation:
+        if target.requires_business_id and "详情" in target.path:
+            return "detail"
+        return "add" if target.supports_add else ""
+    if operation.startswith(ADD_ACTION_PREFIXES):
+        return "add"
+    if operation.startswith(EDIT_ACTION_PREFIXES):
+        return "edit"
+    if operation.startswith(DELETE_ACTION_PREFIXES):
+        return "delete"
+    if operation in NONSTANDARD_EDIT_FORM_ACTIONS:
+        return "edit"
+    return ""
+
+
+def common_case_sheet_matches_target(
+    target: ModuleItem, sheet_name: str, *, case_family: str | None = None,
+) -> bool:
     """Keep operation-specific Excel sheets on matching operation targets."""
     family = common_case_sheet_family(sheet_name)
-    operation = (target.operation or "").strip()
+    target_family = case_family or common_case_target_family(target)
     if not family:
-        return bool(
-            (not operation and target.supports_add)
-            or (
-                operation.startswith(ADD_ACTION_PREFIXES)
-                and not target.operation_path
-            )
-        )
+        return target_family == "add"
     if family == "add":
-        return bool(
-            (not operation and target.supports_add)
-            or (
-                operation.startswith(ADD_ACTION_PREFIXES)
-                and not target.operation_path
-            )
-        )
+        return target_family == "add"
     if family == "edit":
-        return bool(
-            operation.startswith(EDIT_ACTION_PREFIXES)
-            and not target.operation_path
-        )
+        return target_family == "edit"
     if family == "delete":
-        return bool(
-            operation.startswith(DELETE_ACTION_PREFIXES)
-            and not target.operation_path
-        )
+        return target_family == "delete"
     if family == "detail":
+        operation = (target.operation or "").strip()
         return bool(
             target.requires_business_id
             and not target.operation_path
@@ -2293,6 +2374,8 @@ class Launcher(tk.Tk):
                 command_env["PYTHONUTF8"] = "1"
                 command_env["PYTHONIOENCODING"] = "utf-8"
                 command_env[DEFER_SKILL_GATE_ENV] = "true"
+                if test_file == "tests/test_common_field_discovery.py":
+                    clear_discovery_manifest(command_env)
                 if test_file == "tests/test_common_field_validation.py":
                     # Its parameters depend on the fresh manifest created by this run's
                     # discovery command. A previous run's manifest is not a valid total.

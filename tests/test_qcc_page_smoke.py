@@ -17,6 +17,8 @@ def test_manage_platform_company_name_uses_qcc_dropdown():
     from playwright.sync_api import sync_playwright
 
     url = os.getenv("EI_FORM_URL", "http://172.29.237.39:5443/ei-view/#/managePlatform")
+    add_button_label = os.getenv("EI_QCC_ADD_BUTTON", "新增管理平台")
+    company_field_label = os.getenv("EI_QCC_FIELD_LABEL", "公司全称")
     storage = Path(os.getenv("EI_STORAGE_STATE", "artifacts/auth-state.json"))
     backend_mode = os.getenv("QCC_BROWSER_MODE", "backend").lower() == "backend"
     service = QccSearchService(QccSettings(mode="mock"))
@@ -29,11 +31,13 @@ def test_manage_platform_company_name_uses_qcc_dropdown():
         page = context.new_page()
         page.on("request", lambda request: captured.append(request.url))
         page.goto(url, wait_until="domcontentloaded")
-        page.get_by_role("button", name="新增管理平台").click()
+        page.get_by_role("button", name=add_button_label, exact=True).click()
         dialog = page.locator('[role="dialog"]:visible,.el-dialog:visible').last
         dialog.wait_for(state="visible", timeout=15_000)
         with page.expect_response(lambda response: "/dataManager/entSearch" in response.url) as response_info:
-            selected_company = ModuleSmokeDriver(page, data_strategy=None)._select_by_label("公司全称")
+            selected_company = ModuleSmokeDriver(page, data_strategy=None)._select_by_label(
+                company_field_label
+            )
         search_response = response_info.value
         search_status = search_response.status
         search_body = search_response.text()

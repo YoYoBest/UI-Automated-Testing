@@ -10,9 +10,7 @@ from ei_ui_smoke.case_data import load_smoke_case
 from ei_ui_smoke.common_field_cases import (
     build_common_case_coverage,
     common_case_coverage_path,
-    expand_common_case_report_items,
-    load_bound_common_cases,
-    plan_common_case_transactions,
+    plan_common_field_report_items,
     save_common_case_coverage,
 )
 from ei_ui_smoke.allure_report import set_allure_module_metadata
@@ -112,16 +110,12 @@ def pytest_generate_tests(metafunc):
         )
         return
     try:
-        # 真正干活：加载Excel和清单，解析出一批测试事务（一条条测试用例数据）
-        # 1.读取Excel + manifest字段清单 + 根据case_ids过滤指定用例
-        cases = load_bound_common_cases(
+        # Every selected row is visible in the report. Bound rows share a
+        # physical transaction; absent controls become explicit skipped rows.
+        report_items = plan_common_field_report_items(
             Path(workbook), Path(manifest), sheet_name=sheet_name,
             case_ids=selected_case_ids,
         )
-        # 2.把读取到的规则转换成可执行事务
-        transactions = plan_common_case_transactions(cases)
-        # 3.最终生成 report_items 列表（所有待执行的测试数据对象）
-        report_items = expand_common_case_report_items(transactions)
         # 统计覆盖率：算出哪些规则执行了、哪些没匹配、哪些不适用，输出coverage统计
         coverage = build_common_case_coverage(
             Path(workbook), Path(manifest), sheet_name=sheet_name,

@@ -2323,6 +2323,36 @@ def test_open_add_form_uses_configured_common_form_action(monkeypatch):
     ]
 
 
+def test_open_action_form_uses_latest_safe_row_candidate_before_page_level_edit(monkeypatch):
+    events = []
+
+    class Driver:
+        @staticmethod
+        def open_latest_editable_record_form(action):
+            events.append(("latest", action))
+            return True
+
+        @staticmethod
+        def _wait_for_form_scope():
+            return "scope"
+
+        @staticmethod
+        def _wait_for_form_ready(scope):
+            events.append(("ready", scope))
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.driver = Driver()
+    executor.page = object()
+    monkeypatch.setattr(
+        executor_module,
+        "visible_action",
+        lambda *_args, **_kwargs: pytest.fail("must not click page-level 编辑"),
+    )
+
+    assert executor.open_action_form("编辑") == "scope"
+    assert events == [("latest", "编辑"), ("ready", "scope")]
+
+
 def test_open_fresh_add_form_returns_to_entry_after_retained_save():
     events = []
 
@@ -8071,6 +8101,99 @@ def test_wait_for_new_form_scope_ignores_marked_closing_dialog():
     executor.page = Page()
 
     assert executor._wait_for_new_form_scope("old-generation") is new
+
+
+def test_wait_for_new_form_scope_accepts_new_inline_form(monkeypatch):
+    class Form:
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, _name):
+            return None
+
+        @staticmethod
+        def locator(_selector):
+            return type(
+                "Controls", (), {
+                    "count": staticmethod(lambda: 1),
+                    "first": type(
+                        "Control", (), {"is_visible": staticmethod(lambda: True)}
+                    )(),
+                }
+            )()
+
+    class Forms:
+        def count(self):
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Form()
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Forms()
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            pass
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+
+    assert executor._wait_for_new_form_scope("old-generation") is not None
+
+
+def test_open_add_form_does_not_mark_readonly_inline_form_as_stale():
+    events = []
+
+    class Controls:
+        @staticmethod
+        def count():
+            return 0
+
+        first = type("First", (), {"is_visible": staticmethod(lambda: False)})()
+
+    class Form:
+        def is_visible(self):
+            return True
+
+        @staticmethod
+        def locator(_selector):
+            return Controls()
+
+        def evaluate(self, *_args):
+            events.append("marked")
+
+    class Forms:
+        def count(self):
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Form()
+
+        @property
+        def last(self):
+            return self
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Forms()
+
+    add = type("Add", (), {"click": staticmethod(lambda: events.append("click"))})()
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor.driver = type("Driver", (), {
+        "_wait_for_add_button": staticmethod(lambda: add),
+        "_wait_for_form_ready": staticmethod(lambda _scope: None),
+    })()
+    executor._wait_for_new_form_scope = lambda _generation: "opened"
+
+    assert executor.open_add_form(require_new=True) == "opened"
+    assert events == ["click"]
 
 
 def test_wait_for_new_form_scope_rejects_only_marked_old_dialog():
