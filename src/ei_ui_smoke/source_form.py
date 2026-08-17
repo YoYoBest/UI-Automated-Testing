@@ -30,6 +30,12 @@ LOCAL_FORM_IMPORT = re.compile(
 LOCAL_COMPONENT_IMPORT = re.compile(
     r"import\s+(?P<name>[A-Za-z_$][\w$]*)\s+from\s+['\"](?P<path>\.[^'\"]+)['\"]"
 )
+ADD_DIALOG_HANDLER = re.compile(
+    r"\b(?:open(?:Add|Create|New)[\w$]*|(?:add|create|new)[\w$]*Dialog)\s*"
+    r"=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{(?P<body>.*?)^\s*\};",
+    re.I | re.M | re.S,
+)
+COMPONENT_PATH = re.compile(r"\bcomponentPath\s*:\s*['\"]([^'\"]+)", re.I)
 TABLE_COLUMN_LABEL = re.compile(
     r"\{\s*[^{}]*\bprop\s*:\s*['\"]([^'\"]+)['\"][^{}]*\blabel\s*:\s*['\"]([^'\"]+)['\"]",
     re.I | re.S,
@@ -61,6 +67,15 @@ def discover_custom_form_fields(source_root: Path, component: str) -> list[tuple
     text = page.read_text(encoding="utf-8-sig", errors="ignore")
     related_pages = [(page, text), *_transparent_page_components(page, text)]
     for owner, owner_text in related_pages:
+        add_dialog_fields = [
+            fields
+            for candidate in _add_dialog_component_files(source_root, owner, owner_text)
+            if (fields := _fields_from_page(candidate, set()))
+        ]
+        if len(add_dialog_fields) == 1:
+            return add_dialog_fields[0]
+        if len(add_dialog_fields) > 1:
+            return []
         dialog_fields = [
             fields
             for candidate in _dialog_component_files(source_root, owner, owner_text)
@@ -73,6 +88,24 @@ def discover_custom_form_fields(source_root: Path, component: str) -> list[tuple
         if fields := _fields_from_text(owner, owner_text, set()):
             return fields
     return []
+
+
+def _add_dialog_component_files(source_root: Path, page: Path, text: str) -> list[Path]:
+    """Resolve an explicit Add handler before considering unrelated dialogs."""
+    source_family = "srcEi" if "/srcEi/" in page.as_posix() else "src"
+    resolved: list[Path] = []
+    for handler in ADD_DIALOG_HANDLER.finditer(text):
+        component = COMPONENT_PATH.search(handler.group("body"))
+        if component is None:
+            continue
+        candidate = _component_file(
+            source_root,
+            component.group(1),
+            preferred_source_family=source_family,
+        )
+        if candidate is not None and candidate not in resolved:
+            resolved.append(candidate)
+    return resolved
 
 
 def _dialog_component_files(source_root: Path, page: Path, text: str) -> list[Path]:

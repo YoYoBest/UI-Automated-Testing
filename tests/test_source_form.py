@@ -64,6 +64,39 @@ def test_prefers_local_dialog_component_over_unrelated_component_path(tmp_path):
     ]
 
 
+def test_prefers_explicit_add_dialog_component_when_page_has_multiple_dialogs(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "resource"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <script setup>
+      const openAddDialog = () => {
+        dialogProps.value = {
+          componentPath: "resource/AddForm",
+        };
+      };
+      const openStoreDialog = () => {
+        dialogProps.value = {
+          componentPath: "resource/StoreForm",
+        };
+      };
+      </script>
+    ''', encoding="utf-8")
+    (views / "AddForm.vue").write_text('''
+      <PurvarCol field-code="projObjectName" label="企业全称">
+        <el-form-item prop="projObjectName"><QccSelect /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+    (views / "StoreForm.vue").write_text('''
+      <PurvarCol field-code="projectName" label="项目名称">
+        <el-form-item prop="projectName"><el-input /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+
+    assert discover_custom_form_fields(tmp_path, "resource/index") == [
+        ("projObjectName", "企业全称", True),
+    ]
+
+
 def test_missing_local_dialog_does_not_fall_back_to_unrelated_component_path(tmp_path):
     views = tmp_path / "ei-view" / "src" / "views"
     (views / "resource").mkdir(parents=True)

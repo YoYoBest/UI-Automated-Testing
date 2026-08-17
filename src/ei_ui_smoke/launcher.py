@@ -1255,6 +1255,20 @@ def target_preflight_error(item: ModuleItem) -> str:
     return ""
 
 
+def resource_pool_mode_preflight_error(item: ModuleItem, mode: str) -> str:
+    """Reject only resource-pool flows that will create an outer record."""
+    if item.form_code != "POOL_RESOURCE":
+        return ""
+    if not requires_add_cycle(item.operation, item.operation_path):
+        return ""
+    if (mode or "").strip().lower() != "stable":
+        return ""
+    return (
+        "资源池新增需要创建并保存外层资源池记录；稳定冒烟不执行完整新增校验。"
+        "请切换为“快速探测”或“标准自动化”后重新执行。"
+    )
+
+
 def format_failure_message(
     failures: list[tuple[str, str, Path]],
     log_dir: Path,
@@ -2120,6 +2134,20 @@ class Launcher(tk.Tk):
             messagebox.showwarning("源码目录无效", str(exc))
             return
         mode = self.mode.get()
+        resource_pool_mode_errors = [
+            (target, resource_pool_mode_preflight_error(target, mode))
+            for target in targets
+        ]
+        resource_pool_mode_errors = [
+            (target, error) for target, error in resource_pool_mode_errors if error
+        ]
+        if resource_pool_mode_errors:
+            details = "\n".join(
+                f"- {' / '.join(target.path) or target.name}: {error}"
+                for target, error in resource_pool_mode_errors
+            )
+            messagebox.showwarning("资源池运行模式不满足", details)
+            return
         submit_zentao = self.submit_zentao.get()
         if submit_zentao:
             missing = missing_zentao_settings(os.environ)

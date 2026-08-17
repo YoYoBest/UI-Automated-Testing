@@ -28,6 +28,7 @@
       "createSelector": ".enterprise-section__toolbar button.el-button",
       "itemSelector": ".el-table__body-wrapper .el-table__row:has(input)",
       "minRows": 1,
+      "createOnOuterAdd": false,
       "children": [
         {
           "fieldCodeTemplate": "ownershipStructureList.{index}.stockName",
@@ -91,6 +92,7 @@
       "createSelector": ".enterprise-section__toolbar button.el-button",
       "itemSelector": ".el-table__body-wrapper .el-table__row:has(input)",
       "minRows": 1,
+      "createOnOuterAdd": false,
       "children": [
         {
           "fieldCodeTemplate": "entInvestList.{index}.name",

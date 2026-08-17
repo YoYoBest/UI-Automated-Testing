@@ -1,6 +1,7 @@
+import json
+import hashlib
 import os
 import re
-import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,8 +21,10 @@ from ei_ui_smoke.detail_navigation import (
     navigate_detail_module as _navigate_detail_module,
     visible_action as _visible_action,
 )
-from ei_ui_smoke.module_driver import ModuleSmokeDriver, RecordNotDeletableError
-from ei_ui_smoke.project_progress_preconditions import project_progress_parent_provisioner
+from ei_ui_smoke.module_driver import (
+    ModuleSmokeDriver,
+    RecordNotDeletableError,
+)
 from ei_ui_smoke.module_resolver import resolve_form_code
 from ei_ui_smoke.source_form import discover_custom_form_fields
 from ei_ui_smoke.common_delete_cases import CommonDeleteCase, load_common_delete_cases
@@ -70,7 +73,13 @@ ADD_VERIFIED_MODES = {
 }
 _CREATED_RESULTS: dict[tuple[str, str], object] = {}
 _DETAIL_PARENT_RESULTS: dict[tuple[str, str], object] = {}
-_DELETE_PRECONDITION_FAILURES: dict[tuple[str, str], str] = {}
+_DELETE_PRECONDITION_FAILURES: dict[tuple[str, str, str], str] = {}
+
+
+class _DeleteSharedPreconditionError(RuntimeError):
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
 
 
 def _selected_actions() -> list[dict[str, object]]:
@@ -89,7 +98,7 @@ def _selected_actions() -> list[dict[str, object]]:
         except json.JSONDecodeError as exc:
             raise AssertionError(f"EI_ACTIONS_JSON 不是有效 JSON：{exc}") from exc
         assert isinstance(actions, list) and actions, "EI_ACTIONS_JSON 必须是非空操作列表"
-    actions = _coalesce_nested_actions(actions)
+    actions = _schedule_actions_independently(actions)
     workbook = os.getenv("EI_COMMON_DELETE_CASES_EXCEL", "").strip()
     if not workbook:
         return actions
@@ -109,47 +118,29 @@ def _selected_actions() -> list[dict[str, object]]:
     ]
 
 
-def _coalesce_nested_actions(actions: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Execute all actions inside one outer dialog during the same CRUD cycle."""
-    cases: list[dict[str, object]] = []
-    outer_cases: dict[tuple[str, str, str, str], dict[str, object]] = {}
+def _schedule_actions_independently(actions: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Keep each selected nested operation in its own outer-form lifecycle."""
 
-    def key(item: dict[str, object], outer_action: str) -> tuple[str, str, str, str]:
-        return (
-            str(item.get("form_url") or ""), str(item.get("component") or ""),
-            str(item.get("form_code") or ""), outer_action,
-        )
-
+    scheduled: list[dict[str, object]] = []
     for raw_item in actions:
         item = dict(raw_item)
         path = item.get("action_path") or []
         if isinstance(path, list) and len(path) >= 3:
-            outer_action = str(path[0])
-            group_key = key(item, outer_action)
-            parent = outer_cases.get(group_key)
-            if parent is None:
-                parent = dict(item)
-                parent["action"] = outer_action
-                parent["action_path"] = []
-                parent["nested_action_paths"] = []
-                cases.append(parent)
-                outer_cases[group_key] = parent
-            nested_paths = parent.setdefault("nested_action_paths", [])
-            if path not in nested_paths:
-                nested_paths.append(path)
-            continue
+            item["action"] = str(path[0])
+            item["action_path"] = list(path)
+        item.pop("nested_action_paths", None)
+        scheduled.append(item)
+    return scheduled
 
-        action = str(item.get("action") or "")
-        group_key = key(item, action)
-        existing = outer_cases.get(group_key)
-        if existing is not None:
-            item["nested_action_paths"] = existing.get("nested_action_paths", [])
-            cases[cases.index(existing)] = item
-            outer_cases[group_key] = item
-        else:
-            cases.append(item)
-            outer_cases[group_key] = item
-    return cases
+
+def _action_data_scope(action_case: dict[str, object]) -> str:
+    """Return a stable generated-data discriminator for one logical action."""
+    identity = {
+        "module_id": str(action_case.get("module_id") or ""),
+        "action_path": list(action_case.get("action_path") or ()),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
 
 
 def pytest_generate_tests(metafunc):
@@ -341,9 +332,6 @@ def _prepare_detail_action_context(
         record_identity=created,
         provision_record=provision_parent_record,
         provision_child_record=provision_child_record,
-        provision_eligible_record=project_progress_parent_provisioner(
-            browser_page, form_url, module_name,
-        ),
     )
 
 
@@ -799,7 +787,8 @@ def test_selected_actions_reads_page_batch(monkeypatch):
     actions = _selected_actions()
 
     assert [item["action"] for item in actions] == ["查询", "新增"]
-    assert actions[1]["nested_action_paths"] == [["新增", "股权结构", "删除"]]
+    assert actions[1]["action_path"] == ["新增", "股权结构", "删除"]
+    assert "nested_action_paths" not in actions[1]
 
 
 def test_selected_actions_expands_delete_cases_for_direct_cli(monkeypatch):
@@ -824,7 +813,10 @@ def test_selected_actions_expands_delete_cases_for_direct_cli(monkeypatch):
     ]
 
 
-def test_common_delete_cases_share_a_failed_detail_precondition(monkeypatch):
+@pytest.mark.parametrize("failure_type", [AssertionError, RuntimeError])
+def test_common_delete_cases_share_a_failed_detail_precondition(
+    monkeypatch, failure_type,
+):
     _DELETE_PRECONDITION_FAILURES.clear()
     calls = []
     case = {
@@ -841,11 +833,11 @@ def test_common_delete_cases_share_a_failed_detail_precondition(monkeypatch):
 
     def fail_precondition(*_args, **_kwargs):
         calls.append("prepare")
-        raise AssertionError("详情子模块无法建立新增前置数据")
+        raise failure_type("详情子模块无法建立新增前置数据")
 
     monkeypatch.setitem(globals(), "_prepare_detail_action_context", fail_precondition)
 
-    with pytest.raises(AssertionError, match="无法建立新增前置数据"):
+    with pytest.raises(failure_type, match="无法建立新增前置数据"):
         test_selected_page_action(object(), object(), case)
     with pytest.raises(pytest.skip.Exception, match="删除共享前置条件未满足"):
         test_selected_page_action(
@@ -860,13 +852,147 @@ def test_common_delete_cases_share_a_failed_detail_precondition(monkeypatch):
     _DELETE_PRECONDITION_FAILURES.clear()
 
 
+def test_common_delete_cases_share_a_failed_record_provision_precondition(monkeypatch):
+    _DELETE_PRECONDITION_FAILURES.clear()
+    calls = []
+    action_case = {
+        "module_id": "DETAIL::delete",
+        "module_name": "建设项目/详情/信息管理与备案/项目进度/删除",
+        "action": "删除",
+        "form_url": "https://example.test/buildProjects/detail",
+        "component": "buildProject/information/projectExecution/index",
+        "requires_business_id": True,
+        "common_delete_case": CommonDeleteCase(
+            "DELETE-001", "删除关联数据检查", "删除成功",
+        ),
+    }
+
+    class Driver:
+        def find_available_delete_record(self):
+            calls.append("find")
+            return None
+
+        def run(self, *, provision_only=False):
+            assert provision_only is True
+            calls.append("provision")
+            raise RuntimeError("点击新增后没有出现对话框或页面内嵌表单")
+
+    monkeypatch.setitem(globals(), "_crud_driver", lambda *_args: Driver())
+    monkeypatch.setitem(
+        globals(), "_prepare_detail_action_context", lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="点击新增后没有出现"):
+        test_selected_page_action(
+            SimpleNamespace(url=""), object(), action_case,
+        )
+    with pytest.raises(pytest.skip.Exception, match="删除共享前置条件未满足"):
+        test_selected_page_action(
+            SimpleNamespace(url=""),
+            object(),
+            {**action_case, "common_delete_case": CommonDeleteCase(
+                "DELETE-002", "删除确认提示信息检查", "删除成功",
+            )},
+        )
+
+    assert calls == ["find", "provision"]
+    _DELETE_PRECONDITION_FAILURES.clear()
+
+
+def test_common_delete_precondition_is_scoped_to_one_logical_action(monkeypatch):
+    _DELETE_PRECONDITION_FAILURES.clear()
+    calls = []
+    base_case = {
+        "module_name": "建设项目/详情/信息管理与备案/项目进度/删除",
+        "action": "删除",
+        "form_url": "https://example.test/buildProjects/detail",
+        "component": "buildProject/information/projectExecution/index",
+        "requires_business_id": True,
+        "common_delete_case": CommonDeleteCase(
+            "DELETE-001", "删除关联数据检查", "删除成功",
+        ),
+    }
+
+    class Driver:
+        @staticmethod
+        def find_available_delete_record():
+            return None
+
+        @staticmethod
+        def run(*, provision_only=False):
+            assert provision_only is True
+            calls.append("provision")
+            raise RuntimeError("删除前置不可用")
+
+    monkeypatch.setitem(globals(), "_crud_driver", lambda *_args: Driver())
+    monkeypatch.setitem(
+        globals(), "_prepare_detail_action_context", lambda *_args, **_kwargs: None,
+    )
+
+    for module_id in ("DETAIL::delete-a", "DETAIL::delete-b"):
+        with pytest.raises(RuntimeError, match="删除前置不可用"):
+            test_selected_page_action(
+                SimpleNamespace(url=""),
+                object(),
+                {**base_case, "module_id": module_id},
+            )
+
+    assert calls == ["provision", "provision"]
+    _DELETE_PRECONDITION_FAILURES.clear()
+
+
+def test_common_delete_behavior_failure_does_not_poison_shared_precondition(monkeypatch):
+    _DELETE_PRECONDITION_FAILURES.clear()
+    calls = []
+    action_case = {
+        "module_id": "DETAIL::delete",
+        "module_name": "建设项目/详情/信息管理与备案/项目进度/删除",
+        "action": "删除",
+        "form_url": "https://example.test/buildProjects/detail",
+        "component": "buildProject/information/projectExecution/index",
+        "requires_business_id": True,
+        "common_delete_case": CommonDeleteCase(
+            "DELETE-004", "删除成功检查", "删除成功",
+        ),
+    }
+    reusable = SimpleNamespace(mode="delete_any_available")
+
+    class Driver:
+        @staticmethod
+        def find_available_delete_record():
+            return reusable
+
+        @staticmethod
+        def delete_created_record(_record):
+            calls.append("delete")
+            raise AssertionError("删除响应业务状态不正确")
+
+    monkeypatch.setitem(globals(), "_crud_driver", lambda *_args: Driver())
+    monkeypatch.setitem(
+        globals(), "_prepare_detail_action_context", lambda *_args, **_kwargs: None,
+    )
+
+    for case_id in ("DELETE-004", "DELETE-006"):
+        with pytest.raises(AssertionError, match="删除响应业务状态不正确"):
+            test_selected_page_action(
+                SimpleNamespace(url=""),
+                object(),
+                {**action_case, "common_delete_case": CommonDeleteCase(
+                    case_id, "删除成功检查", "删除成功",
+                )},
+            )
+
+    assert calls == ["delete", "delete"]
+    assert _DELETE_PRECONDITION_FAILURES == {}
+
+
 def test_destructive_action_requires_add_even_when_the_command_omits_it():
     assert _require_add_for_action({"action": "删除"}, "删除") is True
     assert _require_add_for_action({"require_add": ""}, "删除") is True
     assert _require_add_for_action({"action": "查询"}, "查询") is False
 
 
-def test_nested_actions_share_one_outer_add_execution(monkeypatch):
+def test_nested_actions_have_independent_outer_add_executions(monkeypatch):
     monkeypatch.setenv("EI_ACTIONS_JSON", json.dumps([
         {"module_id": "POOL::2", "action": "新增", "action_path": [], "form_url": "/pool"},
         {"module_id": "POOL::3", "action": "新增", "action_path": ["新增", "股权结构", "新增"], "form_url": "/pool"},
@@ -877,12 +1003,27 @@ def test_nested_actions_share_one_outer_add_execution(monkeypatch):
 
     actions = _selected_actions()
 
-    assert len(actions) == 1
-    assert actions[0]["action"] == "新增"
-    assert actions[0]["nested_action_paths"] == [
-        ["新增", "股权结构", "新增"], ["新增", "股权结构", "删除"],
-        ["新增", "对外投资", "新增"], ["新增", "对外投资", "删除"],
+    assert len(actions) == 5
+    assert [item["action"] for item in actions] == ["新增"] * 5
+    assert [item["action_path"] for item in actions] == [
+        [],
+        ["新增", "股权结构", "新增"],
+        ["新增", "股权结构", "删除"],
+        ["新增", "对外投资", "新增"],
+        ["新增", "对外投资", "删除"],
     ]
+    assert all("nested_action_paths" not in item for item in actions)
+
+
+def test_independent_actions_have_distinct_stable_data_scopes():
+    outer = {"module_id": "POOL::2", "action_path": []}
+    nested = {
+        "module_id": "POOL::3",
+        "action_path": ["add", "ownership", "add"],
+    }
+
+    assert _action_data_scope(outer) == _action_data_scope(dict(outer))
+    assert _action_data_scope(outer) != _action_data_scope(nested)
 
 
 def test_dialog_action_accepts_inline_edit_form(monkeypatch):
@@ -952,6 +1093,8 @@ def test_selected_page_action(browser_page, request, action_case):
     os.environ["EI_FORM_CODE"] = str(
         action_case.get("form_code") or os.getenv("EI_FORM_CODE", "")
     )
+    action_scope = _action_data_scope(action_case)
+    os.environ["EI_AUTOMATION_ACTION_SCOPE"] = action_scope
     if _require_add_for_action(action_case, action):
         os.environ["EI_REQUIRE_ADD"] = str(action_case.get("require_add") or "true")
     else:
@@ -960,16 +1103,11 @@ def test_selected_page_action(browser_page, request, action_case):
         os.environ["EI_ACTION_PATH"] = json.dumps(action_path, ensure_ascii=False)
     else:
         os.environ.pop("EI_ACTION_PATH", None)
-    nested_action_paths = action_case.get("nested_action_paths") or []
-    if nested_action_paths:
-        os.environ["EI_ACTION_PATHS_JSON"] = json.dumps(
-            nested_action_paths, ensure_ascii=False
-        )
-    else:
-        os.environ.pop("EI_ACTION_PATHS_JSON", None)
+    os.environ.pop("EI_ACTION_PATHS_JSON", None)
     form_url = str(action_case.get("form_url") or os.getenv("EI_FORM_URL", ""))
     requires_business_id = bool(action_case.get("requires_business_id"))
     record_key = (form_url, os.getenv("EI_COMPONENT", ""))
+    delete_precondition_key = (*record_key, action_scope)
     created = _CREATED_RESULTS.get(record_key)
     parent_record = _DETAIL_PARENT_RESULTS.get(record_key)
     common_delete_case = action_case.get("common_delete_case")
@@ -982,7 +1120,7 @@ def test_selected_page_action(browser_page, request, action_case):
             common_delete_case.case_id,
             mode=allure.parameter_mode.HIDDEN,
         )
-        prior_failure = _DELETE_PRECONDITION_FAILURES.get(record_key)
+        prior_failure = _DELETE_PRECONDITION_FAILURES.get(delete_precondition_key)
         if prior_failure:
             pytest.skip(f"删除共享前置条件未满足：{prior_failure}")
     if form_url:
@@ -997,9 +1135,9 @@ def test_selected_page_action(browser_page, request, action_case):
                     action=action,
                     created=parent_record,
                 )
-            except AssertionError as exc:
+            except Exception as exc:
                 if common_delete_case is not None:
-                    _DELETE_PRECONDITION_FAILURES[record_key] = str(exc)
+                    _DELETE_PRECONDITION_FAILURES[delete_precondition_key] = str(exc)
                 raise
             if provisioned is not None:
                 _DETAIL_PARENT_RESULTS[record_key] = provisioned
@@ -1009,7 +1147,11 @@ def test_selected_page_action(browser_page, request, action_case):
             browser_page.goto(form_url, wait_until="domcontentloaded")
     print(f"ACTION_START {action}", flush=True)
     if common_delete_case is not None:
-        result = _run_common_delete_case(browser_page, request, common_delete_case)
+        try:
+            result = _run_common_delete_case(browser_page, request, common_delete_case)
+        except _DeleteSharedPreconditionError as exc:
+            _DELETE_PRECONDITION_FAILURES[delete_precondition_key] = str(exc.original)
+            raise exc.original from exc
     else:
         result = _run_selected_action(browser_page, request, action, created)
     if result and result.mode in ADD_VERIFIED_MODES:
@@ -1021,18 +1163,34 @@ def test_selected_page_action(browser_page, request, action_case):
 
 def _run_common_delete_case(browser_page, request, case):
     driver = _crud_driver(browser_page, request)
-    created = driver.find_available_delete_record()
-    if created is None:
-        driver.run(provision_only=True)
+    try:
         created = driver.find_available_delete_record()
+    except Exception as exc:
+        raise _DeleteSharedPreconditionError(exc) from exc
     if created is None:
-        raise RecordNotDeletableError("页面没有可用的删除记录")
+        try:
+            driver.run(provision_only=True)
+            created = driver.find_available_delete_record()
+        except Exception as exc:
+            raise _DeleteSharedPreconditionError(exc) from exc
+    if created is None:
+        error = RecordNotDeletableError("删除前置创建后页面仍没有可用的删除记录")
+        raise _DeleteSharedPreconditionError(error) from error
     try:
         return _run_delete_case_behavior(driver, created, case)
     except RecordNotDeletableError:
-        created = driver.run(provision_only=True)
-        assert created.mode == "add_provisioned"
-        return _run_delete_case_behavior(driver, created, case)
+        try:
+            created = driver.run(provision_only=True)
+            if created.mode != "add_provisioned":
+                raise AssertionError(
+                    f"删除前置创建返回了无效结果：{created.mode}"
+                )
+        except Exception as exc:
+            raise _DeleteSharedPreconditionError(exc) from exc
+        try:
+            return _run_delete_case_behavior(driver, created, case)
+        except RecordNotDeletableError as exc:
+            raise _DeleteSharedPreconditionError(exc) from exc
 
 
 def _run_delete_case_behavior(driver, record, case):

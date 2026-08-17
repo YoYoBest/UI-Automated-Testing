@@ -222,6 +222,39 @@ def test_resource_pool_standard_mode_uses_scoped_legal_capital_baseline():
     ) != 1000
 
 
+def test_resource_pool_probe_keeps_the_general_data_strategy():
+    strategy = create_data_strategy("probe", pool(), "POOL_RESOURCE")
+
+    assert isinstance(strategy, ProbeDataStrategy)
+
+
+def test_resource_pool_duplicate_message_declares_proj_object_name_repair():
+    project_root = Path(__file__).resolve().parents[1]
+    strategy = create_data_strategy(
+        "probe",
+        GlobalDataPool.from_directory(project_root / "data"),
+        "POOL_RESOURCE",
+        run_id="run",
+    )
+    submitted = {"projObjectName": "测试企业"}
+
+    constraint = strategy.declared_unique_constraint_for_message(
+        "资源池已存在同名企业请勿重复录入", submitted,
+    )
+
+    assert constraint is not None
+    assert constraint.field_codes == ("projObjectName",)
+    assert constraint.repair_field == "projObjectName"
+    assert constraint.list_url_includes == ("/projStorage/list",)
+    assert constraint.record_paths == ("data",)
+    assert constraint.aliases_for("projObjectName") == (
+        "projObjectName", "name", "enterpriseOrProjectName",
+    )
+    assert strategy.unique_repair_field(
+        "资源池已存在同名企业请勿重复录入", submitted,
+    ) == "projObjectName"
+
+
 def test_mode_switch_rejects_unknown_mode():
     assert isinstance(create_data_strategy("probe", pool(), "FORM"), ProbeDataStrategy)
     assert isinstance(create_data_strategy("stable", pool(), "FORM"), StableDataStrategy)
@@ -247,6 +280,19 @@ def test_strategy_uses_one_launcher_run_id_with_distinct_target_sequences(monkey
     assert first.value_for(field("name", "名称"), 1) != second.value_for(
         field("name", "名称"), 1
     )
+
+
+def test_strategy_scopes_generated_values_per_independent_action(monkeypatch):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "20260812230000123456_ab12cd34")
+    monkeypatch.setenv("EI_AUTOMATION_TARGET_SEQUENCE", "7")
+    monkeypatch.setenv("EI_AUTOMATION_ACTION_SCOPE", "outer-add")
+    first = create_data_strategy("standard", pool(), "FORM")
+    monkeypatch.setenv("EI_AUTOMATION_ACTION_SCOPE", "nested-ownership-add")
+    second = create_data_strategy("standard", pool(), "FORM")
+
+    assert first.generator.run_id.endswith("_7_outer-add")
+    assert second.generator.run_id.endswith("_7_nested-ownership-add")
+    assert first.value_for(field("name"), 1) != second.value_for(field("name"), 1)
 
 
 def test_strategy_repairs_value_only_for_supported_validation_message():

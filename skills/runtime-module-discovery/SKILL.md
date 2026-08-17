@@ -20,6 +20,7 @@ description: 在 UI-Smoke-Testing 中选择、扫描或排查 EI/FI 源项目模
 1. 用 `resolve_view_root()` 解析用户选择的目录；同时接受 `ei-parent`、`fi-parent`、`ei-view`、`fi-view`，不要写死项目名。
 2. 用 `discover_modules()` 生成源码技术索引。该结果只说明源码中存在候选页面，不能证明当前用户有权限，也不能提供可靠的中文菜单和运行路由。
 3. 从目标 view 的 `.env` 读取 `VITE_APP_ID`。不要把 EI/FI 的应用 ID 固化在 Skill 或新增分支中。
+   当自动化必须直接调用页面已有的只读接口时，也读取同一文件的 `VITE_APP_BASE_API`，将接口相对路径附加到该代理基址；不得假定 API 位于部署域名根路径。
 4. 用户提供已部署系统地址并登录后，通过 `capture_menu()` 监听成功的 `/funcPerm/getUserFuncPerm` 响应。
 5. 复用主菜单请求中的认证请求头获取详情权限树和按钮权限。至少保留 `Authorization`、`x-access-token`、`token` 和 `x-tenant-id` 中实际存在的头；不要假定 `context.request` 自动继承页面请求的全部认证头或租户上下文。
 6. 用 `modules_from_menu()` 保留 `meta.title`、`children`、`funcCode`、`path`、`component`，生成当前用户可见的真实层级和路由。

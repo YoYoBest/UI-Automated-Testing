@@ -1,6 +1,17 @@
 {
   "constraints": [
     {
+      "formCode": "POOL_RESOURCE",
+      "fieldCodes": ["projObjectName"],
+      "repairField": "projObjectName",
+      "listUrlIncludes": ["/projStorage/list"],
+      "recordPaths": ["data"],
+      "fieldAliases": {
+        "projObjectName": ["projObjectName", "name", "enterpriseOrProjectName"]
+      },
+      "messageIncludes": ["资源池已存在同名企业请勿重复录入"]
+    },
+    {
       "formCode": "BUILD_NETASSETS_MAINTAIL",
       "fieldCodes": ["belongSection", "assetYear"],
       "repairField": "assetYear",

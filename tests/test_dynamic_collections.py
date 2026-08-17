@@ -103,6 +103,7 @@ def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_ch
         "text", "number", "number", "select"
     ]
     assert by_code["ownershipStructureList"].section_title == "股权结构"
+    assert by_code["ownershipStructureList"].create_on_outer_add is False
     assert by_code["ownershipStructureList"].root_selector == (
         '.enterprise-section:has(.enterprise-section__title:text-is("股权结构"))'
     )
@@ -115,6 +116,7 @@ def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_ch
     assert by_code["entInvestList"].root_selector == (
         '.enterprise-section:has(.enterprise-section__title:text-is("对外投资"))'
     )
+    assert by_code["entInvestList"].create_on_outer_add is False
     assert by_code["entInvestList"].create_selector == (
         ".enterprise-section__toolbar button.el-button"
     )

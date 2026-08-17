@@ -272,6 +272,9 @@ def create_data_strategy(mode: str, pool: GlobalDataPool, form_code: str, run_id
         target_sequence = os.getenv("EI_AUTOMATION_TARGET_SEQUENCE", "").strip()
         if run_id and target_sequence:
             run_id = f"{run_id}_{target_sequence}"
+        action_scope = os.getenv("EI_AUTOMATION_ACTION_SCOPE", "").strip()
+        if run_id and action_scope:
+            run_id = f"{run_id}_{action_scope}"
     normalized = (mode or "probe").strip().lower()
     if normalized == "probe":
         return ProbeDataStrategy(pool, run_id, form_code=form_code)

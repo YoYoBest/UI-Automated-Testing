@@ -20,15 +20,22 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 - Nested add/delete actions must resolve the nearest independently titled table section (for example `.enterprise-section`) and use only that section's button and rows. Do not use a shared dialog ancestor or `first`/`last` as a cross-section fallback; a nested delete creates and removes only its own temporary row while retaining the legal baseline row.
 - A manifest-owned nested row filled by `_fill_configured_collection_row` has its own failure boundary. Its completion check may combine only that row's fill failures and current empty required controls; never reuse `_fill_failures` left by the parent form or a previous generic row. Parent failures remain parent-form evidence and must be reported at the parent completion gate rather than mislabeled as the nested action.
 - Declare a collection-local numeric dependency in `valueRelations` only when both endpoints are declared numeric children of the same exact `formCode`/component collection. Enforce the relation after the whole row is filled and before Save; `adjustOrder` may change only values generated in that row. Preserve hydrated/page values and Excel target mutations, and raise `DynamicFieldContractError` when a violated relation has no safe generated endpoint instead of silently rewriting business data.
+- A declared collection can remain available for an explicitly selected nested action without being a valid outer-Add baseline. When its configuration disables outer creation, do not click its Add control or submit generated rows during the parent save; retain the exact section contract so nested Add/Delete can create and fill its own row later.
 
 ## Declared Composite Unique Keys
 
 - Before opening a physical Add form, capture a fresh configured list response and replay its real authenticated pagination request from page 1 through the reported total. Do not allocate from a partial page, stale prior response, missing-key record set, or guessed endpoint. If the current composite key is unoccupied, reserve it and keep every existing form value; change a field only when the current key is occupied or already reserved by this process.
+- A list response may expose a business key under a display-oriented field rather than the submitted form code. Confirm every declared unique-key alias from the live response or read-only source contract and cover it with a response parsing test; do not treat an unknown or missing alias as an available key.
 - Replay every extra page from the captured Playwright `Request` object through `page.request.fetch(request, ...)`, changing only the page parameter. Do not construct a bare URL fetch: browser applications may inject authorization, tenant, or other request context that a naked replay loses. Reject any non-success response, inconsistent total, empty expected page, or duplicated/missing record identity instead of treating the partial result as availability evidence.
 - Common-field Add transactions use the same pre-save preparation, but exclude every current Excel target field so boundary and validation inputs are never overwritten. When the primary repair field is protected, try configured alternate repair fields; choice alternates must be enumerated from real currently rendered options without changing the control before an unoccupied candidate is selected. Edit/Modify transactions skip both unique-key preallocation and duplicate-response repair entirely.
 - The common save helper must enforce the Edit/Modify no-repair flag before calling the validation-repair callback. A duplicate returned by an edit save is a reported business error, never authority to mutate any existing field; keep a regression that makes the callback fail if invoked.
 - Command-style Save/Submit uses the identical Add-only unique-key lifecycle: preallocate only for Add, commit after the confirmed successful business response before readback, and release on every earlier exit. Edit/Modify command cases neither preallocate nor repair a duplicate response.
 - All ordinary and command save paths call the same structured business-validation repair interface with both the protected Excel codes and `allow_unique_repair`. Keep compatible test doubles on that keyword contract so a stale helper signature cannot hide a path that bypasses protected-field or Edit safeguards.
+
+## Retained Dynamic Collection Readback
+
+- A hydrated collection row that existed before the driver opened its Add form is retained business support data. The driver may fill its empty declared children so the submitted form is valid, but those child paths must not become mandatory detail/edit readback fields for the new parent record.
+- Track these retained-row writes separately from collection wrapper codes. Default readback compares top-level writes and children of rows created during the current lifecycle; nested-operation evidence remains responsible for verifying the row explicitly created by the selected nested action.
 
 ## Runtime Locator Diagnostics
 
@@ -52,7 +59,8 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 
 ## Detail Parent Data Provisioning
 
-- Common-field discovery, validation, and batch entry points for a gated detail Add must use the same qualified-parent provisioner as module actions. Do not let one entry point create an ordinary parent that cannot open the target form while another correctly searches eligible parents.
+- Common-field discovery, validation, and batch entry points must share the same detail-parent selection contract as module actions. For project progress, that contract is the first row from the first non-empty project-status query; do not construct a parent or call a separate eligibility API. If every configured status query is empty, let the single explicit parent-precondition failure stop discovery and therefore prevent dependent validation commands from being scheduled; do not relabel it as a skipped test.
+- A project-progress parent-precondition failure must propagate from common-field discovery. Validation and batch code must not retain an old precondition cache entry or convert that failure to `pytest.skip`.
 - A related prerequisite form that must advance workflow state may use the normal add driver with `submit=True`, which selects the exact visible `提交` footer command. Ordinary Add and provisioning continue to use `保存/确定`; never silently fall back from an expected submit command to save.
 - For `requires_business_id=True`, first use an existing parent-list record. Provision exactly one automation-owned parent record through the standard add/save driver only when the parent list is stably empty, or every bounded existing candidate has entered the target child module and its rendered table explicitly says `暂无数据`; do not create records for permission, route, or component failures.
 - A `provision_only=True` parent or child creation is an explicit add-flow request. It must run the add/save driver even when the selected detail action is Edit and therefore has no `EI_REQUIRE_ADD` flag; returning `page_access` is an invalid provisioning result.
@@ -61,6 +69,8 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 - When a persisted parent ID is not on the first rendered parent-list page, traverse authenticated rendered pagination and locate that exact ID before failing. Do not substitute a visible row, marker, or page position; absent or duplicate ID remains a precondition failure.
 
 ## Reusable Delete Records
+
+- A delete response followed by an inconclusive rendered-list absence check may use the same-resource `detail/{id}` endpoint as read-only evidence. Start with the request context, but when it returns HTTP 401/403 retry through `page.evaluate(fetch)` in the active browser page so local-storage authorization and same-origin cookies are preserved. Only HTTP 404 or an explicit business not-found response proves deletion; HTTP 401/403 after retry, HTTP 5xx, malformed JSON, and transport errors are verification failures, never deletion success.
 
 - Treat the local automation-record registry as the only cross-run ownership proof. Immediately after an Add response is business-successful and returns a business ID, before list/detail/edit readback, write or replace the entry keyed by normalized `page_scope + business_id`; retain only submitted display values, an automation marker when available, and the minimal ID-associated response fields. A later readback failure must not erase this successful-create evidence. Never register Edit/Modify/Update saves, including common-field edit transactions. Every module-smoke and common-field entry point must pass the shared registry path, and common-field Add must pass its stable entry-page scope rather than the post-save detail URL.
 - On a later delete run, consider only entries loaded from the current normalized `page_scope`; a visible `AUTO_`/`UI自动化` marker plus business ID without that scoped entry is not ownership proof. Associate the registered business ID to exactly one visible row by its exact rendered ID. If the list hides the ID, require either the ID-associated response fields or at least two exact saved display values to match one and only one row; a marker alone never permits the hidden-ID exception. A regular business row, an unregistered ID, a different-scope entry, a one-field/partial match, or an ambiguous association is never eligible for deletion. Remove only that `page_scope + business_id` entry after the guarded delete response succeeds and the same record is proven absent; cancellation or any failure keeps the entry.
@@ -126,8 +136,10 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 1. 使用运行时菜单提供的真实路由进入模块并确认页面没有登录失效、404 或应用级错误。
 2. 查找可见的新增/新建/创建入口。点击后以当前可见对话框或表单区域为主要作用域。
 3. 用 `discover_custom_form_fields()` 读取 Vue 源码中的字段契约；用 DOM 确认字段是否实际渲染和定位。源码不替代浏览器交互。
+- 当列表页同时声明新增、编辑、入库或跟进等多个弹窗时，字段契约必须优先来自明确的 `openAdd`/`openCreate`/`openNew` 处理器中的静态 `componentPath`；不能把与新增无关的弹窗并入候选而丢失稳定字段码。未声明唯一新增处理器时保持未解析，禁止按目录或 DOM 顺序猜测。
 4. 每次联动或响应式重渲染后重新扫描 DOM，禁止继续使用可能失效的旧 Locator。
-5. 使用 `FieldInteractor` 处理输入、数字、日期、单选、下拉、远程选项和附件。下拉值从页面真实候选项选择，不向选择框强行填任意文本。
+5. 首次扫描时按稳定业务字段码、可规范化标签和控件类型建立普通字段执行计划。每次交互后的重扫必须按该计划身份重新定位当前字段，禁止用新的 DOM 数组下标替换计划项；新出现且身份可判定的条件字段追加到计划末尾。身份不唯一或字段已消失时停止该项，不得填入当前同位置的其他控件。动态集合保持行级执行，只填写新建行的空子字段并保留已有业务值。嵌套操作执行器一次只接受一条路径；多条路径必须在调度层拆成独立父表单事务，不能在驱动内合并。回归必须覆盖重渲染插入字段后仍按原计划执行，以及驱动拒绝合并路径。
+6. 使用 `FieldInteractor` 处理输入、数字、日期、单选、下拉、远程选项和附件。下拉值从页面真实候选项选择，不向选择框强行填任意文本。
 6. 对公司到部门、部门到项目组等依赖下拉执行回退和重选，直到得到完整可保存组合或明确失败。
 7. 点击保存前开始捕获响应；从 `/add`、`/save`、`/create`、`/insert` 等候选中选取实际保存响应。
    新增表单存在已确认的组合唯一键时，在收集记录标识和点击保存之前应用声明式唯一值；编辑动作不主动改动组合键，只有后端返回明确重复提示时才进入受控修复。
@@ -174,6 +186,7 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 - 卡片列表和表格列表分别按现有 `module_driver.py` 行为打开详情，不假定所有模块都有表格行。
 - 进入详情首页不等于进入目标详情模块。根据运行时完整层级提取“详情”之后、操作名之前的分组与子模块，按页面实际页签/纵向菜单逐级点击；每级等待可见和组件渲染，最终必须看到目标操作或目标组件证据后才能执行，禁止停在默认详情首页后用全页同名按钮兜底。
 - 父列表第一条记录可能因业务阶段、权限或数据完整性不具备目标详情子模块。使用有上限的候选记录重试：候选序号必须是跨分页的绝对序号，依据当前页大小跳到对应页后再取页内记录；禁止每次回到第一页后把“前 N 条”误当成全列表重试。目标操作已可见但处于禁用态时，给予短暂异步渲染宽限后立即换下一条记录，不为每条业务阶段不适用的数据等待完整操作超时。默认扫描上限由 `EI_DETAIL_RECORD_SCAN_LIMIT` 控制，目标模块出现后停止；候选耗尽时报告尝试数量、最终 URL、缺失层级、操作禁用状态和可见活动菜单，不得无限循环，也不得把某条数据不适用误报成模块未采集。
+- 当详情模块的只读业务前置门禁已证明候选父记录全部不适用时，新增、编辑、删除、字段发现及字段验证均报告明确跳过，不再继续打开表单或将业务门禁归类为字段/定位失败。参数化字段验证在同一 pytest 进程缓存该原因，使后续字段行直接跳过；未知门禁响应、请求异常、权限或详情导航异常仍保持失败。
 - 详情接口 URL 不一定包含业务 ID；允许结合请求体和最新详情响应识别，但必须排除保存响应自身。
 - 保存成功后的列表刷新或子记录查询接口即使 URL 不含 `detail/getById`，只要它是成功的 JSON XHR/Fetch、请求或响应标量精确包含本轮业务 ID，并且字段级回读断言能在该 ID 对应的同一逻辑记录内核对目标提交值，就应先作为持久化证据；禁止在读取已捕获响应前强制要求 DOM 行暴露业务 ID。仅响应中出现 ID 不足以通过，目标字段值不一致仍须失败；关联响应不含全部目标字段或不返回嵌套子表时，只保留其已经证明的记录身份和字段证据，并继续走完整页面详情/编辑回读，不得把局部列表响应当成完整详情而直接通过或失败。
 - 当输入正确性用例还要求编辑回读，而父详情只展示无业务 ID 属性的子表行时，可用上述 ID 关联响应作为详情证据，再将该响应记录的显示字段与每条可见行的单元格做精确组合匹配，唯一关联后仅点击该行的编辑/修改入口。零匹配、多行最高匹配并列或字段值只能模糊包含时必须失败，禁止按第一行、最后一行或新记录通常置顶来猜测。
@@ -201,7 +214,7 @@ description: 在 UI-Smoke-Testing 中实现、运行或排查任意业务模块�
 保存按钮命令用例捕获到成功响应后也必须等待原新增表单实例真正隐藏，并等待全局加载遮罩消失，再开始列表、详情或编辑回读。底层列表已经有数据不代表保存后的新记录已经完成刷新；禁止在保存按钮仍处于 loading、弹窗仍覆盖页面时穿透遮罩扫描底层记录。若关闭后 URL 已进入 `/detail`，等待当前详情的记录标识和页面级“编辑”按钮加载，直接执行详情与编辑双回读，不再回到底层列表定位记录。
 
 不要自动删除既有业务记录。同一进程刚完成 Add 并返回业务 ID 的 `ModuleSmokeResult` 可作为本次创建证明；跨运行复用则只能接受当前 `page_scope` 台账中已登记、且能按业务 ID 或至少两个稳定展示值唯一关联到当前列表行的记录。页面上未登记的 `AUTO_`/`UI自动化` 文案加业务 ID 也不得自行升级为 ownership。没有这种安全候选，或候选当前没有可用删除操作时，才新增带唯一标识的记录。普通业务记录、跨页面台账记录、只有自动化文案的记录，以及归属或 ID 不唯一的记录都不得成为删除候选。确认删除前必须按该业务 ID 重新定位并锁定目标行，再校验删除请求 ID 与候选一致；删除响应成功且该记录已证实消失后才移除当前 scope 台账项，取消或失败必须保留。回归覆盖必须分别证明同进程 Add 结果可用于本轮删除、同 scope 登记记录可跨运行复用、未登记 `AUTO_ + ID` 和跨 scope 记录被拒绝、隐藏 ID 时至少两个展示值唯一关联、不可删候选新增回退及无候选时新增回退。
-- 删除接口成功后，列表记录消失校验必须重新按业务 ID 或自动化唯一标识查询当前表格；不要对删除前取得的 `rows.nth(index)` / `.first` 行 locator 等待隐藏，因为 Vue 表格刷新、分页或行重排后该 locator 会动态指向另一条仍可见记录，导致把历史记录误判成本次删除未生效。子记录 ID 不渲染到 DOM 时，优先读取删除响应之后、与删除端点同资源族的最新成功 JSON 列表响应，按本次业务 ID 判断记录是否消失；列表记录集合既可能在 `records`/`rows`/`list`，也可能直接位于 `data`、`result` 或 `results` 的数组中。不得因为另一条历史记录具有相同日期、类型等非唯一显示值就判定删除失败；缺少 ID 级接口证据且 DOM 只能匹配多条展示值时，报告“删除证据不足”，不得写成“记录仍可见”。只有没有这种 ID 级接口证据时才回退到 DOM 标识，接口仍返回该 ID 时不得用 DOM 暂时不可见放行。
+- 删除接口成功后，列表记录消失校验必须重新按业务 ID 或自动化唯一标识查询当前表格；不要对删除前取得的 `rows.nth(index)` / `.first` 行 locator 等待隐藏，因为 Vue 表格刷新、分页或行重排后该 locator 会动态指向另一条仍可见记录，导致把历史记录误判成本次删除未生效。子记录 ID 不渲染到 DOM 时，优先读取删除响应之后、与删除端点同资源族的最新成功 JSON 列表响应，按本次业务 ID 判断记录是否消失；列表记录集合既可能在 `records`/`rows`/`list`，也可能直接位于 `data`、`result` 或 `results` 的数组中。若列表和 DOM 均无法给出 ID 级终态证据，从删除请求的精确业务 ID 调用同资源只读 `detail/{id}`：仅 HTTP 404 或后端明确“不存在”可证明已删除，成功响应中仍有相同 ID 则删除失败。不得因为另一条历史记录具有相同日期、类型等非唯一显示值就判定删除失败；详情查询不可用或响应身份不完整时报告“删除证据不足”，不得写成“记录仍可见”。接口仍返回该 ID 时不得用 DOM 暂时不可见放行。
 - 自动化记录台账以 `schema_version`、`page_scope::business_id` 的 `registry_key`、业务 ID、当前运行标识和序号保存归属证明。跨运行复用只接受键完整、scope 一致且业务 ID 唯一的项；显示标记只作辅助定位，不得替代该键。
 - 删除通用用例按预期分为两类独立闭环：确认类先新增并精确定位 `AUTO_` 记录，再确认删除接口成功及该记录消失；取消类同样先定位自有记录、打开确认框并取消，再重新按业务 ID 或标记确认记录仍存在。关联/流程等页面专属的“不能删除”条件不能由通用框架伪造，通用用例只验证确认框可安全取消，专项用例另行构造该业务前置条件。
 

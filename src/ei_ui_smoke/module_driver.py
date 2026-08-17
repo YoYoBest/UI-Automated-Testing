@@ -175,6 +175,21 @@ class FieldCompletionReport:
         return "；".join(parts) if parts else "全部字段均已定位并成功输入"
 
 
+@dataclass(frozen=True, slots=True)
+class FieldExecutionPlan:
+    """A stable field identity retained while Vue rerenders the form."""
+
+    field_code: str
+    field_label: str
+    source_qcc: bool
+    source_code: str
+    source_label: str
+    kind: str
+    required: bool
+    identity_safe: bool
+    ordinal: int
+
+
 @dataclass(slots=True)
 class AttachmentCompletionReport:
     status: str = "not_configured"
@@ -252,6 +267,7 @@ class ModuleSmokeDriver:
         self._nested_evidence: list[dict[str, str]] = []
         self._submitted_display_values: dict[str, tuple[Any, str]] = {}
         self._collection_submission_codes: set[str] = set()
+        self._readback_excluded_submission_codes: set[str] = set()
         self._unique_list_responses: list[Any] = []
         self._unique_list_listener = None
         self._unique_occupied_snapshot: dict[tuple[Any, ...], list[Any]] = {}
@@ -337,6 +353,7 @@ class ModuleSmokeDriver:
         self._reset_nested_evidence()
         self._submitted_display_values = {}
         self._collection_submission_codes = set()
+        self._readback_excluded_submission_codes = set()
         automation_registry_scope = self._automation_registry_scope()
         self.prepare_unique_constraint_evidence()
         add = self._wait_for_add_button()
@@ -756,10 +773,10 @@ class ModuleSmokeDriver:
         )
 
     def _default_readback_required_codes(self, submitted: dict[str, Any]) -> set[str]:
-        """Use collection child paths for readback, not the collection's UI wrapper code."""
+        """Read back writes from newly created rows, not retained collection support values."""
         return set(submitted) - set(
             getattr(self, "_collection_submission_codes", set())
-        )
+        ) - set(getattr(self, "_readback_excluded_submission_codes", set()))
 
     def _open_current_detail_edit_for_readback(self, markers: list[str]) -> bool:
         """Enter edit mode when ordinary readback currently sits on readonly detail."""
@@ -2235,7 +2252,18 @@ class ModuleSmokeDriver:
         except ValueError:
             pass
         self._refresh_list_after_delete()
-        if not arbitrary_row:
+        if arbitrary_row:
+            if not actual_delete_id:
+                raise AssertionError("删除接口未返回可查询的业务 ID，无法确认删除结果")
+            detail_presence = self._deleted_record_detail_presence(
+                delete_response, actual_delete_id,
+            )
+            if detail_presence is not False:
+                raise AssertionError(
+                    "删除后详情接口未证明记录已删除："
+                    f"business_id={actual_delete_id}"
+                )
+        else:
             self._wait_for_deleted_record_absent(
                 result.business_id,
                 markers,
@@ -4098,6 +4126,7 @@ class ModuleSmokeDriver:
             token.lstrip("/")
             for token in cls.BUSINESS_MUTATION_URL_TOKENS
         }
+        action_tokens.update({"delete", "remove"})
         action_index = next(
             (
                 index
@@ -4502,6 +4531,11 @@ class ModuleSmokeDriver:
                 paths = json.loads(raw_paths)
             except json.JSONDecodeError as exc:
                 raise AssertionError(f"EI_ACTION_PATHS_JSON 不是有效 JSON：{exc}") from exc
+            if not isinstance(paths, list) or len(paths) != 1:
+                raise AssertionError(
+                    "EI_ACTION_PATHS_JSON 仅允许一条嵌套操作路径；"
+                    "多条路径必须由调度器拆分为独立执行项"
+                )
         else:
             raw_path = os.getenv("EI_ACTION_PATH", "").strip()
             if not raw_path:
@@ -4510,8 +4544,6 @@ class ModuleSmokeDriver:
                 paths = [json.loads(raw_path)]
             except json.JSONDecodeError as exc:
                 raise AssertionError(f"EI_ACTION_PATH 不是有效 JSON：{exc}") from exc
-        if not isinstance(paths, list):
-            return nested_submitted
         operations = []
         for steps in paths:
             if isinstance(steps, list) and len(steps) >= 3:
@@ -5246,6 +5278,17 @@ class ModuleSmokeDriver:
                 break
             self.page.wait_for_timeout(300)
         if last_error:
+            if api_presence is None:
+                detail_presence = self._deleted_record_detail_presence(
+                    after_response, business_id,
+                )
+                if detail_presence is False:
+                    return
+                if detail_presence is True:
+                    raise AssertionError(
+                        "删除后详情接口仍返回本次业务 ID："
+                        f"{business_id}"
+                    )
             if business_id and api_presence is None and (
                 "保存字段组合精确匹配到" in last_error
                 or "自动化标识精确匹配到" in last_error
@@ -5258,6 +5301,103 @@ class ModuleSmokeDriver:
             raise AssertionError(f"删除后无法确认本次记录消失：{last_error}")
         identity = last_identity or business_id or ", ".join(markers)
         raise AssertionError(f"删除接口成功但本次记录仍在列表中：{identity}")
+
+    def _deleted_record_detail_presence(
+        self, delete_response, business_id: str,
+    ) -> bool | None:
+        """Return exact-ID detail presence after delete, or None when unavailable.
+
+        This is a read-only fallback for an inconclusive rendered list. A
+        successful detail response proves the record remains; only HTTP 404 or
+        the backend's explicit not-found business response proves deletion.
+        """
+        normalized_id = self._normalize_record_text(business_id)
+        if not normalized_id or delete_response is None:
+            return None
+        detail_url = self._same_resource_detail_url(
+            getattr(delete_response, "url", ""), normalized_id,
+        )
+        request_context = getattr(self.page, "request", None)
+        get = getattr(request_context, "get", None)
+        if not detail_url or not callable(get):
+            return None
+        try:
+            response = get(detail_url)
+        except Exception as exc:
+            raise AssertionError("删除后详情查询请求失败") from exc
+        status = int(getattr(response, "status", 0) or 0)
+        if status in {401, 403}:
+            response = self._browser_authenticated_get_response(detail_url)
+            status = int(getattr(response, "status", 0) or 0)
+        if status == 404:
+            return False
+        try:
+            payload = response.json()
+        except Exception as exc:
+            if not getattr(response, "ok", False):
+                raise AssertionError(
+                    f"删除后详情查询失败：HTTP {status}"
+                ) from exc
+            raise AssertionError("删除后详情查询未返回 JSON") from exc
+        if not getattr(response, "ok", False):
+            raise AssertionError(f"删除后详情查询失败：HTTP {status}")
+        if isinstance(payload, dict):
+            try:
+                self._assert_business_success(payload, operation="删除后详情查询")
+            except AssertionError as exc:
+                message = self._normalize_record_text(str(exc))
+                if re.search(r"(?:不存在|not\s+found)", message, re.I):
+                    return False
+                raise
+        payload_ids = self._record_scalar_texts(payload)
+        if normalized_id not in payload_ids:
+            raise AssertionError(
+                "删除后详情响应未返回目标业务 ID："
+                f"expected={normalized_id}"
+            )
+        return True
+
+    def _browser_authenticated_get_response(self, url: str):
+        """Fetch a readback URL from the page's logged-in browser context.
+
+        Playwright's ``page.request`` context does not inherit a SPA token stored
+        in local storage.  Use it only as the first attempt; an authorization
+        response is retried through the actual page context, which also retains
+        the browser cookies.  The structured result intentionally preserves
+        non-2xx statuses so callers can distinguish a 404 from authentication or
+        server failures.
+        """
+        evaluate = getattr(self.page, "evaluate", None)
+        if not callable(evaluate):
+            raise AssertionError("删除后详情查询缺少浏览器登录上下文")
+        try:
+            result = evaluate(
+                """async (requestUrl) => {
+                  const headers = {'Content-Type': 'application/json'};
+                  const token = localStorage.getItem('accessToken');
+                  const tenant = localStorage.getItem('tenantId') || localStorage.getItem('tenant-id');
+                  if (token) headers.Authorization = token;
+                  if (tenant) {
+                    headers.tenantId = tenant;
+                    headers['x-tenant-id'] = tenant;
+                    headers['X-Tenant-Id'] = tenant;
+                  }
+                  headers['X-Language'] = localStorage.getItem('i18n-language') || 'zh_CN';
+                  const response = await fetch(requestUrl, {
+                    method: 'GET', headers, credentials: 'same-origin',
+                  });
+                  const text = await response.text();
+                  let body;
+                  try { body = JSON.parse(text); } catch { body = text; }
+                  return {ok: response.ok, status: response.status, url: response.url, body};
+                }""",
+                url,
+            )
+        except Exception as exc:
+            raise AssertionError("删除后详情查询无法使用浏览器登录上下文") from exc
+        if not isinstance(result, dict):
+            raise AssertionError("删除后详情查询未返回结构化响应")
+        return _UniqueListReplayResponse(result, url)
 
     @classmethod
     def _latest_collection_record_presence(
@@ -6905,12 +7045,15 @@ class ModuleSmokeDriver:
         """Apply manifest-owned collection rules without changing application markup."""
         submitted: dict[str, Any] = {}
         for spec in getattr(self, "dynamic_collections", ()):
+            if not getattr(spec, "create_on_outer_add", True):
+                continue
             root = scope.locator(spec.root_selector).first
             if not root.count() or not root.is_visible():
                 raise DynamicFieldContractError(
                     f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
                 )
             rows = self._configured_collection_rows(root, spec)
+            retained_row_count = len(rows)
             if len(rows) < spec.min_rows:
                 trigger = root.locator(spec.create_selector).first
                 if not trigger.count() or not trigger.is_visible():
@@ -6922,9 +7065,17 @@ class ModuleSmokeDriver:
             # min_rows is a creation threshold. Hydrated collections may already
             # contain more rows, and every rendered row participates in Save.
             for row_index, row in enumerate(rows):
-                submitted.update(self._fill_configured_collection_row(
+                row_submitted = self._fill_configured_collection_row(
                     spec, row, row_index, value_offset=len(submitted)
-                ))
+                )
+                submitted.update(row_submitted)
+                if row_index < retained_row_count:
+                    excluded = getattr(
+                        self, "_readback_excluded_submission_codes", None
+                    )
+                    if excluded is None:
+                        excluded = self._readback_excluded_submission_codes = set()
+                    excluded.update(row_submitted)
             submitted[spec.field_code] = spec.mode
             self._collection_submission_codes.add(spec.field_code)
         return submitted
@@ -7364,13 +7515,23 @@ class ModuleSmokeDriver:
             and not configured_collections
         ):
             submitted.update(self._prepare_dynamic_collection_baselines(collection_scope))
-        fields = scan_fields()
-        field_count = max(len(fields), len(self.source_fields) if source_identity else 0)
-        for index in range(1, field_count + 1):
-            current_fields = scan_fields()
-            if index > len(current_fields):
-                break
-            dom = current_fields[index - 1]
+        plans = self._field_execution_plan(scan_fields(), source_identity=source_identity)
+        processed_plan_keys: set[tuple[str, str, str]] = set()
+        cursor = 0
+        while cursor < len(plans):
+            plan = plans[cursor]
+            cursor += 1
+            plan_key = self._field_execution_plan_key(plan)
+            if plan_key in processed_plan_keys:
+                continue
+            processed_plan_keys.add(plan_key)
+            dom = self._resolve_field_execution_plan(
+                plan, scan_fields(), source_identity=source_identity,
+            )
+            if dom is None:
+                # Conditional fields may disappear after another selection. Do
+                # not substitute the current DOM item at this position.
+                continue
             if dom.readonly or not dom.field_code:
                 continue
             if (
@@ -7380,24 +7541,10 @@ class ModuleSmokeDriver:
                 and self._dom_field_is_in_configured_collection(collection_scope, dom)
             ):
                 continue
-            if source_identity:
-                (
-                    field_code,
-                    field_label,
-                    source_qcc,
-                    source_code,
-                    _source_label,
-                    _source_identity_safe,
-                ) = self._runtime_identity_for_dom(dom, index)
-            else:
-                (
-                    field_code,
-                    field_label,
-                    source_qcc,
-                    source_code,
-                    _source_label,
-                    _source_identity_safe,
-                ) = self._runtime_identity_for_nested_dom(dom, index)
+            field_code = plan.field_code
+            field_label = plan.field_label
+            source_qcc = plan.source_qcc
+            source_code = plan.source_code
             if only_codes is not None and field_code.lower() not in only_codes:
                 continue
             definition = FieldDefinition(
@@ -7438,7 +7585,7 @@ class ModuleSmokeDriver:
                 and field_code.lower() in self.OPTIONAL_RELATIONSHIP_FIELDS
             ):
                 continue
-            value = self.data_strategy.value_for(definition, index)
+            value = self.data_strategy.value_for(definition, plan.ordinal)
             try:
                 if dom.kind == "radio":
                     radios = self._radio_group(
@@ -7487,6 +7634,12 @@ class ModuleSmokeDriver:
                 wait_for_timeout = getattr(self.page, "wait_for_timeout", None)
                 if callable(wait_for_timeout):
                     wait_for_timeout(500)
+                self._append_new_field_execution_plans(
+                    plans,
+                    processed_plan_keys,
+                    scan_fields(),
+                    source_identity=source_identity,
+                )
             except Exception as exc:
                 detail = f"{dom.label or dom.field_code} ({field_code}): {exc}"
                 (failures if dom.required else optional_failures).append(detail)
@@ -7501,6 +7654,111 @@ class ModuleSmokeDriver:
         self._fill_failures = failures
         self._optional_fill_failures = optional_failures
         return submitted
+
+    def _field_execution_plan(
+        self, fields, *, source_identity: bool,
+    ) -> list[FieldExecutionPlan]:
+        plans: list[FieldExecutionPlan] = []
+        seen: set[tuple[str, str, str]] = set()
+        for ordinal, dom in enumerate(fields, 1):
+            if not dom.field_code:
+                continue
+            if source_identity:
+                identity = self._runtime_identity_for_dom(dom, ordinal)
+            else:
+                identity = self._runtime_identity_for_nested_dom(dom, ordinal)
+            (
+                field_code,
+                field_label,
+                source_qcc,
+                source_code,
+                source_label,
+                identity_safe,
+            ) = identity
+            plan = FieldExecutionPlan(
+                field_code=field_code,
+                field_label=field_label,
+                source_qcc=source_qcc,
+                source_code=source_code,
+                source_label=source_label,
+                kind=dom.kind,
+                required=dom.required,
+                identity_safe=identity_safe,
+                ordinal=ordinal,
+            )
+            key = self._field_execution_plan_key(plan)
+            if key not in seen:
+                plans.append(plan)
+                seen.add(key)
+        return plans
+
+    @classmethod
+    def _field_execution_plan_key(
+        cls, plan: FieldExecutionPlan,
+    ) -> tuple[str, str, str]:
+        if plan.identity_safe and plan.source_code:
+            return ("code", plan.source_code.lower(), plan.kind)
+        if plan.field_code and not cls._is_generated_identifier(plan.field_code):
+            return ("code", plan.field_code.lower(), plan.kind)
+        return ("label", cls._normalize_label(plan.field_label), plan.kind)
+
+    def _resolve_field_execution_plan(
+        self,
+        plan: FieldExecutionPlan,
+        fields,
+        *,
+        source_identity: bool,
+    ):
+        matches = []
+        for ordinal, dom in enumerate(fields, 1):
+            if dom.kind != plan.kind:
+                continue
+            if source_identity:
+                identity = self._runtime_identity_for_dom(dom, ordinal)
+            else:
+                identity = self._runtime_identity_for_nested_dom(dom, ordinal)
+            field_code, field_label, _qcc, source_code, source_label, identity_safe = identity
+            if plan.identity_safe:
+                if not identity_safe:
+                    continue
+                if self._source_code_matches_runtime(plan.source_code, source_code):
+                    matches.append(dom)
+                continue
+            if (
+                plan.field_code
+                and not self._is_generated_identifier(plan.field_code)
+                and self._source_code_matches_runtime(plan.field_code, field_code)
+            ):
+                matches.append(dom)
+                continue
+            if (
+                self._normalize_label(plan.field_label)
+                and self._normalize_label(plan.field_label)
+                in {
+                    self._normalize_label(field_label),
+                    self._normalize_label(source_label),
+                }
+            ):
+                matches.append(dom)
+        return matches[0] if len(matches) == 1 else None
+
+    def _append_new_field_execution_plans(
+        self,
+        plans: list[FieldExecutionPlan],
+        processed_plan_keys: set[tuple[str, str, str]],
+        fields,
+        *,
+        source_identity: bool,
+    ) -> None:
+        planned = {
+            self._field_execution_plan_key(plan)
+            for plan in plans
+        }
+        for plan in self._field_execution_plan(fields, source_identity=source_identity):
+            key = self._field_execution_plan_key(plan)
+            if key not in planned and key not in processed_plan_keys:
+                plans.append(plan)
+                planned.add(key)
 
     def _retry_field_codes(self, submitted: dict[str, Any]) -> set[str]:
         retry_codes: set[str] = set()

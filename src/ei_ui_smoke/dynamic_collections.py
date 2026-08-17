@@ -36,6 +36,7 @@ class DynamicCollectionSpec:
     component: str = ""
     section_title: str = ""
     value_relations: tuple[DynamicCollectionValueRelation, ...] = ()
+    create_on_outer_add: bool = True
 
 
 def load_dynamic_collection_specs(
@@ -97,6 +98,7 @@ def _parse_spec(entry: object, path: Path) -> DynamicCollectionSpec:
         component=_normalize_component(str(entry.get("component") or "")),
         section_title=str(entry.get("sectionTitle") or "").strip(),
         value_relations=value_relations,
+        create_on_outer_add=bool(entry.get("createOnOuterAdd", True)),
     )
     if (
         not spec.field_code

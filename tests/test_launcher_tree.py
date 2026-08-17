@@ -52,6 +52,7 @@ from ei_ui_smoke.launcher import (
     save_url_history,
     safe_run_log_name,
     target_preflight_error,
+    resource_pool_mode_preflight_error,
     preferred_common_cases_sheet,
     parse_sheet_selection,
     preferred_case_sheets,
@@ -1884,6 +1885,62 @@ def test_matched_runtime_component_passes_preflight():
     )
 
     assert target_preflight_error(item) == ""
+
+
+def test_resource_pool_probe_is_allowed_but_stable_add_is_preflight_blocked():
+    add = ModuleItem(
+        id="resourcePool::action::2",
+        name="新增",
+        path=("对外投资项目", "资源池", "新增"),
+        form_code="POOL_RESOURCE",
+        runnable=True,
+        operation="新增",
+    )
+    nested_delete = ModuleItem(
+        id="resourcePool::action::4",
+        name="删除",
+        path=("对外投资项目", "资源池", "新增", "股权结构", "删除"),
+        form_code="POOL_RESOURCE",
+        runnable=True,
+        operation="删除",
+        operation_path=("新增", "股权结构", "删除"),
+    )
+
+    assert resource_pool_mode_preflight_error(add, "probe") == ""
+    assert resource_pool_mode_preflight_error(add, "standard") == ""
+    assert "稳定冒烟" in resource_pool_mode_preflight_error(add, "stable")
+    assert "稳定冒烟" in resource_pool_mode_preflight_error(nested_delete, "stable")
+
+
+def test_run_selected_warns_before_starting_stable_resource_pool_add(monkeypatch, tmp_path):
+    source_root = tmp_path / "source"
+    (source_root / "ei-view" / "src" / "views").mkdir(parents=True)
+    target = ModuleItem(
+        id="resourcePool::action::2",
+        name="新增",
+        path=("对外投资项目", "资源池", "新增"),
+        form_code="POOL_RESOURCE",
+        runnable=True,
+        operation="新增",
+    )
+    warnings = []
+    monkeypatch.setattr(
+        launcher_module.messagebox, "showwarning",
+        lambda title, message: warnings.append((title, message)),
+    )
+    launcher = SimpleNamespace(
+        _selected_targets=lambda: [target],
+        storage=_StubValue("auth-state.json"), username=_StubValue(""),
+        password=_StubValue(""), mode=_StubValue("stable"),
+        submit_zentao=_StubValue(False), source=_StubValue(str(source_root)),
+        system_url=_StubValue("https://host/ei-view/"), project_root=tmp_path,
+    )
+
+    Launcher.run_selected(launcher)
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "资源池运行模式不满足"
+    assert "稳定冒烟" in warnings[0][1]
 
 
 def test_action_without_source_match_fails_preflight():

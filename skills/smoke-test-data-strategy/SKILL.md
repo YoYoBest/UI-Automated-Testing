@@ -88,6 +88,12 @@ probe 模式不读取页面专属业务值，但仍必须遵守公共合法规�
 
 ## 验证
 
+## Independent Action Data Scope
+
+- A launcher target sequence distinguishes subprocesses but not parametrized actions executed inside one pytest process. The module-action runner must provide a stable, non-secret per-action scope derived from its logical module/action path, and `create_data_strategy()` must append it to the generated run ID after `EI_AUTOMATION_RUN_ID` and `EI_AUTOMATION_TARGET_SEQUENCE`.
+- Generated fallback text and enterprise names must therefore differ for independently scheduled outer-form lifecycles in one action batch, while the same logical action remains reproducible across retries.
+- `POOL_RESOURCE` supports `probe` and `standard`. Do not reject the entire form in `create_data_strategy()` based on mode: the declared `projObjectName` unique constraint is applied only by the physical outer Add lifecycle, where it captures the authenticated resource-pool list, preallocates an unused value, and retries only that field after the declared duplicate response. Its list payload uses `enterpriseOrProjectName` for this field, so retain it alongside `projObjectName` and `name` in the declared aliases. `stable` cannot validate a complete resource-pool Add; the launcher must warn before scheduling any target that requires an outer Add lifecycle.
+
 ## 字段语义识别
 
 - 语义映射同时检查稳定业务字段代码和可读标签，优先信任业务字段代码。禁止使用 `el-id-*`、占位文本或 DOM 数组位置推断邮箱、手机号、金额等语义。

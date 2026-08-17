@@ -22,16 +22,23 @@ _PARENT_PAGINATION_SELECTOR = ".table_pagination:visible,.el-pagination:visible"
 _PARENT_PAGE_JUMP_SELECTOR = (
     "input[aria-label='页'],.el-pagination__editor input[type='number']"
 )
-_PROJECT_LIST_MORE_SELECTOR = ".search-more button:visible"
+_PROJECT_LIST_MORE_SELECTOR = ".search-more:visible"
 _PROJECT_STATUS_FILTER_SELECTOR = (
     ".search-more-list .el-form-item:has-text('项目状态'):visible"
 )
-_PROJECT_LIST_QUERY_SELECTOR = ".search-button button:visible"
+_PROJECT_LIST_QUERY_SELECTOR = ".search-button:visible"
 _PROJECT_LIST_EMPTY_SELECTOR = ".fund-card-list:has-text('暂无建设项目数据'):visible"
-# The status filter accepts one value per request.  The server permits project
-# progress creation only from these post-decision states; completed and
-# terminated projects are later in the lifecycle but are not writable.
-_PROJECT_PROGRESS_ELIGIBLE_STATUSES = ("项目决策", "项目实施")
+_PROJECT_LIST_RECORD_SELECTOR = ".fund-card-list .mujijin-cardBox:visible"
+_PROJECT_STATUS_CELL_SELECTOR = ".card-info-row .card-col"
+# The status filter accepts one value per request. The first rendered result
+# from the first non-empty status query is the fixed project-progress parent.
+_PROJECT_PROGRESS_STATUS_CODES = {
+    "项目决策": "20",
+    "项目实施": "30",
+    "项目竣工": "40",
+    "已终止": "100",
+}
+_PROJECT_PROGRESS_ELIGIBLE_STATUSES = tuple(_PROJECT_PROGRESS_STATUS_CODES)
 _PROJECT_PROGRESS_STATUS_LABEL = "项目决策及后续可新增状态"
 _RECORD_DETAIL_ACTION_TEXTS = {
     "详情", "查看", "编辑", "修改", "删除", "移除", "清空", "新增", "添加", "新建",
@@ -66,18 +73,15 @@ class ProjectProgressParentContext:
     detail_url: str
 
 
+@dataclass(frozen=True)
+class _ProjectStatusCandidates:
+    candidates: object
+    expected_business_id: str
+
+
 def _is_project_progress_module(module_name: str) -> bool:
     normalized_module = _normalized_action_text(module_name)
     return any(label in normalized_module for label in ("项目进度", "实施进度"))
-
-
-def _is_project_progress_add(module_name: str, action: str) -> bool:
-    """Whether this detail action is subject to the project-progress add gate."""
-    normalized_action = _normalized_action_text(action)
-    return (
-        normalized_action in {"新增", "添加", "新建"}
-        and _is_project_progress_module(module_name)
-    )
 
 
 def _project_progress_context_path() -> Path:
@@ -695,23 +699,44 @@ def _wait_for_project_decision_results(
     page,
     *,
     status: str = _PROJECT_PROGRESS_STATUS_LABEL,
+    expected_records: list[dict] | None = None,
+    expect_empty: bool | None = None,
     timeout: int = 15_000,
 ):
-    """Wait for the filtered project list, including its rendered empty state."""
+    """Wait for a post-query filtered list, including its rendered empty state."""
     deadline = time.monotonic() + max(1, timeout) / 1000
     previous: tuple[str, ...] = ()
     stable_count = 0
     while time.monotonic() < deadline:
-        candidates = page.locator(_PARENT_RECORD_SELECTOR)
+        candidates = page.locator(_PROJECT_LIST_RECORD_SELECTOR)
         snapshot = _record_snapshot(candidates)
         if not _parent_list_loading(page):
-            if snapshot:
+            statuses_match = bool(snapshot) and all(
+                _project_status_from_card(candidates.nth(index)) == status
+                for index in range(candidates.count())
+            )
+            records_match = expected_records is None or (
+                len(expected_records) == candidates.count()
+                and all(
+                    _project_card_matches_response_record(
+                        candidates.nth(index), expected_records[index], status,
+                    )
+                    for index in range(candidates.count())
+                )
+            )
+            if snapshot and statuses_match and records_match:
                 stable_count = stable_count + 1 if snapshot == previous else 1
                 previous = snapshot
                 if stable_count >= 2:
                     return candidates
-            elif page.locator(_PROJECT_LIST_EMPTY_SELECTOR).count():
+            elif (
+                expect_empty is not False
+                and page.locator(_PROJECT_LIST_EMPTY_SELECTOR).count()
+            ):
                 raise ParentListEmptyError(f"项目状态“{status}”查询结果为空")
+            else:
+                previous = ()
+                stable_count = 0
         else:
             previous = ()
             stable_count = 0
@@ -719,34 +744,175 @@ def _wait_for_project_decision_results(
     raise ParentListNotReadyError(f"项目状态“{status}”查询后列表未就绪")
 
 
-def _click_project_list_query(
-    page,
-    *,
-    status: str = _PROJECT_PROGRESS_STATUS_LABEL,
-) -> None:
-    """Click 查询 and wait for the list request initiated by that click."""
-    query = page.locator(_PROJECT_LIST_QUERY_SELECTOR)
+def _request_json_payload(request) -> object:
+    try:
+        payload = request.post_data_json
+        return payload() if callable(payload) else payload
+    except Exception:
+        raw = getattr(request, "post_data", "") or ""
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+
+def _is_filtered_project_list_response(
+    response, expected_status_code: str = "",
+) -> bool:
+    request = getattr(response, "request", None)
+    if request is None:
+        return False
+    if str(getattr(request, "method", "")).upper() != "POST":
+        return False
+    if not str(getattr(response, "url", "")).split("?", 1)[0].endswith(
+        "/fi-service/projInfo/listPage"
+    ):
+        return False
+    payload = _request_json_payload(request)
+    if not isinstance(payload, dict):
+        return False
+    actual_status = _normalized_action_text(str(payload.get("projStatus") or ""))
+    expected_status = _normalized_action_text(expected_status_code)
+    return bool(actual_status) and (
+        not expected_status or actual_status == expected_status
+    )
+
+
+def _project_records_from_payload(payload: object) -> list[dict] | None:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return None
+    for key in ("records", "rows", "list"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    for key in ("data", "result"):
+        if key not in payload:
+            continue
+        records = _project_records_from_payload(payload.get(key))
+        if records is not None:
+            return records
+    return None
+
+
+def _project_status_from_card(record) -> str:
+    return _project_card_label_value(record, "项目状态")
+
+
+def _project_card_label_value(record, label: str) -> str:
+    try:
+        cells = record.locator(_PROJECT_STATUS_CELL_SELECTOR)
+        for index in range(cells.count()):
+            text = _normalized_action_text(cells.nth(index).inner_text())
+            match = re.fullmatch(rf"{re.escape(label)}[:：](.+)", text)
+            if match:
+                return match.group(1)
+    except Exception:
+        return ""
+    return ""
+
+
+def _project_name_from_card(record) -> str:
+    try:
+        names = record.locator(".card-name")
+        if names.count() == 1:
+            return _normalized_action_text(names.first.inner_text())
+    except Exception:
+        return ""
+    return ""
+
+
+def _project_card_matches_response_record(
+    card, response_record: dict, status: str,
+) -> bool:
+    expected_name = _normalized_action_text(str(response_record.get("projName") or ""))
+    if not expected_name or _project_name_from_card(card) != expected_name:
+        return False
+    if _project_status_from_card(card) != status:
+        return False
+    display_fields = {
+        "项目类型": "projClassifyName",
+        "责任板块": "belongSectionName",
+        "实施主体公司": "inveName",
+    }
+    return all(
+        not (expected := _normalized_action_text(str(response_record.get(code) or "")))
+        or _project_card_label_value(card, label) == expected
+        for label, code in display_fields.items()
+    )
+
+
+def _assert_project_list_business_success(payload: object, status: str) -> None:
+    if not isinstance(payload, dict):
+        raise ParentListNotReadyError(
+            f"项目状态“{status}”查询响应不是业务 JSON 对象"
+        )
+    code = payload.get("code", payload.get("status"))
+    success = payload.get("success")
+    errors = payload.get("errors")
+    has_errors = bool(errors) if isinstance(errors, (list, tuple, dict, str)) else False
+    allowed_codes = {"0", "200", "success", "true"}
+    if (
+        success is False
+        or has_errors
+        or (code is not None and str(code).strip().lower() not in allowed_codes)
+    ):
+        message = _normalized_action_text(
+            str(payload.get("message") or payload.get("msg") or "业务状态失败")
+        )[:200]
+        raise ParentListNotReadyError(
+            f"项目状态“{status}”查询接口返回业务失败："
+            f"code={code!r}, message={message!r}"
+        )
+
+
+def _capture_project_status_response(
+    page, status: str, click: Callable[[], None],
+) -> list[dict] | None:
+    expected_status_code = _PROJECT_PROGRESS_STATUS_CODES.get(status, "")
+    if not expected_status_code:
+        raise ParentListNotReadyError(f"项目状态“{status}”缺少稳定状态码")
     expect_response = getattr(page, "expect_response", None)
     if not callable(expect_response):
-        _click_exact_text(query, "查询")
-        return
+        click()
+        return None
     try:
         with expect_response(
-            lambda response: (
-                getattr(response, "request", None) is not None
-                and str(getattr(response.request, "method", "")).upper() == "POST"
-                and str(getattr(response, "url", "")).split("?", 1)[0].endswith(
-                    "/fi-service/projInfo/listPage"
-                )
+            lambda response: _is_filtered_project_list_response(
+                response, expected_status_code,
             ),
             timeout=15_000,
         ) as response_info:
-            _click_exact_text(query, "查询")
+            click()
         if not bool(getattr(response_info.value, "ok", False)):
             raise ParentListNotReadyError(
                 f"项目状态“{status}”查询请求失败："
                 f"HTTP {getattr(response_info.value, 'status', 0)}"
             )
+        try:
+            payload = response_info.value.json()
+        except Exception as exc:
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询响应不是有效 JSON"
+            ) from exc
+        _assert_project_list_business_success(payload, status)
+        records = _project_records_from_payload(payload)
+        if records is None:
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询响应缺少项目记录集合"
+            )
+        mismatched = {
+            _normalized_action_text(str(record.get("projStatusName") or ""))
+            for record in records
+            if record.get("projStatusName") not in (None, "")
+            and _normalized_action_text(str(record.get("projStatusName"))) != status
+        }
+        if mismatched:
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询返回了其他状态：{sorted(mismatched)!r}"
+            )
+        return records
     except ParentListNotReadyError:
         raise
     except Exception as exc:
@@ -755,14 +921,27 @@ def _click_project_list_query(
         ) from exc
 
 
-def _enter_project_progress_decision_parent(page, detail_url: str) -> object | None:
-    """Open the first parent in a currently eligible post-decision state.
+def _click_project_status_filter(page, status_filter, status: str) -> list[dict] | None:
+    """Select one status and wait for the list response emitted by that change."""
+    return _capture_project_status_response(
+        page,
+        status,
+        lambda: _click_exact_text(status_filter, status),
+    )
 
-    The UI exposes one project-status value per search. Query the eligible
-    lifecycle states in their declared order instead of falling back to an
-    unfiltered list or probing detail pages one by one.
-    """
-    page.goto(detail_parent_url(detail_url), wait_until="domcontentloaded")
+
+def _click_project_list_query(page, status: str) -> list[dict] | None:
+    """Reissue the current status query after a confirmed response/render race."""
+    return _capture_project_status_response(
+        page,
+        status,
+        lambda: _click_exact_text(
+            page.locator(_PROJECT_LIST_QUERY_SELECTOR), "查询",
+        ),
+    )
+
+
+def _project_progress_status_candidates(page, status: str):
     status_filter = page.locator(_PROJECT_STATUS_FILTER_SELECTOR).first
     if not _locator_visible(status_filter):
         _click_exact_text(page.locator(_PROJECT_LIST_MORE_SELECTOR), "···")
@@ -770,19 +949,62 @@ def _enter_project_progress_decision_parent(page, detail_url: str) -> object | N
             status_filter.wait_for(state="visible", timeout=10_000)
         except Exception as exc:
             raise ParentListNotReadyError("项目列表未展示项目状态筛选条件") from exc
+    records = _click_project_status_filter(page, status_filter, status)
+    try:
+        candidates = _wait_for_project_decision_results(
+            page,
+            status=status,
+            expected_records=records,
+            expect_empty=(not records) if records is not None else None,
+        )
+    except ParentListEmptyError:
+        raise
+    except ParentListNotReadyError:
+        records = _click_project_list_query(page, status)
+        candidates = _wait_for_project_decision_results(
+            page,
+            status=status,
+            expected_records=records,
+            expect_empty=(not records) if records is not None else None,
+        )
+    expected_business_id = ""
+    if records:
+        expected_business_id = _normalized_action_text(
+            str(records[0].get("projId") or records[0].get("id") or "")
+        )
+        if not expected_business_id:
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询首条记录缺少项目 ID"
+            )
+    return _ProjectStatusCandidates(candidates, expected_business_id)
+
+
+def _enter_project_progress_decision_parent(page, detail_url: str) -> object | None:
+    """Open the first project returned by the first non-empty status query."""
+    page.goto(detail_parent_url(detail_url), wait_until="domcontentloaded")
     empty_statuses: list[str] = []
     for status in _PROJECT_PROGRESS_ELIGIBLE_STATUSES:
-        _click_exact_text(status_filter, status)
-        _click_project_list_query(page, status=status)
         try:
-            candidates = _wait_for_project_decision_results(page, status=status)
+            status_result = _project_progress_status_candidates(page, status)
         except ParentListEmptyError:
             empty_statuses.append(status)
             continue
+        candidates = status_result.candidates
         selected_identity = _open_parent_list_record(page, candidates.nth(0), candidates)
-        return _project_progress_context_from_page(page, selected_identity)
+        context = _project_progress_context_from_page(page, selected_identity)
+        if not isinstance(context, ProjectProgressParentContext):
+            raise ParentListNotReadyError("项目详情地址未提供项目 ID，无法固定项目进度父项目")
+        if (
+            status_result.expected_business_id
+            and context.business_id != status_result.expected_business_id
+        ):
+            raise ParentListNotReadyError(
+                f"项目状态“{status}”查询首条 ID 与打开详情不一致："
+                f"expected={status_result.expected_business_id}, actual={context.business_id}"
+            )
+        return context
     raise ParentListEmptyError(
-        "项目状态“项目决策及后续可新增状态”查询结果为空："
+        "未找到状态为“项目决策及后续状态”的项目："
         + "、".join(empty_statuses)
     )
 
@@ -961,7 +1183,6 @@ def enter_available_detail_module(
     record_identity=None,
     provision_record: Callable[[], object] | None = None,
     provision_child_record: Callable[[], object] | None = None,
-    provision_eligible_record: Callable[[], object] | None = None,
 ) -> object | None:
     if max_records is None:
         try:
@@ -991,44 +1212,20 @@ def enter_available_detail_module(
                 navigation_labels=navigation_labels,
                 provision_child_record=provision_child_record,
             )
-        try:
-            selected_identity = _enter_project_progress_decision_parent(
-                page, detail_url,
-            )
-            if isinstance(selected_identity, ProjectProgressParentContext):
-                return _open_project_progress_parent_context(
-                    page,
-                    selected_identity,
-                    module_name,
-                    action,
-                    navigation_labels=navigation_labels,
-                    provision_child_record=provision_child_record,
-                )
-            navigate_detail_module(
-                page, module_name, action, navigation_labels=navigation_labels,
-            )
-            return selected_identity
-        except ParentListEmptyError:
-            if not _is_project_progress_add(module_name, action):
-                raise
-            provisioner = provision_eligible_record or provision_record
-            if provisioner is None:
-                raise
-            provisioned = provisioner()
-            if not _normalized_record_identity_values(provisioned):
-                raise AssertionError(
-                    "项目进度前置创建未返回业务 ID 或自动化标识"
-                )
-            selected_identity = _open_provisioned_detail_module(
+        selected_identity = _enter_project_progress_decision_parent(page, detail_url)
+        if isinstance(selected_identity, ProjectProgressParentContext):
+            return _open_project_progress_parent_context(
                 page,
-                detail_url,
+                selected_identity,
                 module_name,
                 action,
-                provisioned,
                 navigation_labels=navigation_labels,
                 provision_child_record=provision_child_record,
             )
-            return _project_progress_context_from_page(page, selected_identity)
+        navigate_detail_module(
+            page, module_name, action, navigation_labels=navigation_labels,
+        )
+        return selected_identity
     identities = _normalized_record_identity_values(record_identity)
     failures = []
     if identities:
@@ -1118,7 +1315,6 @@ def enter_available_detail_module(
 
 def detail_context_preparer_from_env(
     provision_record: Callable[[], object] | None = None,
-    provision_eligible_record: Callable[[object, str, str], Callable[[], object]] | None = None,
 ) -> Callable[[object], object | None] | None:
     """Build the common-form context hook for a detail-module test command."""
     if os.getenv("EI_REQUIRES_BUSINESS_ID", "").lower() != "true":
@@ -1147,11 +1343,6 @@ def detail_context_preparer_from_env(
         parent_provisioner = (
             (lambda: provision_parent(page)) if provision_record is not None else None
         )
-        eligible_parent_provisioner = (
-            provision_eligible_record(page, detail_url, module_name)
-            if provision_eligible_record is not None
-            else None
-        )
         try:
             selected_identity = enter_available_detail_module(
                 page,
@@ -1161,7 +1352,6 @@ def detail_context_preparer_from_env(
                 record_identity=cached_parent_identity,
                 provision_record=parent_provisioner,
                 provision_child_record=provision_record,
-                provision_eligible_record=eligible_parent_provisioner,
             )
         except ParentRecordIdentityUnavailableError:
             if isinstance(cached_parent_identity, ProjectProgressParentContext):
@@ -1182,7 +1372,6 @@ def detail_context_preparer_from_env(
                 record_identity=None,
                 provision_record=parent_provisioner,
                 provision_child_record=provision_record,
-                provision_eligible_record=eligible_parent_provisioner,
             )
         if _normalized_record_identity_values(selected_identity):
             cached_parent_identity = selected_identity

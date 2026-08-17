@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import ei_ui_smoke.module_driver as module_driver_module
@@ -5,7 +7,8 @@ from ei_ui_smoke.interactions import FieldInteractor
 from ei_ui_smoke.data_pool import UniqueConstraintSpec
 from ei_ui_smoke.module_driver import (
     ADD_BUTTON, EDITABLE_FORM_CONTROL, INLINE_FORM, DynamicFieldContractError,
-    FieldCompletionReport, ModuleSmokeDriver, ModuleSmokeResult, RecordNotDeletableError,
+    FieldCompletionReport, ModuleSmokeDriver, ModuleSmokeResult,
+    RecordNotDeletableError,
 )
 from ei_ui_smoke.dynamic_collections import (
     DynamicCollectionChild,
@@ -4839,6 +4842,59 @@ def test_fill_dialog_preserves_fields_that_already_have_values(monkeypatch):
     assert driver._fill_dialog() == {}
 
 
+def test_fill_dialog_reacquires_planned_fields_after_vue_rerender(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [
+        ("enterpriseName", "企业名称", False),
+        ("contactName", "联系人", False),
+        ("shareholderName", "股东名称", False),
+    ]
+    driver.page = object()
+    state = {"enterprise_filled": False, "filled": set()}
+    initial = [
+        DomField("enterpriseName", "企业名称", "text", "#enterprise", required=True),
+        DomField("contactName", "联系人", "text", "#contact", required=True),
+    ]
+    rerendered = [
+        initial[0],
+        DomField("shareholderName", "股东名称", "text", "#shareholder", required=True),
+        initial[1],
+    ]
+
+    def scan(_page):
+        return rerendered if state["enterprise_filled"] else initial
+
+    monkeypatch.setattr("ei_ui_smoke.module_driver.scan_dom_fields", scan)
+    driver._dom_field_has_value = lambda field, **_kwargs: field.field_code in state["filled"]
+    driver.data_strategy = type(
+        "Strategy", (), {"value_for": lambda _self, field, index: f"{field.field_code}-{index}"}
+    )()
+    calls = []
+
+    class Interactor:
+        @staticmethod
+        def fill(resolved, value):
+            field_code = resolved.definition.field_code
+            calls.append((field_code, value))
+            state["filled"].add(field_code)
+            if field_code == "enterpriseName":
+                state["enterprise_filled"] = True
+            return value
+
+    driver.interactor = Interactor()
+
+    submitted = driver._fill_dialog()
+
+    assert [field_code for field_code, _value in calls] == [
+        "enterpriseName", "contactName", "shareholderName",
+    ]
+    assert submitted == {
+        "enterpriseName": "enterpriseName-1",
+        "contactName": "contactName-2",
+        "shareholderName": "shareholderName-2",
+    }
+
+
 def test_fill_dialog_preserves_generated_radio_with_stable_checked_identity(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = [("isGmoDecision", "是否需总经办决策", False)]
@@ -6033,6 +6089,122 @@ def test_delete_verification_reports_missing_id_evidence_not_visible_record():
         )
 
 
+def test_delete_verification_uses_exact_detail_when_list_identity_is_ambiguous(monkeypatch):
+    class Page(RequestPage):
+        def locator(self, selector):
+            assert selector == ".el-table__row:visible"
+            return DeleteRows([
+                DeleteRow(["重大安全事故", "2026-08-01"]),
+                DeleteRow(["重大安全事故", "2026-08-01"]),
+            ])
+
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page([])
+    calls = []
+    monkeypatch.setattr(
+        driver,
+        "_deleted_record_detail_presence",
+        lambda response, business_id: calls.append((response, business_id)) or False,
+    )
+
+    driver._wait_for_deleted_record_absent(
+        "deleted-record",
+        [],
+        fallback_values=["重大安全事故", "2026-08-01"],
+        responses=[deleted],
+        after_response=deleted,
+        timeout=0,
+    )
+
+    assert calls == [(deleted, "deleted-record")]
+
+
+def test_deleted_record_detail_accepts_explicit_not_found_response():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RequestPage([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 500, "message": "实施进度不存在"},
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    assert driver._deleted_record_detail_presence(deleted, "deleted-record") is False
+    assert driver.page.request.urls == [
+        "https://host/fi-service/projProgress/detail/deleted-record"
+    ]
+
+
+def test_deleted_record_detail_rejects_successful_response_for_same_id():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RequestPage([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 200, "data": {"id": "deleted-record"}},
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    assert driver._deleted_record_detail_presence(deleted, "deleted-record") is True
+
+
+def test_deleted_record_detail_retries_unauthorized_request_in_browser_context():
+    class Page(RequestPage):
+        def evaluate(self, _script, url):
+            assert url == "https://host/fi-service/projProgress/detail/deleted-record"
+            return {
+                "ok": False,
+                "status": 404,
+                "url": url,
+                "body": {"code": 404, "message": "not found"},
+            }
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 401}, ok=False, status=401,
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    assert driver._deleted_record_detail_presence(deleted, "deleted-record") is False
+
+
+def test_deleted_record_detail_does_not_treat_browser_server_error_as_deleted():
+    class Page(RequestPage):
+        def evaluate(self, _script, url):
+            return {"ok": False, "status": 500, "url": url, "body": {"code": 500}}
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 401}, ok=False, status=401,
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    with pytest.raises(AssertionError, match="HTTP 500"):
+        driver._deleted_record_detail_presence(deleted, "deleted-record")
+
+
 def test_delete_list_response_presence_is_scoped_after_delete_and_to_same_resource():
     deleted = JsonResponse(
         "https://host/api/projRiskEvent/delete/deleted-record",
@@ -6442,6 +6614,7 @@ def test_configured_collection_preparation_fills_every_hydrated_row():
     driver = object.__new__(ModuleSmokeDriver)
     driver.dynamic_collections = [spec]
     driver._collection_submission_codes = set()
+    driver._readback_excluded_submission_codes = set()
     driver._configured_collection_rows = lambda root, configured: rows
 
     def fill_row(configured, row, row_index, *, value_offset=0):
@@ -6459,6 +6632,43 @@ def test_configured_collection_preparation_fills_every_hydrated_row():
         "items.2.name": "value-2",
         "items": "add-row",
     }
+    assert driver._readback_excluded_submission_codes == {
+        "items.0.name", "items.1.name", "items.2.name",
+    }
+
+
+def test_configured_collection_can_remain_available_for_nested_actions_without_outer_baseline():
+    spec = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(DynamicCollectionChild("ownershipStructureList.{index}.name", "input"),),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    driver._collection_submission_codes = set()
+    driver._readback_excluded_submission_codes = set()
+
+    assert driver._prepare_configured_dynamic_collections(object()) == {}
+    assert driver._configured_collection_for_section("股权结构") is spec
+
+
+def test_default_readback_excludes_values_filled_in_retained_collection_rows():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._collection_submission_codes = {"items"}
+    driver._readback_excluded_submission_codes = {"items.0.missing"}
+
+    assert driver._default_readback_required_codes({
+        "matterName": "AUTO_matter",
+        "items": "add-row",
+        "items.0.missing": "retained-row-support",
+        "items.1.name": "new-row-value",
+    }) == {"matterName", "items.1.name"}
 
 
 def test_configured_collection_row_preserves_existing_values_and_fills_only_empty():
@@ -7528,6 +7738,47 @@ def test_nested_evidence_reset_clears_previous_form_state():
     driver._reset_nested_evidence()
 
     assert driver._nested_evidence == []
+
+
+def test_nested_operation_rejects_coalesced_action_paths(monkeypatch):
+    monkeypatch.setenv(
+        "EI_ACTION_PATHS_JSON",
+        json.dumps([
+            ["新增", "股权结构", "新增"],
+            ["新增", "对外投资", "删除"],
+        ], ensure_ascii=False),
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+
+    with pytest.raises(AssertionError, match="必须由调度器拆分为独立执行项"):
+        driver._prepare_nested_operation(object())
+
+
+def test_resource_pool_list_uses_enterprise_or_project_name_as_unique_name_alias():
+    spec = UniqueConstraintSpec(
+        form_code="POOL_RESOURCE",
+        field_codes=("projObjectName",),
+        repair_field="projObjectName",
+        message_includes=("资源池已存在同名企业请勿重复录入",),
+        list_url_includes=("/projStorage/list",),
+        record_paths=("data",),
+        field_aliases=((
+            "projObjectName",
+            ("projObjectName", "name", "enterpriseOrProjectName"),
+        ),),
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    response = JsonResponse(
+        "https://host/projStorage/list",
+        {
+            "data": [{"id": "1", "enterpriseOrProjectName": "资源池企业A"}],
+            "total": 1,
+        },
+    )
+
+    assert driver._occupied_unique_keys_from_response(response, spec) == [
+        (frozenset({"资源池企业A"}),),
+    ]
 
 
 def test_field_completion_report_uses_actual_visible_control_values(monkeypatch):

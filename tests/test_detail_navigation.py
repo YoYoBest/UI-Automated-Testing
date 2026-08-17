@@ -349,7 +349,10 @@ def test_project_progress_decision_filter_uses_list_query_before_opening_record(
         def locator(self, selector):
             return Locator()
 
-    candidates = type("Candidates", (), {"nth": staticmethod(lambda _index: "first-row")})()
+    candidates = type("Candidates", (), {
+        "count": staticmethod(lambda: 1),
+        "nth": staticmethod(lambda _index: "first-row"),
+    })()
     monkeypatch.setattr(detail_navigation, "_locator_visible", lambda _locator: False)
     monkeypatch.setattr(
         detail_navigation,
@@ -358,8 +361,10 @@ def test_project_progress_decision_filter_uses_list_query_before_opening_record(
     )
     monkeypatch.setattr(
         detail_navigation,
-        "_click_project_list_query",
-        lambda _page, **kwargs: calls.append(("query", kwargs.get("status"))),
+        "_click_project_status_filter",
+        lambda _page, _filter, status: calls.append(("filter", status)) or [{
+            "projId": "parent-001", "projStatusName": status,
+        }],
     )
     monkeypatch.setattr(
         detail_navigation,
@@ -371,17 +376,21 @@ def test_project_progress_decision_filter_uses_list_query_before_opening_record(
         "_open_parent_list_record",
         lambda _page, record, _candidates: ("opened", record),
     )
-
+    context = detail_navigation.ProjectProgressParentContext(
+        "parent-001", "https://example.test/fi-view/#/buildProjects/detail?id=parent-001",
+    )
+    monkeypatch.setattr(
+        detail_navigation, "_project_progress_context_from_page", lambda *_args: context,
+    )
     result = detail_navigation._enter_project_progress_decision_parent(
         Page(), "https://example.test/fi-view/#/buildProjects/detail"
     )
 
-    assert result == ("opened", "first-row")
+    assert result is context
     assert calls == [
         ("goto", "https://example.test/fi-view/#/buildProjects", "domcontentloaded"),
         ("click", "···"),
-        ("click", "项目决策"),
-        ("query", "项目决策"),
+        ("filter", "项目决策"),
     ]
 
 
@@ -405,17 +414,17 @@ def test_project_progress_filter_uses_implementation_when_decision_has_no_record
         def locator(self, _selector):
             return Locator()
 
-    candidates = type("Candidates", (), {"nth": staticmethod(lambda _index: "implementation-row")})()
+    candidates = type("Candidates", (), {
+        "count": staticmethod(lambda: 1),
+        "nth": staticmethod(lambda _index: "implementation-row"),
+    })()
     monkeypatch.setattr(detail_navigation, "_locator_visible", lambda _locator: True)
     monkeypatch.setattr(
         detail_navigation,
-        "_click_exact_text",
-        lambda _locator, text, **_kwargs: calls.append(("filter", text)),
-    )
-    monkeypatch.setattr(
-        detail_navigation,
-        "_click_project_list_query",
-        lambda _page, **kwargs: calls.append(("query", kwargs["status"])),
+        "_click_project_status_filter",
+        lambda _page, _filter, status: calls.append(("filter", status)) or [{
+            "projId": "parent-002", "projStatusName": status,
+        }],
     )
 
     def wait_for_results(_page, *, status, **_kwargs):
@@ -432,16 +441,442 @@ def test_project_progress_filter_uses_implementation_when_decision_has_no_record
         "_open_parent_list_record",
         lambda _page, record, _candidates: ("opened", record),
     )
-
+    context = detail_navigation.ProjectProgressParentContext(
+        "parent-002", "https://example.test/fi-view/#/buildProjects/detail?id=parent-002",
+    )
+    monkeypatch.setattr(
+        detail_navigation, "_project_progress_context_from_page", lambda *_args: context,
+    )
     assert detail_navigation._enter_project_progress_decision_parent(
         Page(), "https://example.test/fi-view/#/buildProjects/detail"
-    ) == ("opened", "implementation-row")
+    ) is context
     assert calls == [
         ("filter", "项目决策"),
-        ("query", "项目决策"),
         ("filter", "项目实施"),
-        ("query", "项目实施"),
     ]
+
+
+def test_project_progress_status_candidates_passes_response_records_to_dom_wait(monkeypatch):
+    class Candidates:
+        def __init__(self, value):
+            self.value = value
+
+    class Locator:
+        first = None
+
+        def __init__(self, candidates=None):
+            self.candidates = candidates
+            self.value = candidates.value if candidates is not None else ""
+            self.first = self
+
+        def wait_for(self, **_kwargs):
+            return None
+
+    before = Candidates("unfiltered")
+    page = type("Page", (), {
+        "locator": lambda _self, selector: (
+            Locator(before)
+            if selector == detail_navigation._PROJECT_LIST_RECORD_SELECTOR
+            else Locator()
+        ),
+    })()
+    observed = {}
+    monkeypatch.setattr(detail_navigation, "_locator_visible", lambda _locator: True)
+    monkeypatch.setattr(detail_navigation, "_record_snapshot", lambda candidates: (candidates.value,))
+    monkeypatch.setattr(
+        detail_navigation,
+        "_click_project_status_filter",
+        lambda *_args, **_kwargs: [{
+            "projId": "parent-001", "projStatusName": "项目决策",
+        }],
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_wait_for_project_decision_results",
+        lambda _page, **kwargs: observed.update(kwargs) or Candidates("filtered"),
+    )
+
+    result = detail_navigation._project_progress_status_candidates(page, "项目决策")
+
+    assert observed["expected_records"] == [{
+        "projId": "parent-001", "projStatusName": "项目决策",
+    }]
+    assert observed["expect_empty"] is False
+    assert result.expected_business_id == "parent-001"
+
+
+def test_project_progress_status_candidates_reissues_query_after_render_race(monkeypatch):
+    class Locator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Locator()
+
+    candidates = type("Candidates", (), {
+        "count": staticmethod(lambda: 1),
+        "nth": staticmethod(lambda _index: "filtered-row"),
+    })()
+    records = [{
+        "projId": "parent-001",
+        "projName": "filtered-project",
+        "projStatusName": "项目决策",
+    }]
+    calls = []
+    monkeypatch.setattr(detail_navigation, "_locator_visible", lambda _locator: True)
+    monkeypatch.setattr(
+        detail_navigation,
+        "_click_project_status_filter",
+        lambda *_args: calls.append("filter") or records,
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_click_project_list_query",
+        lambda *_args: calls.append("query-retry") or records,
+    )
+
+    def wait_for_results(*_args, **_kwargs):
+        calls.append("wait")
+        if calls.count("wait") == 1:
+            raise detail_navigation.ParentListNotReadyError("late unfiltered render")
+        return candidates
+
+    monkeypatch.setattr(
+        detail_navigation, "_wait_for_project_decision_results", wait_for_results,
+    )
+
+    result = detail_navigation._project_progress_status_candidates(Page(), "项目决策")
+
+    assert result.candidates is candidates
+    assert result.expected_business_id == "parent-001"
+    assert calls == ["filter", "wait", "query-retry", "wait"]
+
+
+def test_project_progress_selects_first_status_candidate_without_preadd(monkeypatch):
+    class Candidates:
+        @staticmethod
+        def count():
+            return 2
+
+        @staticmethod
+        def nth(index):
+            return f"row-{index}"
+
+    class Page:
+        url = "https://example.test/fi-view/#/buildProjects"
+
+        def goto(self, *_args, **_kwargs):
+            return None
+
+    candidates = Candidates()
+    opened = []
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_progress_status_candidates",
+        lambda *_args: detail_navigation._ProjectStatusCandidates(candidates, "0"),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_open_parent_list_record",
+        lambda _page, row, _candidates: opened.append(row) or row,
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_progress_context_from_page",
+        lambda _page, identity: detail_navigation.ProjectProgressParentContext(
+            identity.removeprefix("row-"), f"https://example.test/detail?id={identity}"
+        ),
+    )
+
+    monkeypatch.setattr(
+        detail_navigation, "_PROJECT_PROGRESS_ELIGIBLE_STATUSES", ("项目决策",),
+    )
+
+    context = detail_navigation._enter_project_progress_decision_parent(
+        Page(), "https://example.test/fi-view/#/buildProjects/detail"
+    )
+
+    assert context.business_id == "0"
+    assert opened == ["row-0"]
+
+
+def test_project_progress_uses_the_real_build_project_card_root():
+    assert detail_navigation._PROJECT_LIST_RECORD_SELECTOR == (
+        ".fund-card-list .mujijin-cardBox:visible"
+    )
+
+
+def test_project_progress_scopes_the_more_button_lookup_to_its_container():
+    assert detail_navigation._PROJECT_LIST_MORE_SELECTOR == ".search-more:visible"
+    assert detail_navigation._PROJECT_LIST_QUERY_SELECTOR == ".search-button:visible"
+
+
+def test_filtered_project_response_rejects_the_unfiltered_initial_request():
+    class Request:
+        method = "POST"
+
+        def __init__(self, status):
+            self.post_data_json = {"currPage": 1, "projStatus": status}
+
+    class Response:
+        url = "https://example.test/ezgo/fi-service/projInfo/listPage"
+
+        def __init__(self, status):
+            self.request = Request(status)
+
+    assert not detail_navigation._is_filtered_project_list_response(Response(""))
+    assert detail_navigation._is_filtered_project_list_response(Response("30"))
+    assert not detail_navigation._is_filtered_project_list_response(Response("30"), "20")
+    assert detail_navigation._is_filtered_project_list_response(Response("30"), "30")
+
+
+def test_project_list_business_failure_is_not_treated_as_an_empty_result():
+    with pytest.raises(
+        detail_navigation.ParentListNotReadyError,
+        match="查询接口返回业务失败",
+    ):
+        detail_navigation._assert_project_list_business_success(
+            {"status": "1", "message": "查询失败", "data": []},
+            "项目决策",
+        )
+
+    detail_navigation._assert_project_list_business_success(
+        {"status": "0", "errors": [], "data": []},
+        "项目决策",
+    )
+
+
+def test_status_response_capture_rejects_http_200_business_failure():
+    class Request:
+        method = "POST"
+        post_data_json = {"projStatus": "20"}
+
+    class Response:
+        ok = True
+        status = 200
+        url = "https://example.test/ezgo/fi-service/projInfo/listPage"
+        request = Request()
+
+        @staticmethod
+        def json():
+            return {"status": "1", "message": "查询失败", "data": []}
+
+    class Page:
+        @staticmethod
+        def expect_response(predicate, *, timeout):
+            assert timeout == 15_000
+            response = Response()
+            assert predicate(response)
+            return _PreAddExpectation(response)
+
+    with pytest.raises(
+        detail_navigation.ParentListNotReadyError,
+        match="查询接口返回业务失败",
+    ):
+        detail_navigation._capture_project_status_response(
+            Page(), "项目决策", lambda: None,
+        )
+
+
+def test_project_status_wait_rejects_changed_but_wrong_status_cards(monkeypatch):
+    class Cell:
+        def __init__(self, status):
+            self.status = status
+
+        def inner_text(self):
+            return f"项目状态:\n{self.status}"
+
+    class Cells:
+        def __init__(self, status):
+            self.status = status
+
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return Cell(self.status)
+
+    class Record:
+        def __init__(self, text, status):
+            self.text = text
+            self.status = status
+
+        def locator(self, _selector):
+            return Cells(self.status)
+
+    class Candidates:
+        def __init__(self, page):
+            self.page = page
+
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            text, status = self.page.states[self.page.index]
+            return Record(text, status)
+
+        def all_inner_texts(self):
+            text, _status = self.page.states[self.page.index]
+            return [text]
+
+    class Empty:
+        @staticmethod
+        def count():
+            return 0
+
+    class Page:
+        def __init__(self):
+            self.states = [
+                ("decision-result", "项目决策"),
+                ("late-unfiltered-result", "立项论证"),
+                ("decision-result", "项目决策"),
+                ("decision-result", "项目决策"),
+            ]
+            self.index = 0
+
+        def locator(self, selector):
+            if selector == detail_navigation._PROJECT_LIST_RECORD_SELECTOR:
+                return Candidates(self)
+            return Empty()
+
+        def wait_for_timeout(self, _milliseconds):
+            self.index = min(self.index + 1, len(self.states) - 1)
+
+    monkeypatch.setattr(detail_navigation, "_parent_list_loading", lambda _page: False)
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_card_matches_response_record",
+        lambda record, expected, status: (
+            record.text == expected["projName"] and record.status == status
+        ),
+    )
+
+    candidates = detail_navigation._wait_for_project_decision_results(
+        Page(),
+        status="项目决策",
+        expected_records=[{
+            "projName": "decision-result", "projStatusName": "项目决策",
+        }],
+        expect_empty=False,
+        timeout=1_000,
+    )
+
+    assert candidates.nth(0).status == "项目决策"
+    assert candidates.page.index == 3
+
+
+def test_project_status_wait_accepts_a_valid_unchanged_card_snapshot(monkeypatch):
+    class Record:
+        text = "same-result"
+        status = "项目决策"
+
+    class Candidates:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Record()
+
+        @staticmethod
+        def all_inner_texts():
+            return ["same-result"]
+
+    class Empty:
+        @staticmethod
+        def count():
+            return 0
+
+    class Page:
+        polls = 0
+
+        def locator(self, selector):
+            if selector == detail_navigation._PROJECT_LIST_RECORD_SELECTOR:
+                return Candidates()
+            return Empty()
+
+        def wait_for_timeout(self, _milliseconds):
+            self.polls += 1
+
+    page = Page()
+    monkeypatch.setattr(detail_navigation, "_parent_list_loading", lambda _page: False)
+    monkeypatch.setattr(
+        detail_navigation, "_project_status_from_card", lambda record: record.status,
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_card_matches_response_record",
+        lambda record, expected, status: (
+            record.text == expected["projName"] and record.status == status
+        ),
+    )
+
+    result = detail_navigation._wait_for_project_decision_results(
+        page,
+        status="项目决策",
+        expected_records=[{
+            "projName": "same-result", "projStatusName": "项目决策",
+        }],
+        expect_empty=False,
+        timeout=1_000,
+    )
+
+    assert result.count() == 1
+    assert page.polls == 1
+
+
+def test_project_progress_rejects_detail_id_that_differs_from_filtered_first_record(
+    monkeypatch,
+):
+    class Candidates:
+        @staticmethod
+        def nth(_index):
+            return "first-row"
+
+    class Page:
+        url = "https://example.test/fi-view/#/buildProjects"
+
+        @staticmethod
+        def goto(*_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        detail_navigation,
+        "_PROJECT_PROGRESS_ELIGIBLE_STATUSES",
+        ("项目决策",),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_progress_status_candidates",
+        lambda *_args: detail_navigation._ProjectStatusCandidates(
+            Candidates(), "expected-parent",
+        ),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_open_parent_list_record",
+        lambda *_args: ("opened",),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_project_progress_context_from_page",
+        lambda *_args: detail_navigation.ProjectProgressParentContext(
+            "wrong-parent", "https://example.test/detail?id=wrong-parent",
+        ),
+    )
+
+    with pytest.raises(
+        detail_navigation.ParentListNotReadyError,
+        match="查询首条 ID 与打开详情不一致",
+    ):
+        detail_navigation._enter_project_progress_decision_parent(
+            Page(), "https://example.test/fi-view/#/buildProjects/detail",
+        )
 
 
 def test_project_progress_prerequisite_keeps_the_current_detail_root():
@@ -888,8 +1323,7 @@ def test_project_progress_parent_context_is_reused_by_later_command(monkeypatch,
     assert calls == [None, selected]
 
 
-def test_project_progress_provisions_only_when_decision_query_is_empty(monkeypatch):
-    parent = SimpleNamespace(business_id="new-parent")
+def test_project_progress_reports_when_all_status_queries_are_empty(monkeypatch):
     monkeypatch.setattr(
         detail_navigation,
         "_enter_project_progress_decision_parent",
@@ -897,29 +1331,14 @@ def test_project_progress_provisions_only_when_decision_query_is_empty(monkeypat
             detail_navigation.ParentListEmptyError("项目状态“项目决策”查询结果为空")
         ),
     )
-    created = []
-    opened = []
-    monkeypatch.setattr(
-        detail_navigation,
-        "_open_provisioned_detail_module",
-        lambda *_args, **kwargs: opened.append(kwargs) or parent,
-    )
-
-    result = detail_navigation.enter_available_detail_module(
-        object(),
-        "/buildProject/detail",
-        "建设项目/详情/投中管理/项目进度/新增",
-        "新增",
-        max_records=2,
-        provision_eligible_record=lambda: created.append("created") or parent,
-    )
-
-    assert result is parent
-    assert created == ["created"]
-    assert opened == [{
-        "navigation_labels": ["投中管理", "项目进度"],
-        "provision_child_record": None,
-    }]
+    with pytest.raises(detail_navigation.ParentListEmptyError, match="项目决策"):
+        detail_navigation.enter_available_detail_module(
+            object(),
+            "/buildProject/detail",
+            "建设项目/详情/投中管理/项目进度/新增",
+            "新增",
+            max_records=2,
+        )
 
 
 def test_provisioned_parent_seeds_child_before_edit_retry(monkeypatch):

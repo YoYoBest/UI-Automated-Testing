@@ -18,7 +18,6 @@ from ei_ui_smoke.config import Settings
 from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.detail_navigation import detail_context_preparer_from_env
-from ei_ui_smoke.project_progress_preconditions import project_progress_parent_provisioner
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
 from ei_ui_smoke.source_form import discover_custom_form_fields
 
@@ -66,7 +65,6 @@ def common_field_executor(pytestconfig):
     )
     executor.prepare_form_context = detail_context_preparer_from_env(
         lambda: executor.driver.run(provision_only=True),
-        project_progress_parent_provisioner,
     )
     yield executor
     executor.close_form_session()
