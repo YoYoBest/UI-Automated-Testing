@@ -22,6 +22,8 @@ Run all commands from the repository root.
    owner Skill. Confirmed bad methods must be added to that registry; semantic guessing is
    forbidden. Cleanup counts are written to the audit entry and printed as
    `SKILL_AUTO_CLEANUP`.
+   Keep each obsolete-method pattern narrow enough to match the disproved method without
+   deleting a corrected replacement that uses different evidence.
 5. When the change is incident-specific and produces no reusable knowledge, record the decision with a concrete reason:
 
    `python skills/skill-maintenance-gate/scripts/skill_gate.py record --no-skill-reason "<reason>"`
@@ -40,5 +42,6 @@ Never use `bootstrap` to approve a normal change. It exists only to initialize a
 - `check` validates all Skill folders in UTF-8 mode before accepting the baseline.
 - The pytest hook has no environment-variable bypass. Resolve every failure through an owner Skill update or an audited no-Skill decision.
 - The root pytest session hook must enforce the normal gate before direct test collection. The desktop launcher may set `EI_DEFER_SKILL_MAINTENANCE_GATE=true` only for the subprocesses of one active operation batch; those subprocesses defer the session-start check so running operations are not interrupted, and the launcher must run the normal gate once after every operation finishes. Direct pytest runs and all other callers remain guarded at session start.
+- The root pytest session hook must also enforce the shared business-source read-only guard before test collection. The launcher runs that same guard before starting its deferred subprocesses. The guard may use only `git status --porcelain=v1 --untracked-files=all`; a missing, inaccessible, or dirty business source repository blocks execution and must never be repaired by automated Git write operations.
 
 When changing ownership rules or the gate implementation, update this Skill and cover the behavior in `tests/test_skill_maintenance_gate.py`.

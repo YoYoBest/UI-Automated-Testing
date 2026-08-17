@@ -6,6 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from ei_ui_smoke.source_sync import (
+    BusinessSourceReadOnlyError,
+    verify_business_sources_readonly,
+)
+
 
 DEFER_GATE_ENV = "EI_DEFER_SKILL_MAINTENANCE_GATE"
 
@@ -17,6 +22,10 @@ def skill_maintenance_gate_deferred() -> bool:
 def pytest_sessionstart(session: pytest.Session) -> None:
     if skill_maintenance_gate_deferred():
         return
+    try:
+        verify_business_sources_readonly()
+    except BusinessSourceReadOnlyError as exc:
+        raise pytest.UsageError(str(exc)) from exc
     root = Path(__file__).resolve().parent
     script = root / "skills/skill-maintenance-gate/scripts/skill_gate.py"
     spec = importlib.util.spec_from_file_location("skill_maintenance_gate", script)

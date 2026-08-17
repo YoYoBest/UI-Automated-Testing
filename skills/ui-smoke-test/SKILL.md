@@ -129,6 +129,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 模块、动作、公共字段发现和公共字段批处理创建数据策略时，统一传 `EI_FORM_CODE`/页面真实 `formCode`；运行时菜单 ID 只用于用例身份和日志，不能作为 stable 数据或业务约束的查找键。
 
+标准/稳定执行可从 `overrides.json` 的精确 `formCode.choiceValues` 取得少量、已验证的合法选择分支；字段码优先、唯一标签别名次之，并由交互层按真实选项文字/value 精确选择。启动器必须继续传真实 `formCode`，否则配置不得按模块名或菜单 ID 回退命中；probe 模式忽略这类页面专属基线。
+
 外部动态集合配置按规范化后的组件路径精确匹配。配置 root 必须选择部署 DOM 中实际稳定渲染的集合表单区，例如 `.adjustment-type-form`；不得依赖自定义 Vue 组件是否把 `field-code` 透传到最终 HTML。组件值可来自 `@/src/views/...`、`srcEi/views/...` 或带 `.vue?query` 的导入路径，规范化后仍应命中同一配置。
 
 运行时菜单项提供了组件路径但未匹配到所选源码时，不具备判定“页面访问”或“支持新增”的可靠契约。启动器必须在启动浏览器前失败并提示源码/部署版本不一致，禁止用 pytest 返回码 `0` 报告成功。新增操作完成当前页列表/只读区域、详情接口或编辑表单回读时，分别接受 `add_and_list_verified`、`add_and_detail_verified` 和 `add_and_edit_form_verified`；三者都是完整闭环，`page_access` 仍不得通过新增断言。
@@ -160,7 +162,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 1. 在项目根目录工作，确认 `.venv` 可用；依赖不完整时运行 `.\.venv\Scripts\python.exe -m pip install -e .`。
 2. 先运行 `.\.venv\Scripts\python.exe -m pytest -q`，验证本地契约测试没有回归。
 3. 执行已部署 UI 时，使用 `run_test.vbs` 打开图形启动器，或按测试要求设置 `EI_*` 环境变量后运行带 `--browser-smoke` 的 pytest。图形启动器可仅为同一活动批次的 pytest 子进程设置 `EI_DEFER_SKILL_MAINTENANCE_GATE=true`，并必须在批次结束后执行一次正常门禁检查；直接 pytest 仍在会话启动时执行门禁，不得绕过。
-4. 图形启动器每次正式启动 UI pytest 批次前，先同步业务源码仓库：默认扫描 `D:\Auto_Testing\Project_Purvar\SHZY` 下的直接子级 Git 工程（如 `ei-parent`、`fi-parent`），逐个执行 `git pull --ff-only`，成功或跳过信息写入 `artifacts/runs/source-sync.log`。同步失败时必须阻断本轮 pytest 并提示“源码同步失败，未启动 pytest”，不要继续使用可能过期的源码生成用例；临时关闭用 `EI_AUTO_PULL_SOURCE=false`，变更目录用 `EI_AUTO_PULL_SOURCE_ROOT`，调整单仓库超时用 `EI_AUTO_PULL_SOURCE_TIMEOUT_SECONDS`。批次执行完成后先生成并打开已有 Allure 结果，再执行一次正常 Skill 门禁检查；门禁失败必须显式展示，不能让已完成的运行无报告或伪装为成功。
+4. 图形启动器和直接 pytest 启动前必须把业务源码作为只读输入检查：默认扫描 `D:\Auto_Testing\Project_Purvar\SHZY` 下的直接子级 Git 工程（如 `ei-parent`、`fi-parent`），逐个执行只读的 `git status --porcelain=v1 --untracked-files=all`，只有标准输出为空才通过。仓库不存在、Git 状态命令失败或有任何已跟踪/未跟踪改动时，必须阻断本轮 pytest，并把结果写入 `artifacts/runs/business-source-readonly.log`；不得执行 `fetch`、`pull`、`restore`、`reset`、`clean` 或其他源码写操作。通过 `EI_SOURCE_READONLY_ROOT` 配置检查根目录，兼容旧的 `EI_AUTO_PULL_SOURCE_ROOT` 仅作为根目录别名。批次执行完成后先生成并打开已有 Allure 结果，再执行一次正常 Skill 门禁检查；门禁失败必须显式展示，不能让已完成的运行无报告或伪装为成功。
 5. 一次执行只创建一个时间戳 Allure results 目录；多模块测试全部追加到该目录，禁止每个模块互相覆盖结果。
 6. 测试结束后生成报告，记录最新结果和报告路径。即使测试失败，也保留 Allure 原始结果与 `artifacts/runs` 日志。
 7. 报告生成后通过 `open_allure_report()` 或 `allure open <report-dir>` 启动本地 HTTP 服务。
@@ -347,6 +349,12 @@ exit $pytestExit
 - One selected common-field command must start one pytest process and one browser session. Use `tests/test_common_field_validation.py` as the launcher entry point, not the aggregate Batch test, so pytest collection and Allure expose one independent item for every bound field.
 - The command may share physical transactions through the executor cache. Field-level results must be read from the cached transaction by stable item index, including required-field batches; do not reopen a form or repeat Save merely to create another report item.
 - The common-case and module-case worksheet selectors start empty and retain only explicit valid selections after a workbook refresh; their labels must state `未选=全部`. At run time, an empty worksheet selection expands to every worksheet in workbook order; an empty case-ID selection expands to every available case in that effective worksheet scope. The launcher must still emit one command per worksheet rather than passing a multi-sheet value to a single-sheet pytest loader.
+
+## Dynamic Collection Configuration Coverage
+
+- A change to `data/dynamic_collections.json` must have a loader regression that asserts the exact matching `formCode`/component, section title, rendered column headers, declared child paths, and semantic kinds for numeric and select controls. The regression must reject selectors that assume a Vue component `prop` is a rendered DOM attribute. Keep generic driver behavior tests separate from this configuration contract.
+- A configured `valueRelations` entry must be covered as part of the exact collection contract: both endpoints are numeric children of that collection, the operator is supported, and `adjustOrder` names a nonempty unique subset of relation sides. Reject cross-collection, missing-child, nonnumeric, or ambiguous adjustment declarations during manifest loading rather than at Save time.
+- When an exact section-scoped root already makes a collection unique, its create selector should use the source-confirmed rendered toolbar/button classes and runtime visibility checks. Do not add unverified direct-child or exact-text pseudo constraints that can reject a visible framework-wrapped button; assert the final root/create/item selectors in the configuration regression.
 
 ## 安全边界
 

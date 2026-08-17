@@ -143,6 +143,7 @@ class CommonFieldFormSession:
         "form_probe_passed",
         "choice_options_verified",
         "choice_single_selection_verified",
+        "runtime_not_applicable",
         "confirmation_cancelled",
         "command_not_applicable",
         "required_default_value_skipped",
@@ -4261,10 +4262,9 @@ class CommonFieldExecutor:
                     last_message = self._visible_error_text(scope, current)
                 return None, scope_visible, last_message
             if not save_response.ok:
-                try:
-                    response_detail = save_response.text()[:1000]
-                except Exception:
-                    response_detail = "<响应正文不可读>"
+                response_detail = self.driver._failed_save_response_detail(
+                    save_response
+                )
                 if (
                     expected_type == "safe_handling"
                     and 400 <= save_response.status < 500
@@ -4277,7 +4277,7 @@ class CommonFieldExecutor:
                     )
                 raise AssertionError(
                     f"保存接口失败：HTTP {save_response.status} {save_response.url}; "
-                    f"response={response_detail}"
+                    f"{response_detail}"
                 )
             body = None
             try:
@@ -5093,12 +5093,22 @@ class CommonFieldExecutor:
     def _execute_choice_case(
         self, case: BoundCommonCase, field: DiscoveredCommonField, form_scope=None
     ) -> CommonFieldExecutionResult:
+        readonly_result = self._runtime_readonly_choice_result(case, field)
+        if readonly_result is not None:
+            return readonly_result
         # Dependent selects need their upstream fields populated before their real
         # option set exists. The target control is exercised again below.
         if form_scope is None:
             form_scope = self.page.locator(DIALOG).last
         self._apply_case_branch_conditions(case, form_scope)
         submitted = self._fill_valid_baseline(form_scope)
+        if callable(getattr(form_scope, "evaluate", None)):
+            form_scope = self._active_form_scope() or form_scope
+            field = self._wait_for_current_field(case, form_scope)
+            form_scope = self._active_form_scope() or form_scope
+            readonly_result = self._runtime_readonly_choice_result(case, field)
+            if readonly_result is not None:
+                return readonly_result
         locator = self._choice_locator_for_current_field(case, field, form_scope)
         item = locator.locator(
             "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),' el-form-item ')][1]"
@@ -5111,6 +5121,11 @@ class CommonFieldExecutor:
             )
             labels = self._unique_visible_texts(choices)
             if not labels:
+                not_applicable = self._unmodifiable_edit_choice_result(
+                    case, field, "没有可用选项"
+                )
+                if not_applicable is not None:
+                    return not_applicable
                 raise AssertionError(f"单选框没有可用选项：{field.field_key}")
             if "码值" in case.scenario and "互斥" not in case.scenario:
                 return CommonFieldExecutionResult(
@@ -5156,9 +5171,19 @@ class CommonFieldExecutor:
         visible_labels = self._visible_texts(options)
         labels = list(dict.fromkeys(visible_labels))
         if not labels:
+            not_applicable = self._unmodifiable_edit_choice_result(
+                case, field, "没有可用选项"
+            )
+            if not_applicable is not None:
+                return not_applicable
             raise AssertionError(f"下拉框没有可用选项：{field.field_key}")
         if "修改选择框码值正确性检查" in case.scenario:
             if len(labels) < 2:
+                not_applicable = self._unmodifiable_edit_choice_result(
+                    case, field, f"只有 {len(labels)} 个可用选项"
+                )
+                if not_applicable is not None:
+                    return not_applicable
                 raise AssertionError(
                     f"选择框少于两个可用码值：{field.field_key}, options={labels}"
                 )
@@ -5266,6 +5291,36 @@ class CommonFieldExecutor:
         )
         return self._submit_case(
             case, form_scope, field, submitted, actual, actual, ""
+        )
+
+    @staticmethod
+    def _runtime_readonly_choice_result(
+        case: BoundCommonCase,
+        field: DiscoveredCommonField,
+    ) -> CommonFieldExecutionResult | None:
+        if not field.readonly:
+            return None
+        return CommonFieldExecutionResult(
+            case.case_id,
+            case.field_key,
+            "runtime_not_applicable",
+            f"当前记录该字段为只读：{field.field_key}（{field.label}）",
+        )
+
+    @staticmethod
+    def _unmodifiable_edit_choice_result(
+        case: BoundCommonCase,
+        field: DiscoveredCommonField,
+        reason: str,
+    ) -> CommonFieldExecutionResult | None:
+        """Skip edit-only choice mutations when the current record cannot change them."""
+        if not case.case_id.upper().startswith("EDIT-"):
+            return None
+        return CommonFieldExecutionResult(
+            case.case_id,
+            case.field_key,
+            "runtime_not_applicable",
+            f"当前编辑记录的选择控件不可修改：{field.field_key}（{field.label}），{reason}",
         )
 
     def _choice_locator_for_current_field(

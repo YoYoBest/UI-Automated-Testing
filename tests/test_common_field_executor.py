@@ -22,6 +22,7 @@ from ei_ui_smoke.interactions import FieldInteractor
 from ei_ui_smoke.models import DomField, FieldDefinition, ResolvedField
 from ei_ui_smoke.module_driver import FieldCompletionReport, ModuleSmokeResult
 from tests.test_build_project_add_personalized import _field_label, _runtime_field
+from tests.test_common_field_validation import _skip_runtime_not_applicable
 
 
 class _Page:
@@ -1002,6 +1003,11 @@ def test_edit_select_case_changes_to_a_different_option_and_submits():
     selected = iter([["新建"], ["续建"]])
     submitted_calls = []
 
+    class RuntimeScope:
+        @staticmethod
+        def evaluate(*_args, **_kwargs):
+            return None
+
     class Option:
         def click(self, **_kwargs):
             return None
@@ -1055,11 +1061,238 @@ def test_edit_select_case_changes_to_a_different_option_and_submits():
         "projClassify", "项目类型", "select", "select", "#type",
         FieldConstraints(required=True),
     )
+    executor._wait_for_current_field = lambda *_args: field
 
-    result = executor._execute_choice_case(case, field, object())
+    result = executor._execute_choice_case(case, field, RuntimeScope())
 
     assert result.outcome == "saved_verified_and_retained"
     assert submitted_calls[0][0][3]["projClassify"] == "续建"
+
+
+def test_readonly_choice_case_is_not_applicable_without_interaction():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._scan_fields = lambda _scope=None: [
+        DomField(
+            "progressType", "项目进度", "select", "#progress-type",
+            required=True, readonly=True,
+        )
+    ]
+    case = BoundCommonCase(
+        "EDIT-003", "progressType", "项目进度", "select", "#progress-type",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted",
+        "保存成功；查看详情，码值修改正确", "P0",
+    )
+    field = executor._current_field(case, object())
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("readonly choice must not be interacted with")
+
+    executor._apply_case_branch_conditions = unexpected
+    executor._fill_valid_baseline = unexpected
+    executor._choice_locator_for_current_field = unexpected
+    executor._submit_case = unexpected
+
+    result = executor._execute_choice_case(case, field, object())
+
+    assert field.readonly is True
+    assert result.outcome == "runtime_not_applicable"
+    assert result.observed == "当前记录该字段为只读：progressType（项目进度）"
+    assert result.outcome in CommonFieldFormSession._REUSABLE_OUTCOMES
+
+
+def test_choice_case_rescans_readonly_state_after_baseline_rerender():
+    class Scope:
+        @staticmethod
+        def evaluate(*_args, **_kwargs):
+            return None
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    events = []
+    executor._apply_case_branch_conditions = lambda *_args: events.append("branch")
+    executor._fill_valid_baseline = lambda _scope: events.append("baseline") or {}
+    executor._wait_for_current_field = lambda *_args: (
+        events.append("rescan")
+        or DiscoveredCommonField(
+            "progressType", "项目进度", "select", "select", "#progress-type",
+            FieldConstraints(required=True), readonly=True,
+        )
+    )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("rerendered readonly choice must not be clicked or saved")
+
+    executor._choice_locator_for_current_field = unexpected
+    executor._submit_case = unexpected
+    case = BoundCommonCase(
+        "EDIT-003", "progressType", "项目进度", "select", "#progress-type",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted", "", "P0",
+    )
+    initially_editable = DiscoveredCommonField(
+        "progressType", "项目进度", "select", "select", "#progress-type",
+        FieldConstraints(required=True), readonly=False,
+    )
+
+    result = executor._execute_choice_case(case, initially_editable, Scope())
+
+    assert events == ["branch", "baseline", "rescan"]
+    assert result.outcome == "runtime_not_applicable"
+    assert "当前记录该字段为只读" in result.observed
+
+
+def test_add_choice_without_options_remains_a_failure():
+    class Item:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def locator(_selector):
+            return object()
+
+    class Control:
+        @staticmethod
+        def locator(_selector):
+            return Item()
+
+        @staticmethod
+        def click(**_kwargs):
+            return None
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._fill_valid_baseline = lambda _scope: {"progressType": ""}
+    executor._choice_locator_for_current_field = lambda *_args: Control()
+    executor._unique_visible_texts = lambda _locator: []
+    executor._owned_select_options = lambda _locator: object()
+    executor._visible_texts = lambda _options: []
+    case = BoundCommonCase(
+        "ADD-056", "progressType", "项目进度", "select", "#progress-type",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted", "", "P0",
+    )
+    field = DiscoveredCommonField(
+        "progressType", "项目进度", "select", "select", "#progress-type",
+        FieldConstraints(), readonly=False,
+    )
+
+    with pytest.raises(AssertionError, match="下拉框没有可用选项：progressType"):
+        executor._execute_choice_case(case, field, object())
+
+
+def test_edit_choice_without_options_is_not_applicable():
+    class Item:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def locator(_selector):
+            return object()
+
+    class Control:
+        @staticmethod
+        def locator(_selector):
+            return Item()
+
+        @staticmethod
+        def click(**_kwargs):
+            return None
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._fill_valid_baseline = lambda _scope: {"anyChoice": ""}
+    executor._choice_locator_for_current_field = lambda *_args: Control()
+    executor._unique_visible_texts = lambda _locator: []
+    executor._owned_select_options = lambda _locator: object()
+    executor._visible_texts = lambda _options: []
+    case = BoundCommonCase(
+        "EDIT-003", "anyChoice", "任意选择字段", "select", "#any-choice",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted", "", "P0",
+    )
+    field = DiscoveredCommonField(
+        "anyChoice", "任意选择字段", "select", "select", "#any-choice",
+        FieldConstraints(), readonly=False,
+    )
+
+    result = executor._execute_choice_case(case, field, object())
+
+    assert result.outcome == "runtime_not_applicable"
+    assert result.observed == "当前编辑记录的选择控件不可修改：anyChoice（任意选择字段），没有可用选项"
+
+
+def test_editable_choice_click_failure_is_not_converted_to_not_applicable():
+    class Item:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def locator(_selector):
+            return object()
+
+    class Control:
+        @staticmethod
+        def locator(_selector):
+            return Item()
+
+        @staticmethod
+        def click(**_kwargs):
+            raise RuntimeError("click failed")
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._fill_valid_baseline = lambda _scope: {"progressType": ""}
+    executor._choice_locator_for_current_field = lambda *_args: Control()
+    executor._unique_visible_texts = lambda _locator: []
+    case = BoundCommonCase(
+        "EDIT-003", "progressType", "项目进度", "select", "#progress-type",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted", "", "P0",
+    )
+    field = DiscoveredCommonField(
+        "progressType", "项目进度", "select", "select", "#progress-type",
+        FieldConstraints(), readonly=False,
+    )
+
+    with pytest.raises(RuntimeError, match="click failed"):
+        executor._execute_choice_case(case, field, object())
+
+
+def test_missing_choice_field_remains_a_locator_failure():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._scan_fields = lambda _scope=None: []
+    executor._runtime_choice_field = lambda *_args: None
+    case = BoundCommonCase(
+        "EDIT-003", "progressType", "项目进度", "select", "",
+        "修改选择框码值正确性检查", "随意变更码值", "accepted", "", "P0",
+    )
+
+    with pytest.raises(AssertionError, match="当前表单无法定位字段：progressType"):
+        executor._current_field(case, object())
+
+
+def test_runtime_not_applicable_result_becomes_a_reasoned_pytest_skip():
+    result = CommonFieldExecutionResult(
+        "EDIT-003", "progressType", "runtime_not_applicable",
+        "当前记录该字段为只读：progressType（项目进度）",
+    )
+
+    with pytest.raises(pytest.skip.Exception, match="运行时用例不适用.*当前记录该字段为只读"):
+        _skip_runtime_not_applicable(result)
+
+
+def test_runtime_skip_mapping_does_not_hide_execution_failures():
+    result = CommonFieldExecutionResult(
+        "EDIT-003", "progressType", "execution_failed", "下拉框没有可用选项",
+    )
+
+    assert _skip_runtime_not_applicable(result) is None
 
 
 def test_failed_request_summary_keeps_recent_business_request_evidence():

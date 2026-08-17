@@ -25,3 +25,9 @@ When reusable knowledge was produced:
 8. Summarize any automatic skill update in the final response, including which skill changed and what reusable knowledge was added.
 
 Do not update a skill when the result is specific to one incident and has no likely reuse. If ownership is genuinely ambiguous or the change would alter a skill's scope materially, explain the ambiguity and ask the user before writing it.
+
+## Business Source Read-Only Boundary
+
+- `D:\Auto_Testing\Project_Purvar\SHZY\ei-parent` and `D:\Auto_Testing\Project_Purvar\SHZY\fi-parent` are read-only inputs to this automation project.
+- Do not edit, create, delete, restore, reset, clean, fetch, pull, commit, or otherwise mutate either business source repository. Read-only source inspection is allowed.
+- The UI launcher and direct pytest session start enforce a clean-worktree check for the configured business source repositories. A dirty source worktree is an explicit execution blocker, never something the automation project may repair.

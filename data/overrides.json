@@ -1,3 +1,24 @@
 {
-  "forms": {}
+  "forms": {
+    "POOL_RESOURCE": {
+      "values": {
+        "registAmount": 1000,
+        "recCapAmount": 500
+      },
+      "choiceValues": {
+        "inveProjType": {
+          "value": "POOL_RESOURCE",
+          "labels": ["投资类型"]
+        },
+        "isRegion": {
+          "value": "0",
+          "labels": ["运营主体所在地", "被投企业注册地"]
+        },
+        "isRegister": {
+          "value": "2",
+          "labels": ["注册状态"]
+        }
+      }
+    }
+  }
 }

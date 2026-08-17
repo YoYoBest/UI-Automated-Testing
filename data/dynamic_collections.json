@@ -17,6 +17,110 @@
           "label": "重大调整情形说明"
         }
       ]
+    },
+    {
+      "formCode": "POOL_RESOURCE",
+      "component": "projectResourcePool/index",
+      "fieldCode": "ownershipStructureList",
+      "sectionTitle": "股权结构",
+      "mode": "add-row",
+      "rootSelector": ".enterprise-section:has(.enterprise-section__title:text-is(\"股权结构\"))",
+      "createSelector": ".enterprise-section__toolbar button.el-button",
+      "itemSelector": ".el-table__body-wrapper .el-table__row:has(input)",
+      "minRows": 1,
+      "children": [
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.stockName",
+          "columnHeader": "股东名称",
+          "selector": "input",
+          "kind": "text",
+          "label": "股东名称"
+        },
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.stockPercent",
+          "columnHeader": "持股比例(%)",
+          "selector": "input",
+          "kind": "number",
+          "label": "持股比例(%)"
+        },
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.subscribedCapital",
+          "columnHeader": "认缴出资额(万元)",
+          "selector": ".amount-with-currency__amount input",
+          "kind": "number",
+          "label": "认缴出资额(万元)"
+        },
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.subscribedCapitalCcy",
+          "columnHeader": "认缴出资额(万元)",
+          "selector": ".amount-with-currency__currency .el-select",
+          "kind": "select",
+          "label": "认缴出资额币种"
+        },
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.paidUpCapital",
+          "columnHeader": "实缴出资额(万元)",
+          "selector": ".amount-with-currency__amount input",
+          "kind": "number",
+          "label": "实缴出资额(万元)"
+        },
+        {
+          "fieldCodeTemplate": "ownershipStructureList.{index}.paidUpCapitalCcy",
+          "columnHeader": "实缴出资额(万元)",
+          "selector": ".amount-with-currency__currency .el-select",
+          "kind": "select",
+          "label": "实缴出资额币种"
+        }
+      ],
+      "valueRelations": [
+        {
+          "leftField": "ownershipStructureList.{index}.paidUpCapital",
+          "operator": "lte",
+          "rightField": "ownershipStructureList.{index}.subscribedCapital",
+          "adjustOrder": ["left"]
+        }
+      ]
+    },
+    {
+      "formCode": "POOL_RESOURCE",
+      "component": "projectResourcePool/index",
+      "fieldCode": "entInvestList",
+      "sectionTitle": "对外投资",
+      "mode": "add-row",
+      "rootSelector": ".enterprise-section:has(.enterprise-section__title:text-is(\"对外投资\"))",
+      "createSelector": ".enterprise-section__toolbar button.el-button",
+      "itemSelector": ".el-table__body-wrapper .el-table__row:has(input)",
+      "minRows": 1,
+      "children": [
+        {
+          "fieldCodeTemplate": "entInvestList.{index}.name",
+          "columnHeader": "企业名称",
+          "selector": "input",
+          "kind": "text",
+          "label": "被投资企业名称"
+        },
+        {
+          "fieldCodeTemplate": "entInvestList.{index}.fundedRatio",
+          "columnHeader": "持股比例(%)",
+          "selector": "input",
+          "kind": "number",
+          "label": "持股比例(%)"
+        },
+        {
+          "fieldCodeTemplate": "entInvestList.{index}.subscribedCapital",
+          "columnHeader": "投资额(万元)",
+          "selector": ".amount-with-currency__amount input",
+          "kind": "number",
+          "label": "投资额(万元)"
+        },
+        {
+          "fieldCodeTemplate": "entInvestList.{index}.subscribedCapitalCcy",
+          "columnHeader": "投资额(万元)",
+          "selector": ".amount-with-currency__currency .el-select",
+          "kind": "select",
+          "label": "投资额币种"
+        }
+      ]
     }
   ]
 }

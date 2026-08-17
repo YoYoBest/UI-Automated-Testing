@@ -52,7 +52,7 @@ from .pytest_progress import (
     PROGRESS_COMMAND_ENV,
     PROGRESS_FILE_ENV,
 )
-from .source_sync import SourceSyncError, pull_latest_source
+from .source_sync import BusinessSourceReadOnlyError, verify_business_sources_readonly
 from .urls import align_application_url, build_module_url, detail_parent_url
 from .zentao import ZentaoRunResult, process_allure_failures
 
@@ -2283,15 +2283,15 @@ class Launcher(tk.Tk):
             progress_dir = log_dir / ".pytest-progress"
             progress_dir.mkdir(parents=True, exist_ok=True)
             if commands:
-                self.after(0, self.status.set, "正在同步源码仓库...")
-                sync_log_file = log_dir / "source-sync.log"
+                self.after(0, self.status.set, "正在检查业务源码只读状态...")
+                sync_log_file = log_dir / "business-source-readonly.log"
                 try:
-                    sync_output = pull_latest_source(os.environ)
-                except SourceSyncError as exc:
+                    sync_output = verify_business_sources_readonly(os.environ)
+                except BusinessSourceReadOnlyError as exc:
                     sync_log_file.write_text(str(exc) + "\n", encoding="utf-8")
                     self.after(
                         0, self._finish_execution_error,
-                        f"源码同步失败，未启动 pytest。\n\n{exc}\n\n完整日志：{sync_log_file}",
+                        f"业务源码只读门禁失败，未启动 pytest。\n\n{exc}\n\n完整日志：{sync_log_file}",
                     )
                     return
                 sync_log_file.write_text(sync_output + "\n", encoding="utf-8")

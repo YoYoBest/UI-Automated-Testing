@@ -7,27 +7,23 @@ from pathlib import Path
 from typing import Mapping
 
 
-AUTO_PULL_SOURCE_ENV = "EI_AUTO_PULL_SOURCE"
-AUTO_PULL_SOURCE_ROOT_ENV = "EI_AUTO_PULL_SOURCE_ROOT"
-AUTO_PULL_SOURCE_TIMEOUT_ENV = "EI_AUTO_PULL_SOURCE_TIMEOUT_SECONDS"
-DEFAULT_AUTO_PULL_SOURCE_ROOT = Path(r"D:\Auto_Testing\Project_Purvar\SHZY")
-_DISABLED_VALUES = {"0", "false", "no", "off", "disable", "disabled"}
+SOURCE_READONLY_ROOT_ENV = "EI_SOURCE_READONLY_ROOT"
+LEGACY_SOURCE_ROOT_ENV = "EI_AUTO_PULL_SOURCE_ROOT"
+DEFAULT_SOURCE_READONLY_ROOT = Path(r"D:\Auto_Testing\Project_Purvar\SHZY")
 
 
-class SourceSyncError(RuntimeError):
-    """Raised when the configured business source repositories cannot be synced."""
+class BusinessSourceReadOnlyError(RuntimeError):
+    """Raised when a business source repository is not safe to treat as read-only."""
 
 
-def auto_pull_source_enabled(environment: Mapping[str, str] | None = None) -> bool:
+def configured_business_source_root(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
     env = environment or os.environ
-    value = str(env.get(AUTO_PULL_SOURCE_ENV, "")).strip().lower()
-    return value not in _DISABLED_VALUES
-
-
-def configured_source_sync_root(environment: Mapping[str, str] | None = None) -> Path:
-    env = environment or os.environ
-    configured = str(env.get(AUTO_PULL_SOURCE_ROOT_ENV, "")).strip()
-    return Path(configured) if configured else DEFAULT_AUTO_PULL_SOURCE_ROOT
+    configured = str(env.get(SOURCE_READONLY_ROOT_ENV, "")).strip()
+    if not configured:
+        configured = str(env.get(LEGACY_SOURCE_ROOT_ENV, "")).strip()
+    return Path(configured) if configured else DEFAULT_SOURCE_READONLY_ROOT
 
 
 def discover_git_repositories(root: Path) -> list[Path]:
@@ -48,36 +44,40 @@ def _sanitize_git_output(output: str) -> str:
     return re.sub(r"(https?://)([^/\s:@]+):([^@\s/]+)@", r"\1***:***@", output)
 
 
-def pull_latest_source(
+def verify_business_sources_readonly(
     environment: Mapping[str, str] | None = None,
     *,
     runner=subprocess.run,
 ) -> str:
-    """Pull the configured deployed-source repositories before a UI pytest run."""
-    env = environment or os.environ
-    if not auto_pull_source_enabled(env):
-        root = configured_source_sync_root(env)
-        return f"SOURCE_SYNC_SKIPPED root={root} reason=disabled"
+    """Block execution unless every configured business source repo is clean.
 
-    root = configured_source_sync_root(env)
+    This function intentionally invokes only the read-only Git status command. It
+    must never fetch, pull, restore, reset, clean, or otherwise mutate source.
+    """
+    root = configured_business_source_root(environment)
     if not root.exists():
-        raise SourceSyncError(f"SOURCE_SYNC_FAILED root={root} reason=path-not-found")
+        raise BusinessSourceReadOnlyError(
+            f"BUSINESS_SOURCE_READONLY_FAILED root={root} reason=path-not-found"
+        )
 
     repositories = discover_git_repositories(root)
     if not repositories:
-        raise SourceSyncError(f"SOURCE_SYNC_FAILED root={root} reason=no-git-repository")
+        raise BusinessSourceReadOnlyError(
+            f"BUSINESS_SOURCE_READONLY_FAILED root={root} reason=no-git-repository"
+        )
 
-    raw_timeout = str(env.get(AUTO_PULL_SOURCE_TIMEOUT_ENV, "120")).strip() or "120"
-    try:
-        timeout_seconds = int(raw_timeout)
-    except ValueError as exc:
-        raise SourceSyncError(
-            f"SOURCE_SYNC_FAILED root={root} reason=invalid-timeout value={raw_timeout}"
-        ) from exc
-    outputs = [f"SOURCE_SYNC_ROOT root={root} repositories={len(repositories)}"]
+    outputs = [
+        f"BUSINESS_SOURCE_READONLY_ROOT root={root} repositories={len(repositories)}"
+    ]
     for repository in repositories:
-        command = ["git", "-C", str(repository), "pull", "--ff-only"]
-        outputs.append(f"SOURCE_SYNC repo={repository} command=git pull --ff-only")
+        command = [
+            "git",
+            "-C",
+            str(repository),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ]
         try:
             completed = runner(
                 command,
@@ -86,26 +86,29 @@ def pull_latest_source(
                 encoding="utf-8",
                 errors="replace",
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout_seconds,
+                stderr=subprocess.PIPE,
+                timeout=30,
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired as exc:
-            raise SourceSyncError(
-                f"SOURCE_SYNC_FAILED repo={repository} reason=timeout seconds={timeout_seconds}"
+            raise BusinessSourceReadOnlyError(
+                f"BUSINESS_SOURCE_READONLY_FAILED repo={repository} reason=timeout"
             ) from exc
         except OSError as exc:
-            raise SourceSyncError(
-                f"SOURCE_SYNC_FAILED repo={repository} reason={exc}"
+            raise BusinessSourceReadOnlyError(
+                f"BUSINESS_SOURCE_READONLY_FAILED repo={repository} reason={exc}"
             ) from exc
 
-        output = _sanitize_git_output(completed.stdout or "").strip()
-        if output:
-            outputs.append(output)
         if completed.returncode:
-            outputs.append(
-                f"SOURCE_SYNC_FAILED repo={repository} returncode={completed.returncode}"
+            error = _sanitize_git_output(completed.stderr or completed.stdout or "").strip()
+            detail = f" detail={error}" if error else ""
+            raise BusinessSourceReadOnlyError(
+                f"BUSINESS_SOURCE_READONLY_FAILED repo={repository} "
+                f"reason=git-status-returncode returncode={completed.returncode}{detail}"
             )
-            raise SourceSyncError("\n".join(outputs))
-        outputs.append(f"SOURCE_SYNC_OK repo={repository}")
+        if (completed.stdout or "").strip():
+            raise BusinessSourceReadOnlyError(
+                f"BUSINESS_SOURCE_READONLY_FAILED repo={repository} reason=dirty-worktree"
+            )
+        outputs.append(f"BUSINESS_SOURCE_READONLY_OK repo={repository}")
     return "\n".join(outputs)

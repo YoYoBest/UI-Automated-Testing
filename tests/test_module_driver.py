@@ -7,7 +7,11 @@ from ei_ui_smoke.module_driver import (
     ADD_BUTTON, EDITABLE_FORM_CONTROL, INLINE_FORM, DynamicFieldContractError,
     FieldCompletionReport, ModuleSmokeDriver, ModuleSmokeResult, RecordNotDeletableError,
 )
-from ei_ui_smoke.dynamic_collections import DynamicCollectionChild, DynamicCollectionSpec
+from ei_ui_smoke.dynamic_collections import (
+    DynamicCollectionChild,
+    DynamicCollectionSpec,
+    DynamicCollectionValueRelation,
+)
 from ei_ui_smoke.models import DomField, FieldDefinition, ResolvedField
 from ei_ui_smoke.dom import DOM_FIELD_SCRIPT, scan_dom_fields
 
@@ -35,6 +39,105 @@ def test_request_business_id_matching_tolerates_multipart_payloads():
     assert not ModuleSmokeDriver._request_contains_business_id(
         MultipartRequest(), "2086649094884339713"
     )
+
+
+def test_request_shape_summary_records_structure_without_business_values():
+    request = Request(payload={
+        "projObjectName": "敏感企业名称",
+        "ownershipStructureList": [
+            {"shareholderName": "敏感股东", "stockPercent": "12.5"},
+        ],
+        "projectOwnershipStructureList": [
+            {"shareholderName": "另一股东", "stockPercent": None},
+        ],
+    })
+
+    summary = ModuleSmokeDriver._request_shape_summary(request)
+
+    assert '"$.ownershipStructureList":"array[1]"' in summary
+    assert '"$.ownershipStructureList[].stockPercent":"string"' in summary
+    assert '"$.projectOwnershipStructureList":"array[1]"' in summary
+    assert '"$.projectOwnershipStructureList[].stockPercent":"null"' in summary
+    assert "敏感企业名称" not in summary
+    assert "敏感股东" not in summary
+    assert "12.5" not in summary
+
+
+def test_radio_choice_uses_exact_declared_text_or_code():
+    class Radio:
+        def __init__(self, value, text):
+            self.value = value
+            self.text = text
+            self.checked = False
+
+        def get_attribute(self, name):
+            return self.value if name == "value" else None
+
+        def locator(self, _selector):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        def inner_text(self):
+            return self.text
+
+        def check(self, **_kwargs):
+            self.checked = True
+
+    class Radios:
+        def __init__(self, items):
+            self.items = items
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    registered = Radio("1", "已注册")
+    unregistered = Radio("2", "未注册")
+    radios = Radios([registered, unregistered])
+
+    assert ModuleSmokeDriver._select_radio_choice(radios, "未注册") == "2"
+    assert unregistered.checked and not registered.checked
+
+    registered.checked = False
+    unregistered.checked = False
+    assert ModuleSmokeDriver._select_radio_choice(radios, "1") == "1"
+    assert registered.checked and not unregistered.checked
+
+
+def test_radio_choice_fails_when_declared_option_is_absent():
+    class EmptyMatches:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            class Radio:
+                @staticmethod
+                def get_attribute(_name):
+                    return "1"
+
+                @staticmethod
+                def locator(_selector):
+                    return Radio()
+
+                @staticmethod
+                def count():
+                    return 1
+
+                @staticmethod
+                def inner_text():
+                    return "已注册"
+
+            return Radio()
+
+    with pytest.raises(AssertionError, match="没有唯一匹配"):
+        ModuleSmokeDriver._select_radio_choice(EmptyMatches(), "未注册")
 
 
 def test_standard_mode_requires_optional_editable_fields_to_be_exercised():
@@ -2045,6 +2148,63 @@ def test_saved_record_uses_same_resource_detail_before_any_dom_lookup(monkeypatc
     assert result.detail_url.endswith("/risk/detail/record-1")
 
 
+@pytest.mark.parametrize(
+    "verification_options",
+    [
+        {"require_edit_and_detail": True},
+        {"saved_from_current_detail_edit": True},
+    ],
+)
+def test_double_readback_stops_after_exact_business_id_detail_json(
+    monkeypatch, verification_options,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    exact_detail = ApiResponse(
+        "https://host/fi-service/risk/detail/record-1",
+        {
+            "code": 200,
+            "data": {
+                "id": "record-1",
+                "name": "AUTO_risk",
+                "riskReason": "已保存",
+            },
+        },
+    )
+    driver.page = RequestPage([exact_detail])
+    driver.source_fields = [
+        ("name", "名称", False),
+        ("riskReason", "风险原因", False),
+    ]
+    driver._nested_evidence = []
+    save = JsonResponse(
+        "https://host/fi-service/risk/add",
+        {"code": 200, "data": {"id": "record-1"}},
+    )
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        driver,
+        "_verify_saved_record_in_edit_and_detail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact-ID JSON verification must not locate a rendered row")
+        ),
+    )
+
+    result = driver.verify_saved_record(
+        [save],
+        save,
+        {"name": "AUTO_risk", "riskReason": "已保存"},
+        ("AUTO_risk",),
+        required_codes={"name", "riskReason"},
+        **verification_options,
+    )
+
+    assert result.mode == "add_and_detail_verified"
+    assert result.business_id == "record-1"
+    assert result.detail_url.endswith("/risk/detail/record-1")
+
+
 def test_saved_record_fetches_exact_detail_after_incomplete_associated_list(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     associated_list = JsonResponse(
@@ -3610,18 +3770,23 @@ def test_response_record_rejects_duplicate_command_business_ids():
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = RecordPage([
         RecordRow(
-            ["取得开工批复"],
+            ["取得开工批复", "管理员", "2026-08-10"],
             commands=[RecordCommand("编辑", **{"data-record-id": "child-1"})],
         ),
         RecordRow(
-            ["取得开工批复"],
+            ["取得开工批复", "管理员", "2026-08-10"],
             commands=[RecordCommand("删除", **{"data-record-id": "child-1"})],
         ),
     ])
 
     with pytest.raises(AssertionError, match="操作节点匹配到多条"):
         driver._find_response_associated_record_container(
-            {"data": {"records": [{"id": "child-1"}]}},
+            {"data": {"records": [{
+                "id": "child-1",
+                "progressTypeName": "取得开工批复",
+                "createUserName": "管理员",
+                "createDate": "2026-08-10",
+            }]}},
             "child-1",
         )
 
@@ -3728,6 +3893,256 @@ def test_response_record_rejects_duplicate_full_display_evidence_without_dom_id(
             },
             "child-1",
         )
+
+
+def test_detail_probe_selects_exact_response_id_from_identical_rows(monkeypatch):
+    class ProbeRows(DeleteRows):
+        @property
+        def first(self):
+            return self.nth(0)
+
+    class ActionCollection:
+        def __init__(self, action=None):
+            self.action = action
+
+        @property
+        def first(self):
+            return self.action or self
+
+        def count(self):
+            return 1 if self.action is not None else 0
+
+    class ProbeAction:
+        def __init__(self, page, response):
+            self.page = page
+            self.response = response
+            self.clicks = 0
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+        def click(self):
+            self.clicks += 1
+            config_request = Request()
+            config_request.method = "POST"
+            config_request.url = "https://host/ezgo/ezgo-uim/tenantForm/getFormLastVersion"
+            self.page.emit("request", config_request)
+            self.page.emit("response", self.response)
+
+    class ProbeRow(RecordRow):
+        def __init__(self, page, response):
+            super().__init__(["取得开工批复", "刘思语", "2026-08-17"])
+            self.action = ProbeAction(page, response)
+
+        def get_by_role(self, role, name, exact):
+            if role in {"button", "link"} and name in {"查看", "详情"} and exact:
+                return ActionCollection(self.action)
+            return ActionCollection()
+
+        def evaluate(self, _script, marker):
+            self.attributes["data-ei-detail-probe"] = marker
+
+    class ProbePage(RecordPage):
+        def __init__(self):
+            super().__init__([])
+            self.listeners = {"response": [], "request": []}
+            self.rows = ProbeRows([])
+
+        def on(self, event, listener):
+            self.listeners[event].append(listener)
+
+        def remove_listener(self, event, listener):
+            self.listeners[event].remove(listener)
+
+        def emit(self, event, value):
+            for listener in list(self.listeners[event]):
+                listener(value)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+        def locator(self, selector):
+            if "data-ei-detail-probe" in selector:
+                marker = selector.split("'")[1]
+                return ProbeRows([
+                    row for row in self.rows.rows
+                    if row.attributes.get("data-ei-detail-probe") == marker
+                ])
+            return super().locator(selector)
+
+    page = ProbePage()
+    other_response = JsonResponse(
+        "https://host/fi-service/projProgress/detail/child-2",
+        {"data": {"id": "child-2"}},
+    )
+    target_response = JsonResponse(
+        "https://host/fi-service/projProgress/detail/child-1",
+        {"data": {"id": "child-1"}},
+    )
+    other_response.request.method = "GET"
+    target_response.request.method = "GET"
+    other = ProbeRow(page, other_response)
+    target = ProbeRow(page, target_response)
+    page.rows = ProbeRows([other, target])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    returned = []
+    monkeypatch.setattr(driver, "_return_to_record_list", lambda url: returned.append(url))
+
+    identity, marker, response = driver._probe_response_associated_detail_row(
+        {"data": {"records": [{
+            "id": "child-1",
+            "progressTypeName": "取得开工批复",
+            "createByName": "刘思语",
+            "createDt": "2026-08-17",
+        }]}},
+        "child-1",
+    )
+
+    assert identity == "详情响应关联字段=2026-08-17, 取得开工批复, 刘思语"
+    assert response is target_response
+    assert target.attributes["data-ei-detail-probe"] == marker
+    assert other.action.clicks == 1
+    assert target.action.clicks == 2
+    assert returned == [page.url, page.url]
+
+
+def test_detail_probe_fails_when_no_candidate_detail_returns_save_id(monkeypatch):
+    class Action:
+        first = None
+
+        def __init__(self, page):
+            self.page = page
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def is_enabled():
+            return True
+
+        def click(self):
+            response = JsonResponse(
+                "https://host/fi-service/projProgress/detail/not-target",
+                {"data": {"id": "not-target"}},
+            )
+            response.request.method = "GET"
+            self.page.emit("response", response)
+
+    class Actions:
+        def __init__(self, action):
+            self.action = action
+
+        @property
+        def first(self):
+            return self.action
+
+        @staticmethod
+        def count():
+            return 1
+
+    class Row(RecordRow):
+        def __init__(self, page):
+            super().__init__(["取得开工批复", "刘思语", "2026-08-17"])
+            self.action = Action(page)
+
+        def get_by_role(self, role, name, exact):
+            del role, name, exact
+            return Actions(self.action)
+
+        def evaluate(self, _script, marker):
+            self.attributes["data-ei-detail-probe"] = marker
+
+    class Page(RecordPage):
+        def __init__(self):
+            super().__init__([])
+            self.listeners = {"response": [], "request": []}
+            self.rows = DeleteRows([])
+
+        def on(self, event, listener):
+            self.listeners[event].append(listener)
+
+        def remove_listener(self, event, listener):
+            self.listeners[event].remove(listener)
+
+        def emit(self, event, value):
+            for listener in list(self.listeners[event]):
+                listener(value)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+    page = Page()
+    page.rows = DeleteRows([Row(page), Row(page)])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    monkeypatch.setattr(driver, "_return_to_record_list", lambda _url: None)
+
+    with pytest.raises(AssertionError, match="候选详情探测未得到唯一匹配"):
+        driver._probe_response_associated_detail_row(
+            {"data": {"records": [{
+                "id": "child-1",
+                "progressTypeName": "取得开工批复",
+                "createByName": "刘思语",
+                "createDt": "2026-08-17",
+            }]}},
+            "child-1",
+        )
+
+
+def test_detail_probe_requires_readonly_get_response_with_exact_body_id():
+    response = JsonResponse(
+        "https://host/fi-service/projProgress/detail/child-1",
+        {"data": {"id": "child-1"}},
+    )
+    response.request.method = "GET"
+
+    assert ModuleSmokeDriver._is_exact_readonly_detail_response(response, "child-1")
+
+    response.request.method = "POST"
+    assert not ModuleSmokeDriver._is_exact_readonly_detail_response(response, "child-1")
+
+
+def test_response_candidates_filter_hidden_detail_fields_for_list_detail_probe():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["取得开工批复", "刘思语", "2026-08-17"]),
+        RecordRow(["取得开工批复", "刘思语", "2026-08-17"]),
+    ])
+
+    id_matches, candidates = driver._response_associated_record_container_candidates(
+        {"data": {"records": [{
+            "id": "child-1",
+            "progressTypeName": "取得开工批复",
+            "createByName": "刘思语",
+            "createDt": "2026-08-17 09:30:00",
+            "progressDesc": "详情页才显示的长文本",
+        }]}},
+        "child-1",
+        visible_only=True,
+    )
+
+    assert id_matches == []
+    assert len(candidates) == 2
+    assert all("详情页才显示的长文本" not in evidence for _row, evidence in candidates)
 
 
 def test_detail_response_ignores_css_file_with_detail_in_filename():
@@ -3845,6 +4260,93 @@ def test_qcc_remote_select_uses_the_owned_element_plus_dropdown():
     assert selected == "测试企业"
     assert ".el-select-dropdown__item:not(.is-disabled)" in popper.selector
     assert option.clicked
+
+
+def test_select_business_value_uses_exact_declared_text_or_code():
+    class Keyed:
+        def __init__(self, value):
+            self.value = value
+
+        @staticmethod
+        def count():
+            return 1
+
+        def get_attribute(self, name):
+            return self.value if name == "data-key" else None
+
+    class Option:
+        def __init__(self, value, text):
+            self.value = value
+            self.text = text
+            self.clicked = False
+
+        def inner_text(self):
+            return self.text
+
+        @staticmethod
+        def evaluate(_script):
+            return True
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def locator(self, _selector):
+            return Keyed(self.value)
+
+        def click(self, **_kwargs):
+            self.clicked = True
+
+    registered = Option("1", "已注册")
+    unregistered = Option("2", "未注册")
+
+    class Options:
+        @staticmethod
+        def count():
+            return 2
+
+        @staticmethod
+        def nth(index):
+            return [registered, unregistered][index]
+
+    class Popper:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def locator(_selector):
+            return Options()
+
+    class Page:
+        @staticmethod
+        def locator(selector):
+            assert selector == "#owned-popper"
+            return Popper()
+
+        @staticmethod
+        def wait_for_timeout(_milliseconds):
+            return None
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page()
+    driver._select_controls_id = lambda *_controls: "owned-popper"
+
+    selected = driver._select_business_value(
+        resolve_select_control=lambda: (None, None),
+        field_code="isRegister",
+        lookup_label="注册状态",
+        option_index=0,
+        is_company_remote=False,
+        preferred_value="未注册",
+    )
+
+    assert selected == "2"
+    assert unregistered.clicked and not registered.clicked
 
 
 def test_entity_already_exists_prefers_only_remote_company_field():
@@ -4365,6 +4867,42 @@ def test_fill_dialog_preserves_generated_radio_with_stable_checked_identity(monk
     assert driver._fill_dialog() == {}
     assert seen[0]["field_code"] == "isGmoDecision"
     assert seen[0]["field_label"] == "是否需总经办决策"
+
+
+def test_fill_dialog_explicit_choice_baseline_overrides_page_default(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("isRegister", "注册状态", False)]
+    driver.page = object()
+    driver._common_form_scope = None
+    driver._dom_field_has_value = lambda _field, **_kwargs: True
+
+    class Strategy:
+        @staticmethod
+        def preferred_choice_for(field):
+            assert field.field_code == "isRegister"
+            return "未注册"
+
+        @staticmethod
+        def value_for(_field, _index):
+            return ""
+
+    driver.data_strategy = Strategy()
+    radio_group = object()
+    driver._radio_group = lambda *_args, **_kwargs: radio_group
+    selected = []
+    driver._select_radio_choice = lambda radios, preferred, **kwargs: (
+        selected.append((radios, preferred, kwargs)),
+        preferred,
+    )[1]
+    rendered = [
+        DomField("isRegister", "注册状态", "radio", "#register", required=True)
+    ]
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields", lambda page: rendered
+    )
+
+    assert driver._fill_dialog() == {"isRegister": "未注册"}
+    assert selected == [(radio_group, "未注册", {"prefer_last": False})]
 
 
 def test_fill_dialog_routes_required_year_picker_to_interactor(monkeypatch):
@@ -5573,6 +6111,98 @@ def test_fill_dialog_scopes_dynamic_nested_row_fields(monkeypatch):
     assert driver._fill_failures == []
 
 
+def test_configured_nested_row_does_not_inherit_parent_fill_failures(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "EI_ACTION_PATHS_JSON",
+        '[["新增", "股权结构", "新增"]]',
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type(
+        "Page", (), {"wait_for_timeout": lambda self, _timeout: None}
+    )()
+    driver._fill_failures = ["父表单历史失败"]
+    row = object()
+
+    class Title:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def scroll_into_view_if_needed():
+            return None
+
+    class Rows:
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def nth(_index):
+            return row
+
+    class Button:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def click():
+            return None
+
+    class Section:
+        @staticmethod
+        def locator(_selector):
+            return Rows()
+
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return Button()
+
+    class Scope:
+        @staticmethod
+        def get_by_text(*_args, **_kwargs):
+            return Title()
+
+    spec = type("Spec", (), {"item_selector": ".row"})()
+    driver._nested_section_scope = lambda *_args: Section()
+    driver._configured_collection_for_section = lambda _section: spec
+    driver._wait_for_row_count_change = lambda *_args, **_kwargs: 1
+    driver._fill_configured_collection_row = lambda *_args: {
+        "ownershipStructureList.0.stockName": "AUTO_股东"
+    }
+    driver._dom_field_has_value = lambda _field: True
+    driver._remember_configured_collection_evidence = lambda *_args: None
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields",
+        lambda _page, root=None: [
+            DomField(
+                "ownershipStructureList.0.stockName",
+                "股东名称",
+                "text",
+                "input",
+                required=True,
+            )
+        ] if root is row else [],
+    )
+
+    submitted = driver._prepare_nested_operation(Scope())
+
+    assert submitted == {
+        "股权结构.ownershipStructureList.0.stockName": "AUTO_股东"
+    }
+
+
 def test_dynamic_collection_contract_requires_mode_path_and_child_fields():
     driver = object.__new__(ModuleSmokeDriver)
 
@@ -5634,7 +6264,7 @@ def test_fill_dialog_prepares_dynamic_collection_before_regular_field_scan(monke
     }
 
 
-def test_fill_dialog_prepares_configured_collection_before_regular_field_scan(monkeypatch):
+def test_fill_dialog_prepares_configured_collection_after_regular_field_scan(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = []
     driver.dynamic_collections = [object()]
@@ -5649,6 +6279,7 @@ def test_fill_dialog_prepares_configured_collection_before_regular_field_scan(mo
         "riskItems": "selection",
     }
     driver._prepare_dynamic_collection_baselines = lambda scope: {}
+    driver._assert_configured_dynamic_collection_controls = lambda scope: None
     monkeypatch.setattr(
         "ei_ui_smoke.module_driver.scan_dom_fields", lambda page, root=None: []
     )
@@ -5741,6 +6372,316 @@ def test_configured_collection_trigger_failure_is_a_contract_error():
 
     with pytest.raises(DynamicFieldContractError, match="adjustmentItems"):
         ModuleSmokeDriver._activate_configured_collection_trigger(Trigger(), spec)
+
+
+def test_configured_collection_section_matching_is_exact_and_unique():
+    ownership = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".enterprise-section",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(
+            DynamicCollectionChild("ownershipStructureList.{index}.stockName", "input"),
+            DynamicCollectionChild(
+                "ownershipStructureList.{index}.stockPercent", "input", kind="number"
+            ),
+        ),
+        section_title="股权结构",
+    )
+    investment = DynamicCollectionSpec(
+        field_code="entInvestList",
+        mode="add-row",
+        root_selector=".enterprise-section",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(DynamicCollectionChild("entInvestList.{index}.name", "input"),),
+        section_title="对外投资",
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [ownership, investment]
+
+    assert driver._configured_collection_for_section("股权结构") is ownership
+    assert driver._configured_collection_for_section("对外投资") is investment
+    assert driver._configured_collection_for_section("投资信息") is None
+
+
+def test_configured_collection_preparation_fills_every_hydrated_row():
+    class Root:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Scope:
+        @staticmethod
+        def locator(_selector):
+            return Root()
+
+    spec = DynamicCollectionSpec(
+        field_code="items",
+        mode="add-row",
+        root_selector=".items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(DynamicCollectionChild("items.{index}.name", "input"),),
+    )
+    rows = [object(), object(), object()]
+    filled = []
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    driver._collection_submission_codes = set()
+    driver._configured_collection_rows = lambda root, configured: rows
+
+    def fill_row(configured, row, row_index, *, value_offset=0):
+        filled.append((configured, row, row_index, value_offset))
+        return {f"items.{row_index}.name": f"value-{row_index}"}
+
+    driver._fill_configured_collection_row = fill_row
+
+    submitted = driver._prepare_configured_dynamic_collections(Scope())
+
+    assert [entry[2] for entry in filled] == [0, 1, 2]
+    assert submitted == {
+        "items.0.name": "value-0",
+        "items.1.name": "value-1",
+        "items.2.name": "value-2",
+        "items": "add-row",
+    }
+
+
+def test_configured_collection_row_preserves_existing_values_and_fills_only_empty():
+    class Control:
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Controls:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Control()
+
+    class ChildScope:
+        def __init__(self, has_value):
+            self.has_value = has_value
+
+        @staticmethod
+        def locator(_selector):
+            return Controls()
+
+    children = (
+        DynamicCollectionChild(
+            "items.{index}.existing", "input", label="已有值", column_header="已有值"
+        ),
+        DynamicCollectionChild(
+            "items.{index}.missing", "input", label="空值", column_header="空值"
+        ),
+    )
+    spec = DynamicCollectionSpec(
+        field_code="items",
+        mode="add-row",
+        root_selector=".items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=children,
+    )
+    scopes = {
+        "已有值": ChildScope(True),
+        "空值": ChildScope(False),
+    }
+    generated = []
+    filled = []
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._configured_collection_child_scope = (
+        lambda row, configured, child, row_index: scopes[child.column_header]
+    )
+    driver._dom_field_has_value = (
+        lambda field, *, root=None, **_kwargs: root.has_value
+    )
+    driver.data_strategy = type("Strategy", (), {
+        "value_for": lambda self, definition, index: generated.append(
+            (definition.field_code, index)
+        ) or "generated"
+    })()
+    driver.interactor = type("Interactor", (), {
+        "fill": lambda self, resolved, value, *, root=None: filled.append(
+            (resolved.definition.field_code, value, root)
+        ) or value
+    })()
+
+    submitted = driver._fill_configured_collection_row(spec, object(), 2)
+
+    assert submitted == {"items.2.missing": "generated"}
+    assert generated == [("items.2.missing", 2)]
+    assert filled == [("items.2.missing", "generated", scopes["空值"])]
+
+
+def test_configured_collection_row_adjusts_only_generated_value_for_lte_relation():
+    class Control:
+        def __init__(self):
+            self.value = ""
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def input_value(self):
+            return self.value
+
+    class Controls:
+        def __init__(self, control):
+            self.control = control
+
+        @staticmethod
+        def count():
+            return 1
+
+        def nth(self, _index):
+            return self.control
+
+    class ChildScope:
+        def __init__(self):
+            self.control = Control()
+
+        def locator(self, _selector):
+            return Controls(self.control)
+
+    subscribed = DynamicCollectionChild(
+        "items.{index}.subscribed", "input", kind="number", column_header="认缴"
+    )
+    paid = DynamicCollectionChild(
+        "items.{index}.paid", "input", kind="number", column_header="实缴"
+    )
+    spec = DynamicCollectionSpec(
+        field_code="items",
+        mode="add-row",
+        root_selector=".items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(subscribed, paid),
+        value_relations=(DynamicCollectionValueRelation(
+            "items.{index}.paid", "lte", "items.{index}.subscribed", ("left",)
+        ),),
+    )
+    scopes = {"认缴": ChildScope(), "实缴": ChildScope()}
+    generated = {
+        "items.0.subscribed": "100",
+        "items.0.paid": "200",
+    }
+    fills = []
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._configured_collection_child_scope = (
+        lambda row, configured, child, row_index: scopes[child.column_header]
+    )
+    driver._dom_field_has_value = lambda *_args, **_kwargs: False
+    driver.data_strategy = type("Strategy", (), {
+        "value_for": lambda self, definition, index: generated[definition.field_code]
+    })()
+
+    class Interactor:
+        @staticmethod
+        def fill(resolved, value, *, root=None):
+            root.control.value = str(value)
+            fills.append((resolved.definition.field_code, str(value)))
+            return str(value)
+
+    driver.interactor = Interactor()
+
+    submitted = driver._fill_configured_collection_row(spec, object(), 0)
+
+    assert submitted == {
+        "items.0.subscribed": "100",
+        "items.0.paid": "100",
+    }
+    assert fills == [
+        ("items.0.subscribed", "100"),
+        ("items.0.paid", "200"),
+        ("items.0.paid", "100"),
+    ]
+
+
+def test_configured_collection_relation_never_overwrites_existing_values():
+    class Control:
+        def __init__(self, value):
+            self.value = value
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def input_value(self):
+            return self.value
+
+    class Controls:
+        def __init__(self, control):
+            self.control = control
+
+        @staticmethod
+        def count():
+            return 1
+
+        def nth(self, _index):
+            return self.control
+
+    class ChildScope:
+        def __init__(self, value):
+            self.control = Control(value)
+
+        def locator(self, _selector):
+            return Controls(self.control)
+
+    children = (
+        DynamicCollectionChild(
+            "items.{index}.subscribed", "input", kind="number", column_header="认缴"
+        ),
+        DynamicCollectionChild(
+            "items.{index}.paid", "input", kind="number", column_header="实缴"
+        ),
+    )
+    spec = DynamicCollectionSpec(
+        field_code="items",
+        mode="add-row",
+        root_selector=".items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=children,
+        value_relations=(DynamicCollectionValueRelation(
+            "items.{index}.paid", "lte", "items.{index}.subscribed", ("left",)
+        ),),
+    )
+    scopes = {"认缴": ChildScope("100"), "实缴": ChildScope("200")}
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._configured_collection_child_scope = (
+        lambda row, configured, child, row_index: scopes[child.column_header]
+    )
+    driver._dom_field_has_value = lambda *_args, **_kwargs: True
+    driver.data_strategy = type("Strategy", (), {
+        "value_for": lambda *_args, **_kwargs: pytest.fail("existing value regenerated")
+    })()
+    driver.interactor = type("Interactor", (), {
+        "fill": lambda *_args, **_kwargs: pytest.fail("existing value overwritten")
+    })()
+
+    with pytest.raises(DynamicFieldContractError, match="无法安全调整"):
+        driver._fill_configured_collection_row(spec, object(), 0)
 
 
 def test_declared_unique_constraint_updates_year_control_before_save(monkeypatch):

@@ -77,6 +77,13 @@ def common_field_transaction_cache():
     return {}
 
 
+def _skip_runtime_not_applicable(result) -> None:
+    if result.outcome != "runtime_not_applicable":
+        return
+    reason = str(result.observed or "").strip() or "当前记录该字段为只读"
+    pytest.skip(f"运行时用例不适用：{reason}")
+
+
 @pytest.mark.smoke
 def test_common_field_validation(
     browser_page, common_field_case, common_field_executor,
@@ -147,6 +154,7 @@ def test_common_field_validation(
             pytest.skip(
                 "事务被前序字段失败阻断：" + observed
             )
+        _skip_runtime_not_applicable(result)
         if case.field_type.endswith("_command"):
             allowed = command_allowed
         elif case.field_type == "dialog_title":

@@ -19,6 +19,7 @@ def test_load_dynamic_collection_specs_matches_form_and_component(tmp_path):
             "minRows": 1,
             "children": [{
                 "fieldCodeTemplate": "items.{index}.name",
+                "columnHeader": "名称",
                 "selector": "input",
             }],
         }]}),
@@ -32,6 +33,7 @@ def test_load_dynamic_collection_specs_matches_form_and_component(tmp_path):
     assert len(specs) == 1
     assert specs[0].field_code == "items"
     assert specs[0].children[0].field_code_template == "items.{index}.name"
+    assert specs[0].children[0].column_header == "名称"
     assert load_dynamic_collection_specs(
         tmp_path, form_code="FORM_B", component="module/example/index"
     ) == []
@@ -80,6 +82,67 @@ def test_project_adjustment_collection_uses_rendered_form_root():
     assert specs[0].root_selector == ".adjustment-type-form"
 
 
+def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_children():
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+
+    specs = load_dynamic_collection_specs(
+        data_dir, form_code="POOL_RESOURCE", component="projectResourcePool/index"
+    )
+
+    by_code = {spec.field_code: spec for spec in specs}
+    assert set(by_code) == {"ownershipStructureList", "entInvestList"}
+    assert [child.field_code_template for child in by_code["ownershipStructureList"].children] == [
+        "ownershipStructureList.{index}.stockName",
+        "ownershipStructureList.{index}.stockPercent",
+        "ownershipStructureList.{index}.subscribedCapital",
+        "ownershipStructureList.{index}.subscribedCapitalCcy",
+        "ownershipStructureList.{index}.paidUpCapital",
+        "ownershipStructureList.{index}.paidUpCapitalCcy",
+    ]
+    assert [child.kind for child in by_code["entInvestList"].children] == [
+        "text", "number", "number", "select"
+    ]
+    assert by_code["ownershipStructureList"].section_title == "股权结构"
+    assert by_code["ownershipStructureList"].root_selector == (
+        '.enterprise-section:has(.enterprise-section__title:text-is("股权结构"))'
+    )
+    assert by_code["ownershipStructureList"].create_selector == (
+        ".enterprise-section__toolbar button.el-button"
+    )
+    assert by_code["ownershipStructureList"].item_selector == (
+        ".el-table__body-wrapper .el-table__row:has(input)"
+    )
+    assert by_code["entInvestList"].root_selector == (
+        '.enterprise-section:has(.enterprise-section__title:text-is("对外投资"))'
+    )
+    assert by_code["entInvestList"].create_selector == (
+        ".enterprise-section__toolbar button.el-button"
+    )
+    assert [child.column_header for child in by_code["entInvestList"].children] == [
+        "企业名称", "持股比例(%)", "投资额(万元)", "投资额(万元)"
+    ]
+    assert [
+        (
+            relation.left_field_template,
+            relation.operator,
+            relation.right_field_template,
+            relation.adjust_order,
+        )
+        for relation in by_code["ownershipStructureList"].value_relations
+    ] == [(
+        "ownershipStructureList.{index}.paidUpCapital",
+        "lte",
+        "ownershipStructureList.{index}.subscribedCapital",
+        ("left",),
+    )]
+    assert by_code["entInvestList"].value_relations == ()
+    assert all(
+        "[prop" not in child.selector
+        for spec in specs
+        for child in spec.children
+    )
+
+
 @pytest.mark.parametrize("entry", [
     {"formCode": "FORM_A", "fieldCode": "items"},
     {
@@ -94,4 +157,57 @@ def test_load_dynamic_collection_specs_rejects_incomplete_matching_contract(tmp_
     )
 
     with pytest.raises(ValueError):
+        load_dynamic_collection_specs(tmp_path, form_code="FORM_A")
+
+
+@pytest.mark.parametrize("relation", [
+    {
+        "leftField": "items.{index}.paid",
+        "operator": "gt",
+        "rightField": "items.{index}.subscribed",
+        "adjustOrder": ["left"],
+    },
+    {
+        "leftField": "items.{index}.missing",
+        "operator": "lte",
+        "rightField": "items.{index}.subscribed",
+        "adjustOrder": ["left"],
+    },
+    {
+        "leftField": "items.{index}.paid",
+        "operator": "lte",
+        "rightField": "items.{index}.subscribed",
+        "adjustOrder": [],
+    },
+])
+def test_dynamic_collection_value_relation_rejects_unsafe_contract(
+    tmp_path, relation,
+):
+    (tmp_path / "dynamic_collections.json").write_text(
+        json.dumps({"collections": [{
+            "formCode": "FORM_A",
+            "fieldCode": "items",
+            "mode": "add-row",
+            "rootSelector": ".root",
+            "createSelector": ".add",
+            "itemSelector": ".row",
+            "minRows": 1,
+            "children": [
+                {
+                    "fieldCodeTemplate": "items.{index}.subscribed",
+                    "selector": "input",
+                    "kind": "number",
+                },
+                {
+                    "fieldCodeTemplate": "items.{index}.paid",
+                    "selector": "input",
+                    "kind": "number",
+                },
+            ],
+            "valueRelations": [relation],
+        }]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="集合值关系配置不完整"):
         load_dynamic_collection_specs(tmp_path, form_code="FORM_A")

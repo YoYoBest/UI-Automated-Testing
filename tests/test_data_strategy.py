@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from ei_ui_smoke.contracts import normalize_field
 from ei_ui_smoke.data_pool import (
     ConstrainedGenerator,
@@ -122,6 +124,102 @@ def test_stable_priority_is_override_then_collected_then_common_or_generated():
     assert strategy.value_for(field("amount", "金额"), 1) == 88
     assert strategy.value_for(field("status", "状态", "PurvarCodeSelect-SELECT"), 2) == "有效"
     assert strategy.value_for(field("companyName", "企业名称"), 3).startswith("测试企业_")
+
+
+def test_choice_baseline_matches_exact_field_code_then_label_alias():
+    data_pool = GlobalDataPool(
+        common={},
+        collected={},
+        overrides={"forms": {"FORM": {"choiceValues": {
+            "isRegister": {
+                "value": "未注册",
+                "labels": ["注册状态"],
+            },
+        }}}},
+    )
+    strategy = StandardDataStrategy(data_pool, "run", form_code="FORM")
+
+    assert strategy.preferred_choice_for(
+        field("isRegister", "其他标签", "ElRadioGroup-RADIO")
+    ) == "未注册"
+    assert strategy.preferred_choice_for(
+        field("el-id-1", "注册状态", "ElRadioGroup-RADIO")
+    ) == "未注册"
+    assert StableDataStrategy(
+        data_pool, "FORM", "run"
+    ).preferred_choice_for(
+        field("isRegister", "注册状态", "ElRadioGroup-RADIO")
+    ) == "未注册"
+    assert ProbeDataStrategy(
+        data_pool, "run", form_code="FORM"
+    ).preferred_choice_for(
+        field("isRegister", "注册状态", "ElRadioGroup-RADIO")
+    ) is None
+    assert StandardDataStrategy(
+        data_pool, "run", form_code="OTHER"
+    ).preferred_choice_for(
+        field("isRegister", "注册状态", "ElRadioGroup-RADIO")
+    ) is None
+
+
+def test_choice_baseline_rejects_ambiguous_label_alias():
+    data_pool = GlobalDataPool(
+        common={},
+        collected={},
+        overrides={"forms": {"FORM": {"choiceValues": {
+            "first": {"value": "A", "labels": ["状态"]},
+            "second": {"value": "B", "labels": ["状态"]},
+        }}}},
+    )
+
+    with pytest.raises(ValueError, match="选择基线标签不唯一"):
+        data_pool.preferred_choice("FORM", "el-id-1", "状态")
+
+
+def test_resource_pool_standard_mode_declares_unregistered_legal_branch():
+    project_root = Path(__file__).resolve().parents[1]
+    data_pool = GlobalDataPool.from_directory(project_root / "data")
+    strategy = StandardDataStrategy(
+        data_pool, "run", form_code="POOL_RESOURCE"
+    )
+
+    assert strategy.preferred_choice_for(
+        field("inveProjType", "投资类型", "ElRadioGroup-RADIO")
+    ) == "POOL_RESOURCE"
+    assert strategy.preferred_choice_for(
+        field("isRegion", "运营主体所在地", "ElRadioGroup-RADIO")
+    ) == "0"
+    assert strategy.preferred_choice_for(
+        field("isRegister", "注册状态", "ElRadioGroup-RADIO")
+    ) == "2"
+
+
+def test_resource_pool_standard_mode_uses_scoped_legal_capital_baseline():
+    project_root = Path(__file__).resolve().parents[1]
+    data_pool = GlobalDataPool.from_directory(project_root / "data")
+    strategy = StandardDataStrategy(
+        data_pool, "run", form_code="POOL_RESOURCE"
+    )
+
+    registered = strategy.value_for(
+        field("registAmount", "注册资本", "ElInputNumber-NUMBER"), 1
+    )
+    received = strategy.value_for(
+        field("recCapAmount", "实收资本", "ElInputNumber-NUMBER"), 2
+    )
+
+    assert (registered, received) == (1000, 500)
+    assert received <= registered
+    assert StandardDataStrategy(
+        data_pool, "run", form_code="OTHER"
+    ).value_for(
+        field("registAmount", "注册资本", "ElInputNumber-NUMBER"), 1
+    ) != 1000
+    assert ProbeDataStrategy(
+        data_pool, "run", form_code="POOL_RESOURCE"
+    ).value_for(
+        field("registAmount", "注册资本", "ElInputNumber-NUMBER"), 1
+    ) != 1000
 
 
 def test_mode_switch_rejects_unknown_mode():

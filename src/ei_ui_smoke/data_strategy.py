@@ -20,6 +20,9 @@ class DataStrategy:
     def value_for(self, field: FieldDefinition, index: int) -> Any:
         raise NotImplementedError
 
+    def preferred_choice_for(self, field: FieldDefinition) -> Any:
+        return None
+
     def declared_unique_repair_fields(
         self, submitted: dict[str, Any],
     ) -> tuple[str, ...]:
@@ -240,11 +243,27 @@ class StableDataStrategy(DataStrategy):
             return field.props["defaultValue"]
         return self.generator.generate(semantic, field, index) if semantic else self.generator.by_kind(field, index)
 
+    def preferred_choice_for(self, field: FieldDefinition) -> Any:
+        return self.pool.preferred_choice(
+            self.form_code, field.field_code, field.field_name,
+        )
+
 
 class StandardDataStrategy(ProbeDataStrategy):
     """Generate fresh values while requiring every editable field to be exercised."""
 
     strict_field_validation = True
+
+    def value_for(self, field: FieldDefinition, index: int) -> Any:
+        override = self.pool.override_value(self.form_code, field.field_code)
+        if override is not None:
+            return override
+        return super().value_for(field, index)
+
+    def preferred_choice_for(self, field: FieldDefinition) -> Any:
+        return self.pool.preferred_choice(
+            self.form_code, field.field_code, field.field_name,
+        )
 
 
 def create_data_strategy(mode: str, pool: GlobalDataPool, form_code: str, run_id: str = "") -> DataStrategy:

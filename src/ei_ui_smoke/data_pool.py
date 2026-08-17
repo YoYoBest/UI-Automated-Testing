@@ -66,6 +66,37 @@ class GlobalDataPool:
         values = form.get("values") if isinstance(form, dict) else {}
         return values[field_code] if isinstance(values, dict) and field_code in values else None
 
+    def preferred_choice(
+        self, form_code: str, field_code: str, field_label: str = "",
+    ) -> Any:
+        """Return an explicit legal baseline choice for one form field."""
+        form = ((self.overrides.get("forms") or {}).get(form_code) or {})
+        choices = form.get("choiceValues") if isinstance(form, dict) else {}
+        if not isinstance(choices, dict):
+            return None
+
+        entry = choices.get(field_code)
+        if entry is not None:
+            return entry.get("value") if isinstance(entry, dict) else entry
+
+        normalized_label = _normalized(field_label)
+        if not normalized_label:
+            return None
+        matches: list[Any] = []
+        for candidate in choices.values():
+            if not isinstance(candidate, dict):
+                continue
+            labels = candidate.get("labels") or []
+            if isinstance(labels, str):
+                labels = [labels]
+            if any(_normalized(label) == normalized_label for label in labels):
+                matches.append(candidate.get("value"))
+        if len(matches) > 1:
+            raise ValueError(
+                f"{form_code} 的选择基线标签不唯一：{field_label}"
+            )
+        return matches[0] if matches else None
+
     def collected_value(self, form_code: str, field_code: str) -> Any:
         form = ((self.collected.get("forms") or {}).get(form_code) or {})
         field = ((form.get("fields") or {}).get(field_code) or {}) if isinstance(form, dict) else {}

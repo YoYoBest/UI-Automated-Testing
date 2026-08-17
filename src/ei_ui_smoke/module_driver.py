@@ -367,6 +367,7 @@ class ModuleSmokeDriver:
                 self.page.wait_for_timeout(1_000)
         submitted.update(self._prepare_nested_operation(scope))
         submitted.update(self._prepare_implicit_required_nested_baselines(scope))
+        self._assert_configured_dynamic_collection_controls(scope)
         self.last_field_report = self.check_field_completion(submitted, all_failures)
         repaired_values = self._repair_visible_validation_errors(scope, submitted)
         submitted.update(repaired_values)
@@ -405,7 +406,8 @@ class ModuleSmokeDriver:
         if not bool(getattr(response, "ok", False)):
             raise AssertionError(
                 f"保存接口失败：HTTP {getattr(response, 'status', 0)} "
-                f"{getattr(response, 'url', '')}"
+                f"{getattr(response, 'url', '')}; "
+                f"{self._failed_save_response_detail(response)}"
             )
         try:
             body = response.json()
@@ -454,7 +456,10 @@ class ModuleSmokeDriver:
                 "没有稳定业务字段可核对"
             )
         if not save_response.ok:
-            raise AssertionError(f"保存接口失败：HTTP {save_response.status} {save_response.url}")
+            raise AssertionError(
+                f"保存接口失败：HTTP {save_response.status} {save_response.url}; "
+                f"{self._failed_save_response_detail(save_response)}"
+            )
         try:
             body = save_response.json()
         except Exception:
@@ -509,6 +514,20 @@ class ModuleSmokeDriver:
                 record_identity_payload=record_identity_payload,
             )
         if require_edit_and_detail or saved_from_current_detail_edit:
+            api_verified = self._verify_saved_record_by_business_id_detail(
+                save_response,
+                submitted,
+                business_id=business_id,
+                required_codes=(
+                    set(required_codes)
+                    if required_codes is not None
+                    else set(submitted)
+                ),
+                record_markers=record_markers,
+                save_payload=save_payload,
+            )
+            if api_verified is not None:
+                return api_verified
             return self._verify_saved_record_in_edit_and_detail(
                 responses,
                 save_response,
@@ -698,6 +717,44 @@ class ModuleSmokeDriver:
             ),
         )
 
+    def _verify_saved_record_by_business_id_detail(
+        self,
+        save_response,
+        submitted: dict[str, Any],
+        *,
+        business_id: str,
+        required_codes: set[str],
+        record_markers: tuple[str, ...],
+        save_payload: Any,
+    ) -> ModuleSmokeResult | None:
+        """Return exact-ID JSON evidence before any rendered-record fallback."""
+        if not business_id:
+            return None
+        detail_response = self._request_same_resource_detail_response(
+            save_response, business_id
+        )
+        if detail_response is None:
+            return None
+        detail_body = self._detail_response_readback_or_fallback(
+            detail_response,
+            submitted,
+            required_codes=required_codes,
+            business_id=business_id,
+            record_markers=record_markers,
+            save_payload=save_payload,
+        )
+        if detail_body is None:
+            return None
+        return ModuleSmokeResult(
+            mode="add_and_detail_verified",
+            business_id=business_id,
+            save_url=save_response.url,
+            detail_url=detail_response.url,
+            submitted=submitted,
+            record_markers=record_markers,
+            record_identity_payload=detail_response.json(),
+        )
+
     def _default_readback_required_codes(self, submitted: dict[str, Any]) -> set[str]:
         """Use collection child paths for readback, not the collection's UI wrapper code."""
         return set(submitted) - set(
@@ -794,6 +851,7 @@ class ModuleSmokeDriver:
                 # to locate the exact embedded child row before UI readback.
                 associated_detail_body = detail_response.json()
         direct_edit_opened = False
+        verified_detail_row_marker = ""
         requested_detail = None
         detail_edit = self._current_detail_edit_button(echo_values)
         has_record_identity = bool(business_id or echo_values)
@@ -856,20 +914,39 @@ class ModuleSmokeDriver:
                             display_field_codes=self._source_response_association_codes(),
                         )
                     except AssertionError as association_exc:
-                        if requested_detail is not None:
-                            raise AssertionError(
-                                "同资源详情接口已按业务 ID 返回记录，"
-                                "但当前页面仍无法唯一定位对应记录，不能跳过 UI 双回读"
-                            ) from association_exc
-                        raise
-                    self._open_record_container_action(
-                        container,
-                        identity,
-                        echo_values,
-                        action_names=("编辑", "修改"),
-                        allow_row_click=False,
-                    )
-                    direct_edit_opened = True
+                        probe = self._probe_response_associated_detail_row(
+                            association_payload,
+                            business_id,
+                            display_field_codes=self._source_response_association_codes(),
+                        )
+                        if probe is None:
+                            if requested_detail is not None:
+                                raise AssertionError(
+                                    "同资源详情接口已按业务 ID 返回记录，"
+                                    "但当前页面仍无法唯一定位对应记录，不能跳过 UI 双回读"
+                                ) from association_exc
+                            raise
+                        identity, verified_detail_row_marker, detail_response = probe
+                        detail_body = self._detail_response_readback_or_fallback(
+                            detail_response,
+                            submitted,
+                            required_codes=readback_required_codes,
+                            business_id=business_id,
+                            record_markers=record_markers,
+                            save_payload=save_payload,
+                        )
+                        associated_detail_body = (
+                            detail_body if detail_body is not None else detail_response.json()
+                        )
+                    else:
+                        self._open_record_container_action(
+                            container,
+                            identity,
+                            echo_values,
+                            action_names=("编辑", "修改"),
+                            allow_row_click=False,
+                        )
+                        direct_edit_opened = True
                 elif self._url_is_detail_page(list_url):
                     raise AssertionError(
                         "保存后已经进入详情路由，但既没有可用页面级编辑按钮，"
@@ -910,6 +987,18 @@ class ModuleSmokeDriver:
         elif detail_edit is not None:
             detail_edit.click()
             self.page.wait_for_timeout(1_500)
+        elif verified_detail_row_marker:
+            self._return_to_record_list(list_url)
+            container = self._runtime_marked_record_container(
+                verified_detail_row_marker
+            )
+            self._open_record_container_action(
+                container,
+                "详情响应已验证的记录",
+                echo_values,
+                action_names=("编辑", "修改"),
+                allow_row_click=False,
+            )
         else:
             self._return_to_record_list(list_url)
             self._open_record_action(
@@ -2205,7 +2294,8 @@ class ModuleSmokeDriver:
             raise AssertionError(f"页面操作“{operation}”点击保存后没有捕获到业务保存接口")
         if not save_response.ok:
             raise AssertionError(
-                f"页面操作“{operation}”保存接口失败：HTTP {save_response.status} {save_response.url}"
+                f"页面操作“{operation}”保存接口失败：HTTP {save_response.status} "
+                f"{save_response.url}; {self._failed_save_response_detail(save_response)}"
             )
         try:
             body = save_response.json()
@@ -2473,13 +2563,9 @@ class ModuleSmokeDriver:
                 save_response = self._find_save_response(new_responses, submitted)
                 if save_response is not None:
                     if not save_response.ok:
-                        try:
-                            response_detail = save_response.text()[:1000]
-                        except Exception:
-                            response_detail = "<响应正文不可读>"
                         raise AssertionError(
                             f"保存接口失败：HTTP {save_response.status} {save_response.url}; "
-                            f"response={response_detail}"
+                            f"{self._failed_save_response_detail(save_response)}"
                         )
                     try:
                         body = save_response.json()
@@ -4334,13 +4420,17 @@ class ModuleSmokeDriver:
         title = scope.get_by_text(str(section), exact=True).last
         title.wait_for(state="visible", timeout=10_000)
         title.scroll_into_view_if_needed()
-        section_scope = title.locator("xpath=ancestor::*[.//button][1]")
-        primary_rows = section_scope.locator(
-            ".el-table__body-wrapper .el-table__row"
-        )
-        rows = primary_rows if primary_rows.count() else section_scope.locator(
-            ".el-table__row"
-        )
+        section_scope = self._nested_section_scope(title, section)
+        collection_spec = self._configured_collection_for_section(section)
+        if collection_spec is not None:
+            rows = section_scope.locator(collection_spec.item_selector)
+        else:
+            primary_rows = section_scope.locator(
+                ".el-table__body-wrapper .el-table__row"
+            )
+            rows = primary_rows if primary_rows.count() else section_scope.locator(
+                ".el-table__row"
+            )
         before_rows = rows.count()
         button = section_scope.get_by_role(
             "button", name=re.compile(r"^(新增|添加|新建|创建)$")
@@ -4355,7 +4445,13 @@ class ModuleSmokeDriver:
                 f"before={before_rows}, after={after_rows}"
             )
         created_row = rows.nth(after_rows - 1)
-        row_submitted = self._fill_dialog(dom_scope=created_row)
+        row_submitted = (
+            self._fill_configured_collection_row(
+                collection_spec, created_row, after_rows - 1
+            )
+            if collection_spec is not None
+            else self._fill_dialog(dom_scope=created_row)
+        )
         row_fields = scan_dom_fields(self.page, created_row)
         if not row_fields:
             prefix = "隐式必填明细" if implicit else "嵌套操作"
@@ -4380,17 +4476,22 @@ class ModuleSmokeDriver:
             self._nested_submitted_key(str(section), code): value
             for code, value in row_submitted.items()
         }
-        for index, field in enumerate(row_fields, 1):
-            code, label, *_ = self._runtime_identity_for_nested_dom(field, index)
-            value = row_submitted.get(code)
-            if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
-                self._remember_nested_evidence(
-                    section=str(section),
-                    field=label or code,
-                    code=code,
-                    value=value,
-                    submitted_key=self._nested_submitted_key(str(section), code),
-                )
+        if collection_spec is not None:
+            self._remember_configured_collection_evidence(
+                collection_spec, str(section), after_rows - 1, row_submitted
+            )
+        else:
+            for index, field in enumerate(row_fields, 1):
+                code, label, *_ = self._runtime_identity_for_nested_dom(field, index)
+                value = row_submitted.get(code)
+                if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
+                    self._remember_nested_evidence(
+                        section=str(section),
+                        field=label or code,
+                        code=code,
+                        value=value,
+                        submitted_key=self._nested_submitted_key(str(section), code),
+                    )
         return nested_submitted
 
     def _prepare_nested_operation(self, scope) -> dict[str, Any]:
@@ -4419,13 +4520,17 @@ class ModuleSmokeDriver:
             title = scope.get_by_text(str(section), exact=True).last
             title.wait_for(state="visible", timeout=10_000)
             title.scroll_into_view_if_needed()
-            section_scope = title.locator("xpath=ancestor::*[.//button][1]")
-            primary_rows = section_scope.locator(
-                ".el-table__body-wrapper .el-table__row"
-            )
-            rows = primary_rows if primary_rows.count() else section_scope.locator(
-                ".el-table__row"
-            )
+            section_scope = self._nested_section_scope(title, section)
+            collection_spec = self._configured_collection_for_section(str(section))
+            if collection_spec is not None:
+                rows = section_scope.locator(collection_spec.item_selector)
+            else:
+                primary_rows = section_scope.locator(
+                    ".el-table__body-wrapper .el-table__row"
+                )
+                rows = primary_rows if primary_rows.count() else section_scope.locator(
+                    ".el-table__row"
+                )
             before_rows = rows.count()
             if str(action).startswith(NESTED_ADD_ACTIONS):
                 button = section_scope.get_by_role("button", name=str(action), exact=True).first
@@ -4438,7 +4543,14 @@ class ModuleSmokeDriver:
                         f"before={before_rows}, after={after_rows}"
                     )
                 created_row = rows.nth(after_rows - 1)
-                row_submitted = self._fill_dialog(dom_scope=created_row)
+                if collection_spec is not None:
+                    row_submitted = self._fill_configured_collection_row(
+                        collection_spec, created_row, after_rows - 1
+                    )
+                    row_fill_failures: list[str] = []
+                else:
+                    row_submitted = self._fill_dialog(dom_scope=created_row)
+                    row_fill_failures = list(self._fill_failures)
                 row_fields = scan_dom_fields(self.page, created_row)
                 if not row_fields:
                     raise AssertionError(
@@ -4449,8 +4561,8 @@ class ModuleSmokeDriver:
                     for field in row_fields
                     if field.required and not self._dom_field_has_value(field)
                 ]
-                if self._fill_failures or empty_required:
-                    details = [*self._fill_failures, *empty_required]
+                if row_fill_failures or empty_required:
+                    details = [*row_fill_failures, *empty_required]
                     raise AssertionError(
                         f"嵌套操作“{section} / {action}”新增行未填写完整："
                         + "; ".join(details)
@@ -4463,21 +4575,26 @@ class ModuleSmokeDriver:
                     self._nested_submitted_key(str(section), code): value
                     for code, value in row_submitted.items()
                 })
-                for index, field in enumerate(row_fields, 1):
-                    code, label, *_ = self._runtime_identity_for_nested_dom(
-                        field, index
+                if collection_spec is not None:
+                    self._remember_configured_collection_evidence(
+                        collection_spec, str(section), after_rows - 1, row_submitted
                     )
-                    value = row_submitted.get(code)
-                    if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
-                        self._remember_nested_evidence(
-                            section=str(section),
-                            field=label or code,
-                            code=code,
-                            value=value,
-                            submitted_key=self._nested_submitted_key(
-                                str(section), code
-                            ),
+                else:
+                    for index, field in enumerate(row_fields, 1):
+                        code, label, *_ = self._runtime_identity_for_nested_dom(
+                            field, index
                         )
+                        value = row_submitted.get(code)
+                        if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
+                            self._remember_nested_evidence(
+                                section=str(section),
+                                field=label or code,
+                                code=code,
+                                value=value,
+                                submitted_key=self._nested_submitted_key(
+                                    str(section), code
+                                ),
+                            )
             elif str(action).startswith(NESTED_DESTRUCTIVE_ACTIONS):
                 add = section_scope.get_by_role(
                     "button", name=re.compile(r"^(新增|添加|新建|创建)$")
@@ -4537,6 +4654,58 @@ class ModuleSmokeDriver:
         return nested_submitted
 
     @staticmethod
+    def _nested_section_scope(title, section: str):
+        """Return the nearest table section instead of a shared dialog ancestor."""
+        enterprise_section = title.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),"
+            "' enterprise-section ')][1]"
+        )
+        if enterprise_section.count() and enterprise_section.is_visible():
+            return enterprise_section
+        section_scope = title.locator(
+            "xpath=ancestor::*[.//button and (.//table or "
+            ".//*[contains(@class, 'table')])][1]"
+        )
+        if not section_scope.count() or not section_scope.is_visible():
+            raise AssertionError(f"嵌套操作“{section}”未找到独立表格区块")
+        return section_scope
+
+    def _configured_collection_for_section(
+        self, section: str,
+    ) -> DynamicCollectionSpec | None:
+        matches = [
+            spec for spec in getattr(self, "dynamic_collections", ())
+            if spec.section_title and spec.section_title == str(section).strip()
+        ]
+        if len(matches) > 1:
+            raise DynamicFieldContractError(
+                f"动态字段契约重复：区块“{section}”匹配到多个集合"
+            )
+        return matches[0] if matches else None
+
+    def _remember_configured_collection_evidence(
+        self,
+        spec: DynamicCollectionSpec,
+        section: str,
+        row_index: int,
+        submitted: dict[str, Any],
+    ) -> None:
+        for child in spec.children:
+            if child.kind not in {"text", "textarea", "number"}:
+                continue
+            code = child.field_code_template.format(index=row_index)
+            value = submitted.get(code)
+            if value in (None, ""):
+                continue
+            self._remember_nested_evidence(
+                section=section,
+                field=child.label or code,
+                code=code,
+                value=value,
+                submitted_key=self._nested_submitted_key(section, code),
+            )
+
+    @staticmethod
     def _request_payload(request) -> Any:
         try:
             payload = request.post_data_json
@@ -4547,6 +4716,87 @@ class ModuleSmokeDriver:
                 return json.loads(raw)
             except (TypeError, json.JSONDecodeError):
                 return raw
+
+    @staticmethod
+    def _payload_shape_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, dict):
+            return "object"
+        if isinstance(value, list):
+            return f"array[{len(value)}]"
+        return type(value).__name__
+
+    @classmethod
+    def _request_shape_summary(
+        cls, request, *, max_paths: int = 200, max_depth: int = 8,
+    ) -> str:
+        """Describe a JSON request without retaining submitted values."""
+        payload = cls._request_payload(request)
+        if not isinstance(payload, (dict, list)):
+            return json.dumps({"$": "non_json_or_unavailable"}, ensure_ascii=False)
+
+        shapes: dict[str, set[str]] = {}
+        truncated = False
+
+        def remember(path: str, value: Any) -> bool:
+            nonlocal truncated
+            if path not in shapes and len(shapes) >= max_paths:
+                truncated = True
+                return False
+            shapes.setdefault(path, set()).add(cls._payload_shape_type(value))
+            return True
+
+        def visit(value: Any, path: str, depth: int) -> None:
+            nonlocal truncated
+            if not remember(path, value):
+                return
+            if depth >= max_depth:
+                if isinstance(value, (dict, list)) and value:
+                    truncated = True
+                return
+            if isinstance(value, dict):
+                for key in sorted(value, key=lambda item: str(item)):
+                    safe_key = re.sub(r"[\x00-\x1f\x7f]", "?", str(key))[:120]
+                    visit(value[key], f"{path}.{safe_key}", depth + 1)
+                    if len(shapes) >= max_paths:
+                        truncated = True
+                        break
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item, f"{path}[]", depth + 1)
+                    if len(shapes) >= max_paths:
+                        truncated = True
+                        break
+
+        visit(payload, "$", 0)
+        summary = {
+            path: "|".join(sorted(types))
+            for path, types in shapes.items()
+        }
+        if truncated:
+            summary["$.__truncated__"] = "true"
+        return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _failed_save_response_detail(cls, response) -> str:
+        try:
+            response_text = response.text()[:1000]
+        except Exception:
+            response_text = "<响应正文不可读>"
+        request = getattr(response, "request", None)
+        return (
+            f"response={response_text}; "
+            f"requestShape={cls._request_shape_summary(request)}"
+        )
 
     @classmethod
     def _payload_scalar_values(cls, payload: Any) -> set[str]:
@@ -5229,13 +5479,18 @@ class ModuleSmokeDriver:
                 ) from exc
             try:
                 row, _identity = self._find_response_associated_record_container(
-                    response_payload, business_id
+                    response_payload, business_id, visible_only=True
                 )
             except AssertionError as response_exc:
-                raise AssertionError(
-                    "保存后无法用业务 ID 或关联响应唯一定位本次记录，"
-                    "不能打开详情核对"
-                ) from response_exc
+                probe = self._probe_response_associated_detail_row(
+                    response_payload, business_id, visible_only=True
+                )
+                if probe is None:
+                    raise AssertionError(
+                        "保存后无法用业务 ID 或关联响应唯一定位本次记录，"
+                        "不能打开详情核对"
+                    ) from response_exc
+                return
         classes = row.get_attribute("class") or ""
         if any(card_class in classes for card_class in (
             "mujijin-cardBox", "platform-card", "fund-card", "el-tree-node__content",
@@ -5513,8 +5768,46 @@ class ModuleSmokeDriver:
         *,
         containers: Iterable[Any] | None = None,
         display_field_codes: Iterable[str] | None = None,
+        visible_only: bool = False,
     ):
         """Associate an ID-bearing response record with one exact visible row/card."""
+        id_matches, matches = self._response_associated_record_container_candidates(
+            payload,
+            business_id,
+            containers=containers,
+            display_field_codes=display_field_codes,
+            visible_only=visible_only,
+        )
+        if len(id_matches) == 1:
+            return id_matches[0], f"操作节点业务 ID={business_id}"
+        if len(id_matches) > 1:
+            raise AssertionError(
+                f"业务 ID {business_id} 的操作节点匹配到多条可见记录，"
+                "无法唯一操作"
+            )
+        if len(matches) != 1:
+            raise AssertionError(
+                f"业务 ID {business_id} 的响应记录字段匹配到多条可见记录，"
+                "无法唯一操作"
+            )
+        container, evidence = matches[0]
+        return container, "响应关联字段=" + ", ".join(evidence)
+
+    def _response_associated_record_container_candidates(
+        self,
+        payload: Any,
+        business_id: str,
+        *,
+        containers: Iterable[Any] | None = None,
+        display_field_codes: Iterable[str] | None = None,
+        visible_only: bool = False,
+    ) -> tuple[list[Any], list[tuple[Any, tuple[str, ...]]]]:
+        """Return exact ID matches and strict display-evidence row candidates.
+
+        Callers that need one row must keep the normal unique-match requirement.
+        The detail-probe fallback below is the sole consumer allowed to inspect
+        several equally matched candidates.
+        """
         normalized_id = self._normalize_record_text(business_id)
         records = [
             record
@@ -5543,13 +5836,6 @@ class ModuleSmokeDriver:
             normalized_id,
             operation="响应关联",
         )
-        if len(id_matches) == 1:
-            return id_matches[0], f"操作节点业务 ID={business_id}"
-        if len(id_matches) > 1:
-            raise AssertionError(
-                f"业务 ID {business_id} 的操作节点匹配到多条可见记录，"
-                "无法唯一操作"
-            )
 
         response_values = {
             value
@@ -5573,7 +5859,7 @@ class ModuleSmokeDriver:
                 for value in cells
                 if self._normalize_record_text(value)
             ]))
-        if display_field_codes is not None:
+        if display_field_codes is not None or visible_only:
             response_values = {
                 value
                 for value in response_values
@@ -5600,13 +5886,178 @@ class ModuleSmokeDriver:
             raise AssertionError(
                 f"业务 ID {business_id} 的响应记录稳定展示字段未完整匹配任何可见记录行"
             )
-        if len(matches) != 1:
+        return id_matches, matches
+
+    def _probe_response_associated_detail_row(
+        self,
+        payload: Any,
+        business_id: str,
+        *,
+        display_field_codes: Iterable[str] | None = None,
+        visible_only: bool = False,
+    ) -> tuple[str, str, Any] | None:
+        """Resolve visually identical rows only through their read-only detail GET.
+
+        This deliberately sits behind the ordinary strict association method.
+        It never chooses a row by position: every candidate is opened through
+        its existing view/detail control, and exactly one returned detail body
+        must contain the Save response business ID.
+        """
+        id_matches, candidates = self._response_associated_record_container_candidates(
+            payload,
+            business_id,
+            display_field_codes=display_field_codes,
+            visible_only=visible_only,
+        )
+        if id_matches or len(candidates) < 2:
+            return None
+
+        list_url = self.page.url
+        verified: list[tuple[str, tuple[str, ...]]] = []
+        for index, (container, evidence) in enumerate(candidates, 1):
+            action = self._record_detail_probe_action(container, evidence)
+            if action is None:
+                raise AssertionError(
+                    f"业务 ID {business_id} 的候选记录 {index} 没有可用的查看/详情入口，"
+                    "不能用详情响应确认记录身份"
+                )
+            marker = f"ei-detail-probe-{uuid.uuid4().hex}"
+            self._mark_runtime_record_container(container, marker)
+            response = self._click_detail_probe_action(action, business_id)
+            if response is not None:
+                verified.append((marker, evidence))
+            self._return_to_record_list(list_url)
+
+        if len(verified) != 1:
             raise AssertionError(
-                f"业务 ID {business_id} 的响应记录字段匹配到多条可见记录，"
-                "无法唯一操作"
+                f"业务 ID {business_id} 的候选详情探测未得到唯一匹配："
+                f"candidates={len(candidates)}, verified={len(verified)}"
             )
-        container, evidence = matches[0]
-        return container, "响应关联字段=" + ", ".join(evidence)
+
+        marker, evidence = verified[0]
+        container = self._runtime_marked_record_container(marker)
+        action = self._record_detail_probe_action(container, evidence)
+        if action is None:
+            raise AssertionError(
+                f"业务 ID {business_id} 的已验证记录在回读前失去查看/详情入口"
+            )
+        response = self._click_detail_probe_action(action, business_id)
+        if response is None:
+            raise AssertionError(
+                f"业务 ID {business_id} 的已验证记录未返回匹配的只读详情响应"
+            )
+        return "详情响应关联字段=" + ", ".join(evidence), marker, response
+
+    def _record_detail_probe_action(self, container, evidence: tuple[str, ...]):
+        for action_name in ("查看", "详情"):
+            for role in ("button", "link"):
+                try:
+                    action = container.get_by_role(
+                        role, name=action_name, exact=True
+                    ).first
+                    if action.count() and action.is_visible() and action.is_enabled():
+                        return action
+                except Exception:
+                    continue
+        return self._record_identity_link_action(container, list(evidence))
+
+    @staticmethod
+    def _mark_runtime_record_container(container, marker: str) -> None:
+        try:
+            container.evaluate(
+                "(node, value) => node.setAttribute('data-ei-detail-probe', value)",
+                marker,
+            )
+        except Exception as exc:
+            raise AssertionError("候选记录无法写入运行时详情探测标记") from exc
+
+    def _runtime_marked_record_container(self, marker: str):
+        escaped = re.sub(r"[^A-Za-z0-9_-]", "", marker)
+        candidates = self.page.locator(
+            f"[data-ei-detail-probe='{escaped}']:visible"
+        )
+        if candidates.count() != 1:
+            raise AssertionError(
+                "详情探测后无法重新定位唯一的已验证记录："
+                f"marker={escaped!r}, matches={candidates.count()}"
+            )
+        return candidates.first
+
+    def _click_detail_probe_action(self, action, business_id: str):
+        responses: list[Any] = []
+        mutation_requests: list[Any] = []
+        listening = hasattr(self.page, "on") and hasattr(self.page, "remove_listener")
+        if not listening:
+            raise AssertionError("当前页面不支持监听详情响应，禁止用候选行探测记录身份")
+
+        def response_received(response) -> None:
+            responses.append(response)
+
+        def request_started(request) -> None:
+            method = str(getattr(request, "method", "")).upper()
+            if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+                return
+            url = str(getattr(request, "url", ""))
+            if not self._is_business_mutation_url(url):
+                return
+            try:
+                payload = self._request_payload(request)
+                if self._is_non_business_mutation_endpoint(url, payload):
+                    return
+            except Exception:
+                pass
+            mutation_requests.append(request)
+
+        self.page.on("response", response_received)
+        self.page.on("request", request_started)
+        try:
+            action.click()
+            deadline = time.monotonic() + 5
+            inspected = 0
+            while time.monotonic() < deadline:
+                if mutation_requests:
+                    request = mutation_requests[0]
+                    raise AssertionError(
+                        "候选记录详情探测触发了写请求，禁止继续："
+                        f"{getattr(request, 'method', '')} {getattr(request, 'url', '')}"
+                    )
+                for response in responses[inspected:]:
+                    if self._is_exact_readonly_detail_response(response, business_id):
+                        return response
+                inspected = len(responses)
+                self.page.wait_for_timeout(100)
+            return None
+        finally:
+            self.page.remove_listener("response", response_received)
+            self.page.remove_listener("request", request_started)
+
+    @classmethod
+    def _is_exact_readonly_detail_response(cls, response, business_id: str) -> bool:
+        request = getattr(response, "request", None)
+        if (
+            not getattr(response, "ok", False)
+            or str(getattr(request, "method", "")).upper() != "GET"
+            or getattr(request, "resource_type", "xhr") not in {"xhr", "fetch"}
+            or "json" not in str(
+                getattr(response, "headers", {}).get("content-type", "")
+            ).lower()
+            or not any(token in str(getattr(response, "url", "")).lower() for token in (
+                "/detail", "detail/", "getdetail", "getbyid", "querybyid", "/info",
+            ))
+        ):
+            return False
+        try:
+            payload = response.json()
+            cls._assert_business_success(payload, operation="候选详情")
+        except Exception:
+            return False
+        expected = cls._normalize_record_text(business_id)
+        direct_ids = {
+            cls._direct_record_business_id(record)
+            for record in cls._collect_dicts(payload)
+            if cls._direct_record_business_id(record)
+        }
+        return bool(expected and expected in direct_ids)
 
     @classmethod
     def _response_display_identity_values(
@@ -6459,54 +6910,303 @@ class ModuleSmokeDriver:
                 raise DynamicFieldContractError(
                     f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
                 )
-            rows = root.locator(spec.item_selector)
-            if rows.count() < spec.min_rows:
+            rows = self._configured_collection_rows(root, spec)
+            if len(rows) < spec.min_rows:
                 trigger = root.locator(spec.create_selector).first
                 if not trigger.count() or not trigger.is_visible():
                     raise DynamicFieldContractError(
                         f"动态字段契约缺失：{spec.field_code} 没有可新增行"
                     )
                 self._activate_configured_collection_trigger(trigger, spec)
-                rows = self._wait_for_collection_rows_by_selector(
-                    root, spec.item_selector, spec.min_rows, spec.field_code
-                )
-            for row_index in range(spec.min_rows):
-                row = rows.nth(row_index)
-                for child_index, child in enumerate(spec.children, 1):
-                    field_code = child.field_code_template.format(index=row_index)
-                    definition = FieldDefinition(
-                        field_code=field_code,
-                        field_name=child.label or field_code,
-                        field_type=TYPE_BY_KIND.get(child.kind, "TEXT"),
-                        required=child.required,
-                        source="dynamic-collection-manifest",
-                    )
-                    dom = DomField(
-                        field_code=field_code,
-                        label=definition.field_name,
-                        kind=child.kind,
-                        selector=child.selector,
-                        required=child.required,
-                    )
-                    control = row.locator(child.selector).first
-                    if not control.count() or not control.is_visible():
-                        raise DynamicFieldContractError(
-                            f"动态字段契约缺失：{spec.field_code} 子字段未渲染：{field_code}"
-                        )
-                    value = self.data_strategy.value_for(
-                        definition, len(submitted) + child_index
-                    )
-                    actual = self.interactor.fill(
-                        ResolvedField(definition, dom), value, root=row
-                    )
-                    if actual in (None, "", []):
-                        raise DynamicFieldContractError(
-                            f"动态字段契约缺失：{spec.field_code} 子字段未成功填写：{field_code}"
-                        )
-                    submitted[field_code] = actual
+                rows = self._wait_for_configured_collection_rows(root, spec)
+            # min_rows is a creation threshold. Hydrated collections may already
+            # contain more rows, and every rendered row participates in Save.
+            for row_index, row in enumerate(rows):
+                submitted.update(self._fill_configured_collection_row(
+                    spec, row, row_index, value_offset=len(submitted)
+                ))
             submitted[spec.field_code] = spec.mode
             self._collection_submission_codes.add(spec.field_code)
         return submitted
+
+    @staticmethod
+    def _configured_collection_row_headers(row) -> list[str]:
+        return [
+            str(value or "").strip()
+            for value in row.locator("td").evaluate_all(
+                r"""cells => cells.map((cell) => {
+                    const clean = (value) => (value || '')
+                        .replace(/^\s*\*\s*/, '').replace(/\s+/g, ' ').trim();
+                    const table = cell.closest('table');
+                    const headerRows = [...(table?.querySelectorAll('thead tr') || [])];
+                    const direct = headerRows.at(-1)?.cells?.[cell.cellIndex];
+                    const directText = clean(direct?.innerText || direct?.textContent || '');
+                    if (directText) return directText;
+                    const columnClass = [...cell.classList]
+                        .find((name) => /_column_\d+$/.test(name));
+                    const tableRoot = cell.closest('.el-table,.ant-table');
+                    const header = columnClass
+                        ? tableRoot?.querySelector(`th.${CSS.escape(columnClass)}`)
+                        : null;
+                    return clean(header?.innerText || header?.textContent || '');
+                })"""
+            )
+        ]
+
+    def _configured_collection_rows(
+        self, root, spec: DynamicCollectionSpec,
+    ) -> list[Any]:
+        expected_headers = {
+            child.column_header for child in spec.children if child.column_header
+        }
+        candidates = root.locator(spec.item_selector)
+        rows: list[Any] = []
+        for index in range(candidates.count()):
+            row = candidates.nth(index)
+            if not expected_headers:
+                rows.append(row)
+                continue
+            headers = set(self._configured_collection_row_headers(row))
+            if expected_headers.issubset(headers):
+                rows.append(row)
+        return rows
+
+    def _configured_collection_child_scope(
+        self, row, spec: DynamicCollectionSpec, child, row_index: int,
+    ):
+        if not child.column_header:
+            return row
+        headers = self._configured_collection_row_headers(row)
+        matches = [
+            index for index, header in enumerate(headers)
+            if header == child.column_header
+        ]
+        if len(matches) != 1:
+            raise DynamicFieldContractError(
+                f"动态字段契约缺失：{spec.field_code} 第{row_index + 1}行"
+                f"无法唯一定位表头“{child.column_header}”"
+            )
+        return row.locator("td").nth(matches[0])
+
+    def _fill_configured_collection_row(
+        self,
+        spec: DynamicCollectionSpec,
+        row,
+        row_index: int,
+        *,
+        value_offset: int = 0,
+    ) -> dict[str, Any]:
+        submitted: dict[str, Any] = {}
+        generated_codes: set[str] = set()
+        numeric_values: dict[str, Any] = {}
+        numeric_bindings: dict[str, tuple[ResolvedField, Any]] = {}
+        for child_index, child in enumerate(spec.children, 1):
+            field_code = child.field_code_template.format(index=row_index)
+            child_scope = self._configured_collection_child_scope(
+                row, spec, child, row_index
+            )
+            controls = child_scope.locator(child.selector)
+            visible_controls = [
+                controls.nth(index)
+                for index in range(controls.count())
+                if controls.nth(index).is_visible()
+            ]
+            if len(visible_controls) != 1:
+                raise DynamicFieldContractError(
+                    f"动态字段契约缺失：{spec.field_code} 子字段未唯一渲染："
+                    f"{field_code}; count={len(visible_controls)}"
+                )
+            definition = FieldDefinition(
+                field_code=field_code,
+                field_name=child.label or field_code,
+                field_type=TYPE_BY_KIND.get(child.kind, "TEXT"),
+                required=child.required,
+                source="dynamic-collection-manifest",
+            )
+            dom = DomField(
+                field_code=field_code,
+                label=definition.field_name,
+                kind=child.kind,
+                selector=child.selector,
+                required=child.required,
+            )
+            resolved = ResolvedField(definition, dom)
+            if child.kind == "number":
+                numeric_bindings[field_code] = (resolved, child_scope)
+                existing_value = self._configured_collection_numeric_value(
+                    visible_controls[0]
+                )
+                if existing_value not in (None, ""):
+                    numeric_values[field_code] = existing_value
+            if self._dom_field_has_value(
+                dom,
+                root=child_scope,
+                field_code=field_code,
+                field_label=definition.field_name,
+            ):
+                continue
+            value = self.data_strategy.value_for(
+                definition, value_offset + child_index
+            )
+            actual = self.interactor.fill(
+                resolved, value, root=child_scope
+            )
+            if actual in (None, "", []):
+                raise DynamicFieldContractError(
+                    f"动态字段契约缺失：{spec.field_code} 子字段未成功填写：{field_code}"
+                )
+            submitted[field_code] = actual
+            generated_codes.add(field_code)
+            if child.kind == "number":
+                numeric_values[field_code] = actual
+        self._enforce_configured_collection_value_relations(
+            spec,
+            row_index,
+            submitted=submitted,
+            generated_codes=generated_codes,
+            numeric_values=numeric_values,
+            numeric_bindings=numeric_bindings,
+        )
+        return submitted
+
+    @staticmethod
+    def _configured_collection_numeric_value(control) -> Any:
+        try:
+            return control.input_value()
+        except Exception:
+            try:
+                return control.get_attribute("value")
+            except Exception:
+                return None
+
+    @staticmethod
+    def _configured_collection_decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value).replace(",", "").strip())
+        except (InvalidOperation, ValueError) as exc:
+            raise DynamicFieldContractError(
+                "动态字段值关系无法读取数值端点"
+            ) from exc
+
+    def _enforce_configured_collection_value_relations(
+        self,
+        spec: DynamicCollectionSpec,
+        row_index: int,
+        *,
+        submitted: dict[str, Any],
+        generated_codes: set[str],
+        numeric_values: dict[str, Any],
+        numeric_bindings: dict[str, tuple[ResolvedField, Any]],
+    ) -> None:
+        for relation in spec.value_relations:
+            left_code = relation.left_field_template.format(index=row_index)
+            right_code = relation.right_field_template.format(index=row_index)
+            if left_code not in numeric_values or right_code not in numeric_values:
+                raise DynamicFieldContractError(
+                    f"动态字段值关系缺少端点：{left_code} lte {right_code}"
+                )
+            left = self._configured_collection_decimal(numeric_values[left_code])
+            right = self._configured_collection_decimal(numeric_values[right_code])
+            if left <= right:
+                continue
+
+            adjusted = False
+            for side in relation.adjust_order:
+                target_code = left_code if side == "left" else right_code
+                if target_code not in generated_codes:
+                    continue
+                binding = numeric_bindings.get(target_code)
+                if binding is None:
+                    continue
+                replacement = right if side == "left" else left
+                resolved, child_scope = binding
+                actual = self.interactor.fill(
+                    resolved, format(replacement, "f"), root=child_scope
+                )
+                if actual in (None, "", []):
+                    continue
+                numeric_values[target_code] = actual
+                submitted[target_code] = actual
+                left = self._configured_collection_decimal(numeric_values[left_code])
+                right = self._configured_collection_decimal(numeric_values[right_code])
+                if left <= right:
+                    adjusted = True
+                    break
+            if not adjusted:
+                raise DynamicFieldContractError(
+                    f"动态字段值关系无法安全调整：{left_code} lte {right_code}"
+                )
+
+    def _assert_configured_dynamic_collection_controls(self, scope) -> None:
+        """Refuse to submit when a configured collection exposes an unknown child."""
+        for spec in getattr(self, "dynamic_collections", ()):
+            root = scope.locator(spec.root_selector).first
+            if not root.count() or not root.is_visible():
+                raise DynamicFieldContractError(
+                    f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
+                )
+            rows = self._configured_collection_rows(root, spec)
+            if len(rows) < spec.min_rows:
+                raise DynamicFieldContractError(
+                    f"动态字段契约缺失：{spec.field_code} 未渲染最少明细行"
+                )
+            for row_index, row in enumerate(rows):
+                grouped: dict[str, list[Any]] = {}
+                for child in spec.children:
+                    if child.column_header:
+                        grouped.setdefault(child.column_header, []).append(child)
+                    child_scope = self._configured_collection_child_scope(
+                        row, spec, child, row_index
+                    )
+                    controls = child_scope.locator(child.selector)
+                    visible_count = sum(
+                        1 for index in range(controls.count())
+                        if controls.nth(index).is_visible()
+                    )
+                    if visible_count != 1:
+                        field_code = child.field_code_template.format(index=row_index)
+                        raise DynamicFieldContractError(
+                            f"动态字段契约缺失：{spec.field_code} 子字段未唯一渲染："
+                            f"{field_code}; count={visible_count}"
+                        )
+                for header, children in grouped.items():
+                    cell = self._configured_collection_child_scope(
+                        row, spec, children[0], row_index
+                    )
+                    actual_count = int(cell.evaluate(
+                        """node => [...node.querySelectorAll(
+                            'input:not([type=hidden]),textarea,select,[role=combobox]'
+                        )].filter((el) => {
+                            const style = getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                                rect.width > 0 && rect.height > 0;
+                        }).length"""
+                    ))
+                    if actual_count != len(children):
+                        raise DynamicFieldContractError(
+                            f"动态字段契约缺失：{spec.field_code} 第{row_index + 1}行"
+                            f"表头“{header}”控件数不一致："
+                            f"expected={len(children)}, actual={actual_count}"
+                        )
+
+    def _dom_field_is_in_configured_collection(self, scope, dom: DomField) -> bool:
+        """Keep ordinary DOM filling out of manifest-owned detail rows."""
+        selector = str(getattr(dom, "selector", "") or "").strip()
+        if not selector:
+            return False
+        for spec in getattr(self, "dynamic_collections", ()):
+            try:
+                root = scope.locator(spec.root_selector).first
+                if (
+                    root.count()
+                    and root.is_visible()
+                    and root.locator(selector).count()
+                ):
+                    return True
+            except Exception:
+                continue
+        return False
 
     @staticmethod
     def _activate_configured_collection_trigger(
@@ -6521,16 +7221,16 @@ class ModuleSmokeDriver:
                 f"动态字段契约缺失：{spec.field_code} 无法选择可见集合项"
             ) from exc
 
-    def _wait_for_collection_rows_by_selector(
-        self, root, selector: str, minimum: int, field_code: str
-    ):
-        rows = root.locator(selector)
+    def _wait_for_configured_collection_rows(
+        self, root, spec: DynamicCollectionSpec,
+    ) -> list[Any]:
         for _attempt in range(20):
-            if rows.count() >= minimum:
+            rows = self._configured_collection_rows(root, spec)
+            if len(rows) >= spec.min_rows:
                 return rows
             self.page.wait_for_timeout(200)
         raise DynamicFieldContractError(
-            f"动态字段契约缺失：{field_code} 未渲染可填写明细项"
+            f"动态字段契约缺失：{spec.field_code} 未渲染可填写明细项"
         )
 
     def _dynamic_collection_contracts(self, scope) -> list[dict[str, Any]]:
@@ -6654,10 +7354,15 @@ class ModuleSmokeDriver:
             else scan_dom_fields(self.page)
         )
         collection_scope = dom_scope or getattr(self, "_form_scope_for_collections", None)
-        # Collection setup belongs to the outer form. Nested row filling can call
-        # this method recursively for the DOM-attribute compatibility contract.
-        if source_identity and collection_scope is not None and hasattr(collection_scope, "evaluate"):
-            submitted.update(self._prepare_configured_dynamic_collections(collection_scope))
+        configured_collections = bool(getattr(self, "dynamic_collections", ()))
+        # Conditional collection roots can depend on a normal baseline field.
+        # Fill those ordinary fields first, then create and fill configured rows.
+        if (
+            source_identity
+            and collection_scope is not None
+            and hasattr(collection_scope, "evaluate")
+            and not configured_collections
+        ):
             submitted.update(self._prepare_dynamic_collection_baselines(collection_scope))
         fields = scan_fields()
         field_count = max(len(fields), len(self.source_fields) if source_identity else 0)
@@ -6667,6 +7372,13 @@ class ModuleSmokeDriver:
                 break
             dom = current_fields[index - 1]
             if dom.readonly or not dom.field_code:
+                continue
+            if (
+                source_identity
+                and configured_collections
+                and collection_scope is not None
+                and self._dom_field_is_in_configured_collection(collection_scope, dom)
+            ):
                 continue
             if source_identity:
                 (
@@ -6688,6 +7400,27 @@ class ModuleSmokeDriver:
                 ) = self._runtime_identity_for_nested_dom(dom, index)
             if only_codes is not None and field_code.lower() not in only_codes:
                 continue
+            definition = FieldDefinition(
+                field_code=field_code, field_name=field_label,
+                field_type=TYPE_BY_KIND.get(dom.kind, "ElInput-TEXT"),
+                required=dom.required, readonly=dom.readonly, source="runtime-dom",
+            )
+            preferred_choice = None
+            preferred_choice_for = getattr(
+                self.data_strategy, "preferred_choice_for", None
+            )
+            if callable(preferred_choice_for) and dom.kind in {
+                "select", "multi_select", "radio", "checkbox",
+            }:
+                choice_definition = FieldDefinition(
+                    field_code=source_code or field_code,
+                    field_name=field_label,
+                    field_type=definition.field_type,
+                    required=definition.required,
+                    readonly=definition.readonly,
+                    source=definition.source,
+                )
+                preferred_choice = preferred_choice_for(choice_definition)
             has_value = (
                 self._dom_field_has_value(
                     dom, root=dom_scope, field_code=field_code, field_label=field_label,
@@ -6697,13 +7430,8 @@ class ModuleSmokeDriver:
                     dom, field_code=field_code, field_label=field_label,
                 )
             )
-            if has_value:
+            if has_value and preferred_choice in (None, "", []):
                 continue
-            definition = FieldDefinition(
-                field_code=field_code, field_name=field_label,
-                field_type=TYPE_BY_KIND.get(dom.kind, "ElInput-TEXT"),
-                required=dom.required, readonly=dom.readonly, source="runtime-dom",
-            )
             if (
                 dom.kind in {"select", "multi_select"}
                 and not dom.required
@@ -6717,16 +7445,15 @@ class ModuleSmokeDriver:
                         field_code, dom.selector, dom_scope=dom_scope,
                         field_label=field_label,
                     )
-                    target = radios.last if field_code in {"registerStatus", "isRegister"} and radios.count() > 1 else radios.first
-                    target.check(force=True)
-                    radio_item = target.locator(
-                        "xpath=ancestor::*[@role='radio' or contains(concat(' ',normalize-space(@class),' '),' el-radio ')][1]"
+                    actual = self._select_radio_choice(
+                        radios,
+                        preferred_choice,
+                        prefer_last=(
+                            not preferred_choice
+                            and field_code in {"registerStatus", "isRegister"}
+                            and radios.count() > 1
+                        ),
                     )
-                    actual = str(
-                        (radio_item.inner_text() if radio_item.count() else "")
-                        or target.locator("xpath=..").inner_text()
-                        or value
-                    ).strip()
                 elif dom.kind in {"select", "multi_select"} and field_label:
                     if source_code == "orgGroupId":
                         actual = self._select_group_with_backtracking(
@@ -6739,11 +7466,15 @@ class ModuleSmokeDriver:
                             dom_scope=dom_scope,
                         )
                     else:
-                        actual = self._select_by_label(
-                            field_label, field_code=field_code, selector=dom.selector,
-                            qcc_remote=source_qcc or dom.qcc_remote,
-                            dom_scope=dom_scope,
-                        )
+                        select_kwargs = {
+                            "field_code": field_code,
+                            "selector": dom.selector,
+                            "qcc_remote": source_qcc or dom.qcc_remote,
+                            "dom_scope": dom_scope,
+                        }
+                        if preferred_choice not in (None, "", []):
+                            select_kwargs["preferred_value"] = preferred_choice
+                        actual = self._select_by_label(field_label, **select_kwargs)
                 else:
                     resolved = ResolvedField(definition, dom)
                     actual = (
@@ -6759,6 +7490,14 @@ class ModuleSmokeDriver:
             except Exception as exc:
                 detail = f"{dom.label or dom.field_code} ({field_code}): {exc}"
                 (failures if dom.required else optional_failures).append(detail)
+        if (
+            source_identity
+            and configured_collections
+            and collection_scope is not None
+            and hasattr(collection_scope, "evaluate")
+        ):
+            submitted.update(self._prepare_configured_dynamic_collections(collection_scope))
+            self._assert_configured_dynamic_collection_controls(collection_scope)
         self._fill_failures = failures
         self._optional_fill_failures = optional_failures
         return submitted
@@ -7179,6 +7918,68 @@ class ModuleSmokeDriver:
             pass
         return fallback
 
+    @staticmethod
+    def _normalized_choice_value(value: Any) -> str:
+        return re.sub(r"\s+", "", str(value or "")).lower()
+
+    @classmethod
+    def _radio_choice_values(cls, radio) -> tuple[str, ...]:
+        values: list[str] = []
+        for attribute in ("value", "data-value", "aria-label"):
+            try:
+                value = radio.get_attribute(attribute)
+            except Exception:
+                value = None
+            if value not in (None, ""):
+                values.append(str(value).strip())
+        try:
+            radio_item = radio.locator(
+                "xpath=ancestor-or-self::*[@role='radio' or "
+                "contains(concat(' ',normalize-space(@class),' '),' el-radio ')][1]"
+            )
+            if radio_item.count():
+                text = str(radio_item.inner_text() or "").strip()
+                if text:
+                    values.append(text)
+        except Exception:
+            pass
+        try:
+            parent_text = str(radio.locator("xpath=..").inner_text() or "").strip()
+            if parent_text:
+                values.append(parent_text)
+        except Exception:
+            pass
+        return tuple(dict.fromkeys(values))
+
+    @classmethod
+    def _select_radio_choice(
+        cls, radios, preferred_value: Any = None, *, prefer_last: bool = False,
+    ) -> str:
+        count = radios.count()
+        if count <= 0:
+            raise AssertionError("单选字段没有可用选项")
+        wanted = cls._normalized_choice_value(preferred_value)
+        matches: list[tuple[Any, tuple[str, ...]]] = []
+        for index in range(count):
+            radio = radios.nth(index)
+            values = cls._radio_choice_values(radio)
+            if wanted and any(
+                cls._normalized_choice_value(value) == wanted for value in values
+            ):
+                matches.append((radio, values))
+        if wanted:
+            if len(matches) != 1:
+                raise AssertionError(
+                    f"单选字段没有唯一匹配的基线选项：{preferred_value}; "
+                    f"matches={len(matches)}"
+                )
+            target, values = matches[0]
+        else:
+            target = radios.nth(count - 1 if prefer_last else 0)
+            values = cls._radio_choice_values(target)
+        target.check(force=True)
+        return next((value for value in values if value), str(preferred_value or ""))
+
     def _source_for_dom(self, dom, index: int) -> tuple[str, str, bool]:
         if dom.field_code and not self._is_generated_identifier(dom.field_code):
             match = next(
@@ -7431,7 +8232,7 @@ class ModuleSmokeDriver:
 
     def _select_by_label(
         self, label: str, option_index: int = 0, field_code: str = "", qcc_remote: bool = False,
-        selector: str = "", dom_scope=None,
+        selector: str = "", dom_scope=None, preferred_value: Any = None,
     ) -> str:
         dialog = (
             dom_scope
@@ -7505,6 +8306,7 @@ class ModuleSmokeDriver:
             lookup_label=lookup_label,
             option_index=option_index,
             is_company_remote=is_company_remote,
+            preferred_value=preferred_value,
         )
 
     def _select_business_value(
@@ -7515,6 +8317,7 @@ class ModuleSmokeDriver:
         lookup_label: str,
         option_index: int,
         is_company_remote: bool,
+        preferred_value: Any = None,
     ) -> str:
         """Wait for real options while reacquiring Element Plus ownership each poll."""
 
@@ -7587,24 +8390,40 @@ class ModuleSmokeDriver:
                             for word in ("请选择", "全部", "暂无", "无数据", "加载")
                         )
                     ):
-                        valid_options.append((option, text))
+                        keyed_node = option.locator(
+                            "xpath=ancestor-or-self::*[@data-key][1]"
+                        )
+                        business_value = (
+                            keyed_node.get_attribute("data-key")
+                            if keyed_node.count()
+                            else text
+                        )
+                        valid_options.append((option, text, business_value or text))
             except Exception:
                 valid_options = []
             if valid_options:
-                selection_index = (
-                    0
-                    if is_company_remote
-                    else min(option_index, len(valid_options) - 1)
-                )
-                option, text = valid_options[selection_index]
-                keyed_node = option.locator(
-                    "xpath=ancestor-or-self::*[@data-key][1]"
-                )
-                business_value = (
-                    keyed_node.get_attribute("data-key")
-                    if keyed_node.count()
-                    else text
-                )
+                wanted = self._normalized_choice_value(preferred_value)
+                if wanted:
+                    matches = [
+                        item for item in valid_options
+                        if wanted in {
+                            self._normalized_choice_value(item[1]),
+                            self._normalized_choice_value(item[2]),
+                        }
+                    ]
+                    if len(matches) != 1:
+                        raise AssertionError(
+                            f"{lookup_label} 没有唯一匹配的基线选项："
+                            f"{preferred_value}; matches={len(matches)}"
+                        )
+                    option, text, business_value = matches[0]
+                else:
+                    selection_index = (
+                        0
+                        if is_company_remote
+                        else min(option_index, len(valid_options) - 1)
+                    )
+                    option, text, business_value = valid_options[selection_index]
                 try:
                     option.click(force=True)
                     self.page.wait_for_timeout(500)
