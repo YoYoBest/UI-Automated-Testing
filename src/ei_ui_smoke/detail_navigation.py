@@ -603,6 +603,42 @@ def _parent_total_record_count(page) -> int | None:
         return None
 
 
+def _parent_current_page_number(pagination) -> int | None:
+    """Read the rendered active page without depending on one Element Plus label."""
+    try:
+        current = pagination.locator(
+            "[aria-current='true'],[aria-current='page'],.is-active"
+        ).first
+        if not current.count() or not current.is_visible():
+            return None
+        values = [current.get_attribute("aria-label") or ""]
+        try:
+            values.append(current.inner_text() or "")
+        except Exception:
+            pass
+        for value in values:
+            match = re.search(r"(?<!\d)(\d+)(?!\d)", str(value))
+            if match:
+                return int(match.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def _parent_page_navigation_observed(
+    page, pagination, page_number: int, previous_snapshot: tuple[str, ...],
+) -> tuple[bool, bool]:
+    """Return whether a page jump is proven by active state or new list data."""
+    active_page = _parent_current_page_number(pagination)
+    if active_page == page_number:
+        return True, True
+    try:
+        snapshot = _record_snapshot(page.locator(_PARENT_RECORD_SELECTOR))
+    except Exception:
+        snapshot = ()
+    return bool(snapshot and snapshot != previous_snapshot), False
+
+
 def _goto_parent_record_page(
     page, page_number: int, previous_snapshot: tuple[str, ...]
 ):
@@ -614,9 +650,17 @@ def _goto_parent_record_page(
         jump = pagination.locator(_PARENT_PAGE_JUMP_SELECTOR).first
         jump.fill(str(page_number))
         jump.press("Enter")
-        pagination.locator(
-            f"[aria-current='true'][aria-label='第 {page_number} 页']"
-        ).first.wait_for(state="visible", timeout=20_000)
+        deadline = time.monotonic() + 20
+        active_page_confirmed = False
+        while time.monotonic() < deadline:
+            observed, active_page_confirmed = _parent_page_navigation_observed(
+                page, pagination, page_number, previous_snapshot,
+            )
+            if observed:
+                break
+            page.wait_for_timeout(200)
+        else:
+            raise TimeoutError(f"parent page {page_number} was not observed")
     except Exception as exc:
         raise ParentListNotReadyError(
             f"详情父列表无法跳转到第 {page_number} 页；url={page.url}"
@@ -624,7 +668,10 @@ def _goto_parent_record_page(
     return _wait_for_parent_records_ready(
         page,
         timeout=30_000,
-        different_from=previous_snapshot,
+        # An active-page indicator is enough to accommodate lists whose rows
+        # legitimately render identical text on adjacent pages.  Otherwise a
+        # changed row snapshot is the navigation proof.
+        different_from=None if active_page_confirmed else previous_snapshot,
     )
 
 

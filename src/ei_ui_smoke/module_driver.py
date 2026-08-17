@@ -277,7 +277,8 @@ class ModuleSmokeDriver:
     def prepare_unique_constraint_evidence(self) -> None:
         """Capture a complete, authenticated occupied-key snapshot before Add."""
         specs = self._declared_unique_constraints()
-        if not any(spec.list_url_includes for spec in specs):
+        list_specs = tuple(spec for spec in specs if spec.list_url_includes)
+        if not list_specs:
             return
         self._stop_unique_list_capture()
         self._unique_list_responses = []
@@ -287,28 +288,51 @@ class ModuleSmokeDriver:
         if not callable(reload_page):
             self._stop_unique_list_capture()
             raise AssertionError("组合唯一约束缺少列表证据：当前页面不能刷新列表")
+        successful_responses: dict[tuple[Any, ...], Any] | None = None
+        last_error: Exception | None = None
         try:
-            try:
-                reload_page(wait_until="domcontentloaded")
-            except TypeError:
-                reload_page()
-            self._wait_for_unique_list_response(specs)
+            for _attempt in range(2):
+                response_start = len(self._unique_list_responses)
+                try:
+                    try:
+                        reload_page(wait_until="domcontentloaded")
+                    except TypeError:
+                        reload_page()
+                    self._wait_for_unique_list_response(
+                        list_specs, response_start=response_start
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                attempt_responses = self._unique_list_responses[response_start:]
+                captured = {
+                    self._unique_spec_key(spec): matching[-1]
+                    for spec in list_specs
+                    if (
+                        matching := [
+                            response for response in attempt_responses
+                            if self._response_matches_unique_list(response, spec)
+                        ]
+                    )
+                }
+                if len(captured) == len(list_specs):
+                    successful_responses = captured
+                    break
         finally:
             self._stop_unique_list_capture()
-        for spec in specs:
-            if not spec.list_url_includes:
-                continue
-            matching = [
-                response for response in self._unique_list_responses
-                if self._response_matches_unique_list(response, spec)
-            ]
-            if not matching:
-                raise AssertionError(
-                    f"组合唯一约束没有捕获本轮列表响应：{spec.form_code}"
-                )
+        if successful_responses is None:
+            if last_error is not None:
+                raise last_error
+            raise AssertionError(
+                "组合唯一约束缺少真实列表响应，无法证明可用组合："
+                + ", ".join(spec.form_code for spec in list_specs)
+            )
+        for spec in list_specs:
             self._unique_occupied_snapshot[
                 self._unique_spec_key(spec)
-            ] = self._occupied_unique_keys_from_response(matching[-1], spec)
+            ] = self._occupied_unique_keys_from_response(
+                successful_responses[self._unique_spec_key(spec)], spec
+            )
 
     def bind_page(self, page) -> None:
         """Move the driver to a recovered Page without retaining stale evidence."""
@@ -384,13 +408,18 @@ class ModuleSmokeDriver:
                 self.page.wait_for_timeout(1_000)
         submitted.update(self._prepare_nested_operation(scope))
         submitted.update(self._prepare_implicit_required_nested_baselines(scope))
-        self._assert_configured_dynamic_collection_controls(scope)
+        self._assert_configured_dynamic_collection_controls(
+            scope, include_nested_operations=True
+        )
         self.last_field_report = self.check_field_completion(submitted, all_failures)
         repaired_values = self._repair_visible_validation_errors(scope, submitted)
         submitted.update(repaired_values)
         if repaired_values:
             self.last_field_report = self.check_field_completion(submitted, all_failures)
         submitted.update(self._prepare_declared_unique_values(scope, submitted))
+        # The unique-key preparation can change the final payload after the earlier
+        # fill check. Re-run the shared self-check against exactly what will be saved.
+        self.last_field_report = self.check_field_completion(submitted, all_failures)
         record_markers = self._collect_record_identity_markers(submitted, scope=scope)
         self._capture_submitted_display_values(submitted, scope)
         self.write_field_diagnostics(self.last_field_report, submitted, attempts)
@@ -696,20 +725,25 @@ class ModuleSmokeDriver:
                 )
         if detail_body is None:
             self._open_current_detail_edit_for_readback(echo_values)
+            ordinary_codes, nested_codes = self._partition_readback_required_codes(
+                submitted, required_codes
+            )
             display_values = {
                 code: display_value
-                for code in submitted
+                for code in ordinary_codes
                 if (
                     display_value := self._remembered_display_value(
                         code, submitted[code]
                     )
                 )
             }
-            readback_options: dict[str, Any] = {"required_codes": required_codes}
+            readback_options: dict[str, Any] = {"required_codes": ordinary_codes}
             if display_values:
                 readback_options["display_values"] = display_values
             self._assert_open_form_values(submitted, **readback_options)
-            self._assert_nested_values_in_open_form()
+            self._assert_nested_values_in_open_form(
+                submitted=submitted, required_codes=nested_codes
+            )
             self._assert_rendered_detail_text(rendered_text_expectations)
             return ModuleSmokeResult(
                 mode="add_and_edit_form_verified",
@@ -778,6 +812,25 @@ class ModuleSmokeDriver:
             getattr(self, "_collection_submission_codes", set())
         ) - set(getattr(self, "_readback_excluded_submission_codes", set()))
 
+    def _partition_readback_required_codes(
+        self,
+        submitted: dict[str, Any],
+        required_codes: set[str] | None,
+    ) -> tuple[set[str], set[str]]:
+        """Separate ordinary form fields from child-table evidence."""
+        required = (
+            set(submitted) if required_codes is None else set(required_codes)
+        )
+        evidence = self._current_nested_evidence(submitted)
+        nested = {
+            code for code in required
+            if any(
+                self._nested_evidence_targets_code(item, {code})
+                for item in evidence
+            )
+        }
+        return required - nested, nested
+
     def _open_current_detail_edit_for_readback(self, markers: list[str]) -> bool:
         """Enter edit mode when ordinary readback currently sits on readonly detail."""
         try:
@@ -810,20 +863,46 @@ class ModuleSmokeDriver:
                 f"详情接口响应不是有效 JSON：{detail_response.url}"
             ) from exc
         self._assert_business_success(detail_body, operation="详情")
-        self._assert_detail_values(
-            detail_body,
-            submitted,
-            required_codes=required_codes,
-            business_id=business_id,
-            record_markers=record_markers,
-            detail_request=detail_response.request,
-            submitted_payload=save_payload,
+        ordinary_codes, nested_codes = self._partition_readback_required_codes(
+            submitted, required_codes
         )
+        if ordinary_codes or not nested_codes:
+            self._assert_detail_values(
+                detail_body,
+                submitted,
+                required_codes=ordinary_codes,
+                business_id=business_id,
+                record_markers=record_markers,
+                detail_request=detail_response.request,
+                submitted_payload=save_payload,
+            )
+        nested_payload = detail_body
+        if nested_codes:
+            nested_identity_codes = {
+                re.sub(r"(?<=\.)\d+(?=\.|$)", "*", item.get("code", ""))
+                for item in self._current_nested_evidence(submitted)
+                if self._nested_evidence_targets_code(item, nested_codes)
+                and item.get("code")
+            }
+            associated_records = self._strict_detail_record_dicts(
+                detail_body,
+                nested_identity_codes or nested_codes,
+                DETAIL_DISPLAY_ALIASES,
+                business_id=business_id,
+                record_markers=record_markers,
+                detail_request=detail_response.request,
+            )
+            if not associated_records:
+                raise AssertionError(
+                    "详情响应没有持久化嵌套行字段："
+                    "无法在本轮关联记录中定位嵌套字段"
+                )
+            nested_payload = associated_records
         self._assert_nested_values_in_payload(
-            detail_body,
+            nested_payload,
             stage="详情响应",
             submitted=submitted,
-            required_codes=required_codes,
+            required_codes=nested_codes,
         )
         return detail_body
 
@@ -842,6 +921,11 @@ class ModuleSmokeDriver:
         echo_values = list(record_markers)
         readback_required_codes = self._stable_readback_required_codes(
             submitted, required_codes
+        )
+        ordinary_readback_codes, nested_readback_codes = (
+            self._partition_readback_required_codes(
+                submitted, readback_required_codes
+            )
         )
         record_identity_payload = self._saved_record_identity_payload(
             responses, save_response.json(), business_id
@@ -989,7 +1073,7 @@ class ModuleSmokeDriver:
                 )
         detail_expectations = self._submitted_detail_expectations(
             submitted,
-            readback_required_codes,
+            ordinary_readback_codes,
             detail_payload=detail_body,
         )
         if not direct_edit_opened:
@@ -1026,12 +1110,14 @@ class ModuleSmokeDriver:
             )
         self._assert_open_form_values(
             submitted,
-            required_codes=readback_required_codes,
+            required_codes=ordinary_readback_codes,
             display_values={
                 code: expected for code, (_label, expected) in detail_expectations.items()
             },
         )
-        self._assert_nested_values_in_open_form()
+        self._assert_nested_values_in_open_form(
+            submitted=submitted, required_codes=nested_readback_codes
+        )
         return ModuleSmokeResult(
             mode="add_edit_and_detail_verified",
             business_id=business_id,
@@ -1078,6 +1164,7 @@ class ModuleSmokeDriver:
         missing = self._missing_detail_required_codes(
             detail_body,
             required_codes,
+            submitted=submitted,
             business_id=business_id,
             record_markers=record_markers,
             detail_request=detail_response.request,
@@ -1086,20 +1173,22 @@ class ModuleSmokeDriver:
             return None
         return detail_body
 
-    @classmethod
     def _missing_detail_required_codes(
-        cls,
+        self,
         payload: Any,
         required_codes: set[str] | None,
         *,
+        submitted: dict[str, Any] | None = None,
         business_id: str,
         record_markers: tuple[str, ...],
         detail_request,
     ) -> set[str]:
-        required = set(required_codes or ())
+        required, _nested = self._partition_readback_required_codes(
+            submitted or {}, required_codes
+        )
         if not required:
             return set()
-        records = cls._strict_detail_record_dicts(
+        records = self._strict_detail_record_dicts(
             payload,
             required,
             DETAIL_DISPLAY_ALIASES,
@@ -1111,7 +1200,7 @@ class ModuleSmokeDriver:
             code
             for code in required
             if not any(
-                cls._detail_field_values(record, code, DETAIL_DISPLAY_ALIASES)
+                self._detail_field_values(record, code, DETAIL_DISPLAY_ALIASES)
                 for record in records
             )
         }
@@ -2370,9 +2459,16 @@ class ModuleSmokeDriver:
         except TypeError:
             # Keep compatibility with injected scanners used by local contract tests.
             dom_fields = scan_dom_fields(self.page)
+        trusted_candidates: dict[str, tuple[str, str]] = {}
         for index, dom in enumerate(dom_fields, start=1):
-            source_code, _source_label, *_ = self._source_for_dom(dom, index)
-            field_code = source_code if self._is_generated_identifier(dom.field_code) else dom.field_code
+            (
+                field_code,
+                _field_label,
+                _qcc_remote,
+                _source_code,
+                _source_label,
+                identity_safe,
+            ) = self._runtime_identity_for_dom(dom, index)
             if (
                 field_code not in submitted
                 or (required is not None and field_code not in required)
@@ -2382,6 +2478,22 @@ class ModuleSmokeDriver:
                 }
             ):
                 continue
+            trusted_identity = (
+                not self._is_generated_identifier(dom.field_code)
+                or identity_safe
+            )
+            if not trusted_identity:
+                continue
+            candidate = (str(dom.selector or ""), str(dom.kind or ""))
+            if field_code in trusted_candidates:
+                previous = trusted_candidates[field_code]
+                raise AssertionError(
+                    "编辑表单字段身份歧义："
+                    f"{field_code} 匹配多个可信控件："
+                    f"{previous[0]}({previous[1]}), "
+                    f"{candidate[0]}({candidate[1]})"
+                )
+            trusted_candidates[field_code] = candidate
             actual_values = self._open_form_field_values(dom, scope)
             expected = (display_values or {}).get(field_code, submitted[field_code])
             if actual_values or (
@@ -2901,7 +3013,7 @@ class ModuleSmokeDriver:
         self, specs: tuple[Any, ...], *, response_start: int = 0,
     ) -> None:
         deadline = time.monotonic() + max(
-            1, int(os.getenv("EI_UNIQUE_LIST_TIMEOUT_MS", "10000"))
+            1, int(os.getenv("EI_UNIQUE_LIST_TIMEOUT_MS", "30000"))
         ) / 1000
         while time.monotonic() < deadline:
             if all(
@@ -4378,7 +4490,7 @@ class ModuleSmokeDriver:
         self, submitted: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         evidence: list[dict[str, str]] = []
-        for item in self._nested_evidence:
+        for item in getattr(self, "_nested_evidence", []):
             current = self._nested_submitted_value(item, submitted)
             value = item.get("value", "")
             if current not in (None, "", []):
@@ -4523,8 +4635,7 @@ class ModuleSmokeDriver:
                     )
         return nested_submitted
 
-    def _prepare_nested_operation(self, scope) -> dict[str, Any]:
-        nested_submitted: dict[str, Any] = {}
+    def _selected_nested_operations(self) -> list[tuple[str, str]]:
         raw_paths = os.getenv("EI_ACTION_PATHS_JSON", "").strip()
         if raw_paths:
             try:
@@ -4539,21 +4650,29 @@ class ModuleSmokeDriver:
         else:
             raw_path = os.getenv("EI_ACTION_PATH", "").strip()
             if not raw_path:
-                return nested_submitted
+                return []
             try:
                 paths = [json.loads(raw_path)]
             except json.JSONDecodeError as exc:
                 raise AssertionError(f"EI_ACTION_PATH 不是有效 JSON：{exc}") from exc
-        operations = []
+        operations: list[tuple[str, str]] = []
         for steps in paths:
             if isinstance(steps, list) and len(steps) >= 3:
-                operations.extend(zip(steps[1::2], steps[2::2]))
+                operations.extend(
+                    (str(section), str(action))
+                    for section, action in zip(steps[1::2], steps[2::2])
+                )
+        return operations
+
+    def _prepare_nested_operation(self, scope) -> dict[str, Any]:
+        nested_submitted: dict[str, Any] = {}
+        operations = self._selected_nested_operations()
         for section, action in operations:
-            title = scope.get_by_text(str(section), exact=True).last
+            title = scope.get_by_text(section, exact=True).last
             title.wait_for(state="visible", timeout=10_000)
             title.scroll_into_view_if_needed()
             section_scope = self._nested_section_scope(title, section)
-            collection_spec = self._configured_collection_for_section(str(section))
+            collection_spec = self._configured_collection_for_section(section)
             if collection_spec is not None:
                 rows = section_scope.locator(collection_spec.item_selector)
             else:
@@ -4564,8 +4683,8 @@ class ModuleSmokeDriver:
                     ".el-table__row"
                 )
             before_rows = rows.count()
-            if str(action).startswith(NESTED_ADD_ACTIONS):
-                button = section_scope.get_by_role("button", name=str(action), exact=True).first
+            if action.startswith(NESTED_ADD_ACTIONS):
+                button = section_scope.get_by_role("button", name=action, exact=True).first
                 button.wait_for(state="visible", timeout=10_000)
                 button.click()
                 after_rows = self._wait_for_row_count_change(rows, before_rows, increase=True)
@@ -4574,60 +4693,14 @@ class ModuleSmokeDriver:
                         f"嵌套操作“{section} / {action}”已点击，但表格行数未增加："
                         f"before={before_rows}, after={after_rows}"
                     )
-                created_row = rows.nth(after_rows - 1)
-                if collection_spec is not None:
-                    row_submitted = self._fill_configured_collection_row(
-                        collection_spec, created_row, after_rows - 1
-                    )
-                    row_fill_failures: list[str] = []
-                else:
-                    row_submitted = self._fill_dialog(dom_scope=created_row)
-                    row_fill_failures = list(self._fill_failures)
-                row_fields = scan_dom_fields(self.page, created_row)
-                if not row_fields:
-                    raise AssertionError(
-                        f"嵌套操作“{section} / {action}”新增了表格行，但没有发现可编辑字段"
-                    )
-                empty_required = [
-                    field.label or field.field_code
-                    for field in row_fields
-                    if field.required and not self._dom_field_has_value(field)
-                ]
-                if row_fill_failures or empty_required:
-                    details = [*row_fill_failures, *empty_required]
-                    raise AssertionError(
-                        f"嵌套操作“{section} / {action}”新增行未填写完整："
-                        + "; ".join(details)
-                    )
-                if not row_submitted:
-                    raise AssertionError(
-                        f"嵌套操作“{section} / {action}”新增行没有形成提交字段证据"
-                    )
-                nested_submitted.update({
-                    self._nested_submitted_key(str(section), code): value
-                    for code, value in row_submitted.items()
-                })
-                if collection_spec is not None:
-                    self._remember_configured_collection_evidence(
-                        collection_spec, str(section), after_rows - 1, row_submitted
-                    )
-                else:
-                    for index, field in enumerate(row_fields, 1):
-                        code, label, *_ = self._runtime_identity_for_nested_dom(
-                            field, index
-                        )
-                        value = row_submitted.get(code)
-                        if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
-                            self._remember_nested_evidence(
-                                section=str(section),
-                                field=label or code,
-                                code=code,
-                                value=value,
-                                submitted_key=self._nested_submitted_key(
-                                    str(section), code
-                                ),
-                            )
-            elif str(action).startswith(NESTED_DESTRUCTIVE_ACTIONS):
+                nested_submitted.update(self._prepare_nested_row_submission(
+                    section=section,
+                    action=action,
+                    collection_spec=collection_spec,
+                    row=rows.nth(after_rows - 1),
+                    row_index=after_rows - 1,
+                ))
+            elif action.startswith(NESTED_DESTRUCTIVE_ACTIONS):
                 add = section_scope.get_by_role(
                     "button", name=re.compile(r"^(新增|添加|新建|创建)$")
                 ).first
@@ -4636,7 +4709,20 @@ class ModuleSmokeDriver:
                 created_rows = self._wait_for_row_count_change(rows, before_rows, increase=True)
                 if created_rows <= before_rows:
                     raise AssertionError(f"无法为嵌套删除创建自动化临时行：{section}")
-                if before_rows == 0:
+                if before_rows == 0 and (
+                    collection_spec is None
+                    or getattr(collection_spec, "create_on_outer_add", True)
+                ):
+                    # The first row is the legal retained baseline.  Fill it
+                    # before creating and deleting the temporary row so the
+                    # outer form remains submittable after the deletion.
+                    nested_submitted.update(self._prepare_nested_row_submission(
+                        section=section,
+                        action=action,
+                        collection_spec=collection_spec,
+                        row=rows.nth(created_rows - 1),
+                        row_index=created_rows - 1,
+                    ))
                     add.click()
                     second_count = self._wait_for_row_count_change(
                         rows, created_rows, increase=True
@@ -4645,7 +4731,7 @@ class ModuleSmokeDriver:
                         raise AssertionError(f"无法为必填嵌套分区保留可保存行：{section}")
                     created_rows = second_count
                 created_row = rows.nth(created_rows - 1)
-                delete = created_row.get_by_role("button", name=str(action), exact=True).first
+                delete = created_row.get_by_role("button", name=action, exact=True).first
                 delete.wait_for(state="visible", timeout=10_000)
                 delete.click()
                 confirm = self.page.locator(
@@ -4662,7 +4748,7 @@ class ModuleSmokeDriver:
                         f"before={created_rows}, after={remaining_rows}"
                     )
             else:
-                button = section_scope.get_by_role("button", name=str(action), exact=True).first
+                button = section_scope.get_by_role("button", name=action, exact=True).first
                 button.wait_for(state="visible", timeout=10_000)
                 responses = []
                 self.page.on("response", lambda response: responses.append(response))
@@ -4683,6 +4769,66 @@ class ModuleSmokeDriver:
                         f"嵌套操作“{section} / {action}”已点击，但未观察到业务效果"
                     )
             self.page.wait_for_timeout(1_000)
+        return nested_submitted
+
+    def _prepare_nested_row_submission(
+        self,
+        *,
+        section: str,
+        action: str,
+        collection_spec: DynamicCollectionSpec | None,
+        row,
+        row_index: int,
+    ) -> dict[str, Any]:
+        """Fill one nested row and retain only evidence for that physical row."""
+        if collection_spec is not None:
+            row_submitted = self._fill_configured_collection_row(
+                collection_spec, row, row_index
+            )
+            row_fill_failures: list[str] = []
+        else:
+            row_submitted = self._fill_dialog(dom_scope=row)
+            row_fill_failures = list(getattr(self, "_fill_failures", ()))
+        row_fields = scan_dom_fields(self.page, row)
+        if not row_fields:
+            raise AssertionError(
+                f"嵌套操作“{section} / {action}”新增了表格行，但没有发现可编辑字段"
+            )
+        empty_required = [
+            field.label or field.field_code
+            for field in row_fields
+            if field.required and not self._dom_field_has_value(field)
+        ]
+        if row_fill_failures or empty_required:
+            details = [*row_fill_failures, *empty_required]
+            raise AssertionError(
+                f"嵌套操作“{section} / {action}”新增行未填写完整："
+                + "; ".join(details)
+            )
+        if not row_submitted:
+            raise AssertionError(
+                f"嵌套操作“{section} / {action}”新增行没有形成提交字段证据"
+            )
+        nested_submitted = {
+            self._nested_submitted_key(section, code): value
+            for code, value in row_submitted.items()
+        }
+        if collection_spec is not None:
+            self._remember_configured_collection_evidence(
+                collection_spec, section, row_index, row_submitted
+            )
+        else:
+            for index, field in enumerate(row_fields, 1):
+                code, label, *_ = self._runtime_identity_for_nested_dom(field, index)
+                value = row_submitted.get(code)
+                if field.kind in {"text", "textarea", "number"} and value not in (None, ""):
+                    self._remember_nested_evidence(
+                        section=section,
+                        field=label or code,
+                        code=code,
+                        value=value,
+                        submitted_key=self._nested_submitted_key(section, code),
+                    )
         return nested_submitted
 
     @staticmethod
@@ -4892,9 +5038,33 @@ class ModuleSmokeDriver:
             str(item.get("code", "")).strip(),
             str(item.get("submitted_key", "")).strip(),
         } - {""}
+
+        def normalized_path(value: str) -> str:
+            normalized = re.sub(
+                r"\$\{[^}]+\}|(?<=\.)\d+(?=\.|$)", "*", value
+            )
+            return normalized.strip(".").lower()
+
+        def matches(candidate: str, required: str) -> bool:
+            if (
+                cls._source_code_matches_runtime(candidate, required)
+                or cls._source_code_matches_runtime(required, candidate)
+            ):
+                return True
+            candidate_path = normalized_path(candidate)
+            required_path = normalized_path(required)
+            return bool(
+                candidate_path
+                and required_path
+                and (
+                    candidate_path == required_path
+                    or required_path.endswith(f".{candidate_path}")
+                    or candidate_path.endswith(f".{required_path}")
+                )
+            )
+
         return any(
-            cls._source_code_matches_runtime(candidate, required)
-            or cls._source_code_matches_runtime(required, candidate)
+            matches(candidate, required)
             for candidate in candidates
             for required in required_codes
         )
@@ -4944,8 +5114,19 @@ class ModuleSmokeDriver:
                 item["field"] = stable[1] or item.get("field", "")
             item["value"] = next(iter(current_values))
 
-    def _assert_nested_values_in_open_form(self) -> None:
-        for item in self._current_nested_evidence():
+    def _assert_nested_values_in_open_form(
+        self,
+        *,
+        submitted: dict[str, Any] | None = None,
+        required_codes: set[str] | None = None,
+    ) -> None:
+        evidence = self._current_nested_evidence(submitted)
+        if required_codes is not None:
+            evidence = [
+                item for item in evidence
+                if self._nested_evidence_targets_code(item, required_codes)
+            ]
+        for item in evidence:
             title = self.page.get_by_text(item["section"], exact=True).last
             title.wait_for(state="visible", timeout=10_000)
             section_scope = title.locator("xpath=ancestor::*[.//button or .//table][1]")
@@ -7172,6 +7353,11 @@ class ModuleSmokeDriver:
                 field_name=child.label or field_code,
                 field_type=TYPE_BY_KIND.get(child.kind, "TEXT"),
                 required=child.required,
+                props=(
+                    {"maxlength": child.max_length}
+                    if child.max_length is not None
+                    else {}
+                ),
                 source="dynamic-collection-manifest",
             )
             dom = DomField(
@@ -7180,6 +7366,7 @@ class ModuleSmokeDriver:
                 kind=child.kind,
                 selector=child.selector,
                 required=child.required,
+                maxlength=child.max_length,
             )
             resolved = ResolvedField(definition, dom)
             if child.kind == "number":
@@ -7288,16 +7475,40 @@ class ModuleSmokeDriver:
                     f"动态字段值关系无法安全调整：{left_code} lte {right_code}"
                 )
 
-    def _assert_configured_dynamic_collection_controls(self, scope) -> None:
-        """Refuse to submit when a configured collection exposes an unknown child."""
+    def _configured_collection_validation_plan(
+        self, *, include_nested_operations: bool,
+    ) -> tuple[tuple[DynamicCollectionSpec, bool], ...]:
+        planned: dict[str, tuple[DynamicCollectionSpec, bool]] = {}
         for spec in getattr(self, "dynamic_collections", ()):
+            if getattr(spec, "create_on_outer_add", True):
+                planned[spec.field_code] = (spec, True)
+        if include_nested_operations:
+            for section, action in self._selected_nested_operations():
+                spec = self._configured_collection_for_section(section)
+                if spec is None:
+                    continue
+                require_min_rows = action.startswith(NESTED_ADD_ACTIONS)
+                current = planned.get(spec.field_code)
+                planned[spec.field_code] = (
+                    spec,
+                    require_min_rows or bool(current and current[1]),
+                )
+        return tuple(planned.values())
+
+    def _assert_configured_dynamic_collection_controls(
+        self, scope, *, include_nested_operations: bool = False,
+    ) -> None:
+        """Validate only collections active in the current outer/nested lifecycle."""
+        for spec, require_min_rows in self._configured_collection_validation_plan(
+            include_nested_operations=include_nested_operations
+        ):
             root = scope.locator(spec.root_selector).first
             if not root.count() or not root.is_visible():
                 raise DynamicFieldContractError(
                     f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
                 )
             rows = self._configured_collection_rows(root, spec)
-            if len(rows) < spec.min_rows:
+            if require_min_rows and len(rows) < spec.min_rows:
                 raise DynamicFieldContractError(
                     f"动态字段契约缺失：{spec.field_code} 未渲染最少明细行"
                 )
@@ -7836,12 +8047,37 @@ class ModuleSmokeDriver:
             if not has_value and not has_semantic_choice_value:
                 target = not_filled if field.required else optional_not_filled
                 target.append(self._field_display(code, label))
+        persistence_failures = self._configured_collection_length_failures(submitted)
         return FieldCompletionReport(
             [], self._deduplicate(not_filled),
-            self._deduplicate(list(fill_failed or [])),
+            self._deduplicate(list(fill_failed or []) + persistence_failures),
             self._deduplicate(optional_not_filled),
             self._deduplicate(getattr(self, "_optional_fill_failures", [])),
         )
+
+    def _configured_collection_length_failures(
+        self, submitted: dict[str, Any],
+    ) -> list[str]:
+        """Reject dynamic child values that exceed a confirmed persistence limit."""
+        failures: list[str] = []
+        for spec in getattr(self, "dynamic_collections", ()):
+            for child in spec.children:
+                maximum = child.max_length
+                if maximum is None:
+                    continue
+                pattern = re.escape(child.field_code_template).replace(
+                    r"\{index\}", r"\d+"
+                )
+                for field_code, value in submitted.items():
+                    if not isinstance(value, str) or not re.fullmatch(pattern, field_code):
+                        continue
+                    if len(value) <= maximum:
+                        continue
+                    failures.append(
+                        f"{self._field_display(field_code, child.label or field_code)}: "
+                        f"长度 {len(value)} 超过已确认持久化上限 {maximum}"
+                    )
+        return self._deduplicate(failures)
 
     def _source_field_is_visible(self, label: str) -> bool:
         try:
@@ -8332,10 +8568,15 @@ class ModuleSmokeDriver:
         later controls onto the wrong source fields.
         """
 
-        if not self._is_generated_identifier(dom.field_code):
-            return True
         if not source_code or self._is_generated_identifier(source_code):
             return False
+        if (
+            is_semantic_numeric_field(source_code, source_label)
+            and dom.kind not in {"text", "number"}
+        ):
+            return False
+        if not self._is_generated_identifier(dom.field_code):
+            return True
         label = (dom.label or "").strip()
         if self._generated_choice_source_identity_safe(dom, source_code, source_label):
             return True

@@ -117,6 +117,34 @@ class FieldInteractor:
                     f"Field is not editable: {definition.field_code} ({definition.field_name})"
                 )
             locator.fill(str(value))
+            # Browsers may enforce maxlength without raising.  The value used for
+            # request matching and later readback must be the value that the
+            # control retained, not the longer value that was requested.
+            if kind in {"text", "textarea"}:
+                try:
+                    actual = str(locator.input_value())
+                except Exception:
+                    return value
+                requested = str(value)
+                if actual != requested:
+                    maxlength = getattr(field.dom, "maxlength", None)
+                    if maxlength is None:
+                        maxlength = definition.props.get("maxlength")
+                    try:
+                        limit = int(maxlength)
+                    except (TypeError, ValueError):
+                        limit = None
+                    if not (
+                        limit is not None
+                        and len(requested) > limit
+                        and actual == requested[:limit]
+                    ):
+                        raise AssertionError(
+                            "Text control did not retain the requested value: "
+                            f"{definition.field_code}; requested_length={len(requested)}, "
+                            f"actual_length={len(actual)}"
+                        )
+                return actual
             return value
         if kind in {"select", "multi_select", "user_select", "org_select", "tree_select"}:
             return self._select(locator, value)

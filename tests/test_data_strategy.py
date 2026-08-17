@@ -99,6 +99,48 @@ def test_probe_is_reproducible_with_same_run_id():
     assert first == second
 
 
+def test_generated_enterprise_name_respects_maxlength_and_remains_deterministic():
+    definition = normalize_field(
+        {
+            "fieldCode": "companyName",
+            "fieldName": "企业名称",
+            "fieldType": "ElInput-TEXT",
+            "propsJson": json.dumps({"maxlength": 50}),
+        },
+        "test",
+    )
+    run_id = "20260817201810771600_8ae58af3_1_e1ccf050f9ce"
+
+    first = ProbeDataStrategy(pool(), run_id).value_for(definition, 1)
+    second = ProbeDataStrategy(pool(), run_id).value_for(definition, 1)
+
+    assert first
+    assert len(first) <= 50
+    assert first.endswith("_1")
+    assert first == second
+
+
+@pytest.mark.parametrize("semantic", ["mobile", "email", "creditCode"])
+def test_structured_string_generators_are_not_blindly_truncated(semantic):
+    definition = normalize_field(
+        {
+            "fieldCode": semantic,
+            "fieldName": semantic,
+            "fieldType": "ElInput-TEXT",
+            "propsJson": json.dumps({"maxlength": 5}),
+        },
+        "test",
+    )
+
+    value = ConstrainedGenerator(pool().common, "20260817201810").generate(
+        semantic, definition, 1
+    )
+
+    assert len(value) > 5
+    if semantic == "email":
+        assert "@" in value
+
+
 def test_visible_business_item_id_uses_numeric_identifier():
     strategy = ProbeDataStrategy(pool(), "20260731153000")
 

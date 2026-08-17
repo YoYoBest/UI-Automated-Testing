@@ -123,6 +123,7 @@ def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_ch
     assert [child.column_header for child in by_code["entInvestList"].children] == [
         "企业名称", "持股比例(%)", "投资额(万元)", "投资额(万元)"
     ]
+    assert by_code["entInvestList"].children[0].max_length == 50
     assert [
         (
             relation.left_field_template,
@@ -159,6 +160,32 @@ def test_load_dynamic_collection_specs_rejects_incomplete_matching_contract(tmp_
     )
 
     with pytest.raises(ValueError):
+        load_dynamic_collection_specs(tmp_path, form_code="FORM_A")
+
+
+@pytest.mark.parametrize("max_length", [0, -1, "invalid"])
+def test_dynamic_collection_child_rejects_invalid_max_length(
+    tmp_path, max_length,
+):
+    (tmp_path / "dynamic_collections.json").write_text(
+        json.dumps({"collections": [{
+            "formCode": "FORM_A",
+            "fieldCode": "items",
+            "mode": "add-row",
+            "rootSelector": ".root",
+            "createSelector": ".add",
+            "itemSelector": ".row",
+            "minRows": 1,
+            "children": [{
+                "fieldCodeTemplate": "items.{index}.name",
+                "selector": "input",
+                "maxLength": max_length,
+            }],
+        }]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="maxLength 必须是正整数"):
         load_dynamic_collection_specs(tmp_path, form_code="FORM_A")
 
 

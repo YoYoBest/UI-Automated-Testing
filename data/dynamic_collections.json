@@ -99,7 +99,8 @@
           "columnHeader": "企业名称",
           "selector": "input",
           "kind": "text",
-          "label": "被投资企业名称"
+          "label": "被投资企业名称",
+          "maxLength": 50
         },
         {
           "fieldCodeTemplate": "entInvestList.{index}.fundedRatio",

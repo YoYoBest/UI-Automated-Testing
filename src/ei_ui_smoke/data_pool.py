@@ -240,7 +240,10 @@ class ConstrainedGenerator:
         if semantic in {"amount", "percentage"}:
             return self._decimal_in_range(config)
         if semantic == "enterpriseName":
-            return f"{config.get('prefix', 'UI自动化测试企业')}_{self.run_id}_{index}"
+            return self._respect_text_maxlength(
+                f"{config.get('prefix', 'UI自动化测试企业')}_{self.run_id}_{index}",
+                field,
+            )
         if semantic == "businessIdentifier":
             digits = re.sub(r"\D", "", self.run_id) or "1"
             width = max(6, int(config.get("digits", 16)))
@@ -265,8 +268,25 @@ class ConstrainedGenerator:
             return ""
         if kind in {"file", "image", "file_library", "formula", "ai_parse"}:
             return None
-        prefix = ((self.common.get("generators") or {}).get("text") or {}).get("prefix", "UI自动化")
-        return f"{prefix}_{self.run_id}_{index}"
+        prefix = ((self.common.get("generators") or {}).get("text") or {}).get(
+            "prefix", "UI自动化"
+        )
+        return self._respect_text_maxlength(
+            f"{prefix}_{self.run_id}_{index}", field
+        )
+
+    @staticmethod
+    def _respect_text_maxlength(value: str, field: FieldDefinition) -> str:
+        raw_maximum = field.props.get("maxlength", field.props.get("maxLength"))
+        try:
+            maximum = int(raw_maximum)
+        except (TypeError, ValueError):
+            return value
+        if maximum < 1 or len(value) <= maximum:
+            return value
+        head_length = (maximum + 1) // 2
+        tail_length = maximum - head_length
+        return value[:head_length] + (value[-tail_length:] if tail_length else "")
 
     def _decimal_in_range(self, config: dict[str, Any]) -> float:
         low = Decimal(str(config.get("min", 1)))

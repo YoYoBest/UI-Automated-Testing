@@ -329,6 +329,124 @@ def test_persisted_parent_business_id_scans_later_parent_page(monkeypatch):
     ) is target
 
 
+def test_parent_page_navigation_accepts_changed_rows_when_active_aria_is_unavailable():
+    class Current:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class Pagination:
+        @staticmethod
+        def locator(_selector):
+            return Current()
+
+    class Records:
+        @staticmethod
+        def all_inner_texts():
+            return ["parent-3"]
+
+    class Page:
+        @staticmethod
+        def locator(selector):
+            assert selector == detail_navigation._PARENT_RECORD_SELECTOR
+            return Records()
+
+    assert detail_navigation._parent_page_navigation_observed(
+        Page(), Pagination(), 3, ("parent-1",)
+    ) == (True, False)
+
+
+def test_parent_page_jump_accepts_active_number_without_fixed_aria_label(monkeypatch):
+    state = {"page": 1}
+
+    class Jump:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def fill(_value):
+            return None
+
+        @staticmethod
+        def press(_key):
+            state["page"] = 3
+
+    class Current:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return int(state["page"] == 3)
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def get_attribute(_name):
+            return None
+
+        @staticmethod
+        def inner_text():
+            return "3"
+
+    class Pagination:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def locator(selector):
+            if selector == detail_navigation._PARENT_PAGE_JUMP_SELECTOR:
+                return Jump()
+            return Current()
+
+    class Records:
+        @staticmethod
+        def all_inner_texts():
+            return ["same-rendered-text"]
+
+    class Page:
+        url = "https://example.test/list"
+
+        @staticmethod
+        def locator(selector):
+            if selector == detail_navigation._PARENT_PAGINATION_SELECTOR:
+                return Pagination()
+            if selector == detail_navigation._PARENT_RECORD_SELECTOR:
+                return Records()
+            return _EmptyDetailAction()
+
+        @staticmethod
+        def wait_for_timeout(_milliseconds):
+            return None
+
+    page = Page()
+    monkeypatch.setattr(
+        detail_navigation,
+        "_wait_for_parent_records_ready",
+        lambda _page, **kwargs: ("ready", kwargs["different_from"]),
+    )
+
+    assert detail_navigation._goto_parent_record_page(
+        page, 3, ("same-rendered-text",)
+    ) == ("ready", None)
+
+
 def test_project_progress_decision_filter_uses_list_query_before_opening_record(monkeypatch):
     calls = []
 

@@ -1,3 +1,5 @@
+import pytest
+
 from ei_ui_smoke.interactions import FIELD_LABEL_SELECTORS, FieldInteractor
 from ei_ui_smoke.models import DomField, FieldDefinition, ResolvedField
 
@@ -24,6 +26,9 @@ class FakeLocator:
     def fill(self, value):
         self.fill_calls.append(value)
 
+    def input_value(self):
+        return self.fill_calls[-1] if self.fill_calls else ""
+
 
 def test_fill_routes_readonly_numeric_labeled_combobox_to_select(monkeypatch):
     locator = FakeLocator(role="combobox", readonly="", editable=False, classes="el-select__input")
@@ -49,6 +54,36 @@ def test_fill_fails_fast_for_genuinely_readonly_text_control(monkeypatch):
     else:
         raise AssertionError("readonly text control should fail before locator.fill")
     assert locator.fill_calls == []
+
+
+def test_fill_returns_effective_maxlength_truncated_text_value(monkeypatch):
+    class TruncatingLocator(FakeLocator):
+        def input_value(self):
+            return self.fill_calls[-1][:5]
+
+    locator = TruncatingLocator()
+    interactor = FieldInteractor(object())
+    monkeypatch.setattr(interactor, "locate", lambda _field: locator)
+    field = ResolvedField(
+        FieldDefinition("buildScale", "建设规模", "TEXT"),
+        DomField("buildScale", "建设规模", "text", "#scale", maxlength=5),
+    )
+
+    assert interactor.fill(field, "123456") == "12345"
+
+
+def test_fill_rejects_unexplained_text_value_mismatch(monkeypatch):
+    class MismatchedLocator(FakeLocator):
+        def input_value(self):
+            return "old-value"
+
+    locator = MismatchedLocator()
+    interactor = FieldInteractor(object())
+    monkeypatch.setattr(interactor, "locate", lambda _field: locator)
+    field = ResolvedField(FieldDefinition("name", "名称", "TEXT"))
+
+    with pytest.raises(AssertionError, match="did not retain"):
+        interactor.fill(field, "new-value")
 
 
 def test_fill_routes_date_to_picker_without_manual_input(monkeypatch):

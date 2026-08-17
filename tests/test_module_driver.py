@@ -1009,7 +1009,9 @@ def test_verify_saved_record_passes_required_codes_to_edit_form_assertion(monkey
     })()
     monkeypatch.setattr(driver, "_assert_business_success", lambda body, operation="新增": None)
     monkeypatch.setattr(driver, "_assert_nested_values_in_payload", lambda payload, **_kwargs: None)
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(driver, "_open_detail", lambda markers, business_id: None)
     monkeypatch.setattr(driver, "_current_detail_edit_button", lambda markers: edit)
     monkeypatch.setattr(
@@ -1035,6 +1037,70 @@ def test_verify_saved_record_passes_required_codes_to_edit_form_assertion(monkey
 
     assert captured == {"required_codes": {"name"}}
     assert events == [("edit",), ("wait", 1_500)]
+
+
+def test_verify_saved_record_partitions_nested_codes_from_edit_form_readback(
+    monkeypatch,
+):
+    nested_code = "股权结构.ownershipStructureList.0.stockName"
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {
+        "wait_for_timeout": lambda self, timeout: None,
+    })()
+    driver.source_fields = [
+        ("name", "企业名称", False),
+        ("ownershipStructureList.*.stockName", "股东名称", False),
+    ]
+    driver._nested_evidence = [{
+        "section": "股权结构",
+        "field": "股东名称",
+        "code": "ownershipStructureList.0.stockName",
+        "submitted_key": nested_code,
+        "value": "AUTO_股东",
+    }]
+    save = JsonResponse(
+        "https://host/add", {"code": 200, "data": {"id": "record-1"}}
+    )
+    edit = type("Edit", (), {"click": lambda self: None})()
+    captured = {}
+    monkeypatch.setattr(
+        driver, "_assert_business_success", lambda body, operation="新增": None
+    )
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(driver, "_open_detail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(driver, "_current_detail_edit_button", lambda markers: edit)
+    monkeypatch.setattr(driver, "_find_detail_response", lambda *args: None)
+    monkeypatch.setattr(
+        driver,
+        "_assert_open_form_values",
+        lambda submitted, **kwargs: captured.update(
+            ordinary=kwargs["required_codes"]
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_assert_nested_values_in_open_form",
+        lambda **kwargs: captured.update(
+            nested=kwargs["required_codes"], nested_submitted=kwargs["submitted"]
+        ),
+    )
+    submitted = {"name": "AUTO_企业", nested_code: "AUTO_股东"}
+
+    driver.verify_saved_record(
+        [save],
+        save,
+        submitted,
+        ("AUTO_企业",),
+        required_codes=set(submitted),
+    )
+
+    assert captured == {
+        "ordinary": {"name"},
+        "nested": {nested_code},
+        "nested_submitted": submitted,
+    }
 
 
 def test_verify_saved_record_accepts_current_list_readback(monkeypatch):
@@ -1988,6 +2054,78 @@ def test_edit_form_values_only_compare_explicit_command_readback_fields(monkeypa
     )
 
 
+def test_edit_form_readback_rejects_generated_currency_as_amount_identity(
+    monkeypatch,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    scope = FormValueScope({
+        "#amount": "563861.1",
+        "#currency": "人民币",
+        "#other-text": "其他字段值",
+    })
+    driver.page = ValuePage({})
+    driver.source_fields = [
+        ("registAmount", "注册资本（万元）", False),
+        ("registAmountCcy", "币种", False),
+        ("businessScope", "经营范围", False),
+    ]
+    fields = [
+        DomField(
+            "el-id-11", "注册资本（万元）", "number", "#amount"
+        ),
+        DomField(
+            "el-id-12", "注册资本（万元）", "select", "#currency"
+        ),
+        DomField(
+            "el-id-13", "其他说明", "textarea", "#other-text"
+        ),
+    ]
+    monkeypatch.setattr(driver, "_wait_for_readback_form_scope", lambda: scope)
+    monkeypatch.setattr(driver, "_wait_for_form_ready", lambda _scope: None)
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields",
+        lambda _page, root=None: fields,
+    )
+
+    amount_identity = driver._runtime_identity_for_dom(fields[0], 1)
+    currency_identity = driver._runtime_identity_for_dom(fields[1], 2)
+    other_identity = driver._runtime_identity_for_dom(fields[2], 3)
+
+    assert amount_identity[0] == "registAmount"
+    assert amount_identity[-1]
+    assert currency_identity[0] == "el-id-12"
+    assert not currency_identity[-1]
+    assert other_identity[0] == "el-id-13"
+    assert not other_identity[-1]
+    driver._assert_open_form_values(
+        {"registAmount": "563861.1"},
+        required_codes={"registAmount"},
+    )
+
+
+def test_edit_form_readback_rejects_multiple_trusted_controls_for_one_code(
+    monkeypatch,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    scope = FormValueScope({"#name-1": "AUTO_name", "#name-2": "AUTO_name"})
+    driver.page = ValuePage({})
+    driver.source_fields = [("name", "名称", False)]
+    monkeypatch.setattr(driver, "_wait_for_readback_form_scope", lambda: scope)
+    monkeypatch.setattr(driver, "_wait_for_form_ready", lambda _scope: None)
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields",
+        lambda _page, root=None: [
+            DomField("name", "名称", "text", "#name-1"),
+            DomField("name", "名称", "text", "#name-2"),
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="字段身份歧义.*name.*多个可信控件"):
+        driver._assert_open_form_values(
+            {"name": "AUTO_name"}, required_codes={"name"}
+        )
+
+
 def test_fieldless_detail_response_defers_to_rendered_readback(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     response = object()
@@ -2322,7 +2460,9 @@ def test_saved_record_uses_partial_associated_list_to_open_exact_record(monkeypa
     monkeypatch.setattr(driver, "_find_detail_response", lambda *args: None)
     monkeypatch.setattr(driver, "_open_current_detail_edit_for_readback", lambda markers: True)
     monkeypatch.setattr(driver, "_assert_open_form_values", lambda *args, **kwargs: None)
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(driver, "_assert_rendered_detail_text", lambda *args, **kwargs: None)
 
     result = driver.verify_saved_record(
@@ -2410,7 +2550,9 @@ def test_saved_record_double_readback_runs_detail_then_edit(monkeypatch):
             ("edit-page", required_codes)
         ),
     )
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
 
     result = driver._verify_saved_record_in_edit_and_detail(
         [save, detail],
@@ -2465,7 +2607,9 @@ def test_saved_record_on_detail_route_can_use_embedded_record_row(monkeypatch):
             ("edit-page", required_codes)
         ),
     )
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
 
     result = driver._verify_saved_record_in_edit_and_detail(
         [save],
@@ -2541,7 +2685,9 @@ def test_double_readback_uses_partial_associated_list_to_open_embedded_edit(monk
     )
     monkeypatch.setattr(driver, "_find_detail_response", lambda *args: None)
     monkeypatch.setattr(driver, "_assert_open_form_values", lambda *args, **kwargs: events.append(("edit-readback", kwargs["required_codes"])))
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
 
     result = driver._verify_saved_record_in_edit_and_detail(
         [save, child_list],
@@ -2871,7 +3017,9 @@ def test_saved_record_uses_current_detail_page_and_its_edit_button(monkeypatch):
             ("edit-page", required_codes)
         ),
     )
-    monkeypatch.setattr(driver, "_assert_nested_values_in_open_form", lambda: None)
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
+    )
 
     result = driver._verify_saved_record_in_edit_and_detail(
         [save],
@@ -2889,6 +3037,79 @@ def test_saved_record_uses_current_detail_page_and_its_edit_button(monkeypatch):
         ("click-current-edit",),
         ("wait", 1_500),
         ("edit-page", {"name", "amount"}),
+    ]
+
+
+def test_double_readback_partitions_nested_codes_from_flat_detail_and_edit(
+    monkeypatch,
+):
+    nested_code = "股权结构.ownershipStructureList.0.stockName"
+    events = []
+
+    class EditButton:
+        @staticmethod
+        def click():
+            events.append("click-edit")
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {
+        "url": "https://host/resources/record-1",
+        "wait_for_timeout": lambda self, timeout: None,
+    })()
+    driver.source_fields = [
+        ("name", "企业名称", False),
+        ("ownershipStructureList.*.stockName", "股东名称", False),
+    ]
+    driver._nested_evidence = [{
+        "section": "股权结构",
+        "field": "股东名称",
+        "code": "ownershipStructureList.0.stockName",
+        "submitted_key": nested_code,
+        "value": "AUTO_股东",
+    }]
+    save = JsonResponse(
+        "https://host/add", {"code": 200, "data": {"id": "record-1"}}
+    )
+    submitted = {"name": "AUTO_企业", nested_code: "AUTO_股东"}
+    monkeypatch.setattr(
+        driver, "_current_detail_edit_button", lambda markers: EditButton()
+    )
+    monkeypatch.setattr(driver, "_find_detail_response", lambda *args: None)
+    monkeypatch.setattr(
+        driver,
+        "_assert_rendered_detail_text",
+        lambda expectations, *, all_fields=False: events.append(
+            ("detail", set(expectations))
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_assert_open_form_values",
+        lambda _submitted, **kwargs: events.append(
+            ("edit", kwargs["required_codes"])
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_assert_nested_values_in_open_form",
+        lambda **kwargs: events.append(("nested", kwargs["required_codes"])),
+    )
+
+    result = driver._verify_saved_record_in_edit_and_detail(
+        [save],
+        save,
+        submitted,
+        ("AUTO_企业",),
+        "record-1",
+        required_codes=set(submitted),
+    )
+
+    assert result.mode == "add_edit_and_detail_verified"
+    assert events == [
+        ("detail", {"name"}),
+        "click-edit",
+        ("edit", {"name"}),
+        ("nested", {nested_code}),
     ]
 
 
@@ -6658,6 +6879,545 @@ def test_configured_collection_can_remain_available_for_nested_actions_without_o
     assert driver._configured_collection_for_section("股权结构") is spec
 
 
+def test_nested_only_collection_validation_is_scoped_to_selected_action(monkeypatch):
+    ownership = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+    investment = DynamicCollectionSpec(
+        field_code="entInvestList",
+        mode="add-row",
+        root_selector=".investment",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="对外投资",
+        create_on_outer_add=False,
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [ownership, investment]
+
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "对外投资", "新增"]')
+
+    assert driver._configured_collection_validation_plan(
+        include_nested_operations=False
+    ) == ()
+    assert driver._configured_collection_validation_plan(
+        include_nested_operations=True
+    ) == ((investment, True),)
+
+
+def test_nested_add_requires_target_rows_but_not_unrelated_optional_collection(
+    monkeypatch,
+):
+    ownership = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+    investment = DynamicCollectionSpec(
+        field_code="entInvestList",
+        mode="add-row",
+        root_selector=".investment",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="对外投资",
+        create_on_outer_add=False,
+    )
+
+    class Root:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == ".investment"
+            return Root()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [ownership, investment]
+    driver._configured_collection_rows = lambda _root, _spec: []
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "对外投资", "新增"]')
+
+    driver._assert_configured_dynamic_collection_controls(object())
+    with pytest.raises(DynamicFieldContractError, match="entInvestList"):
+        driver._assert_configured_dynamic_collection_controls(
+            Scope(), include_nested_operations=True
+        )
+
+
+def test_nested_delete_allows_optional_target_to_return_to_zero_rows(monkeypatch):
+    spec = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+
+    class Root:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == ".ownership"
+            return Root()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    driver._configured_collection_rows = lambda _root, _spec: []
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "股权结构", "删除"]')
+
+    driver._assert_configured_dynamic_collection_controls(
+        Scope(), include_nested_operations=True
+    )
+
+
+def test_outer_required_collection_still_requires_minimum_rows():
+    spec = DynamicCollectionSpec(
+        field_code="riskItems",
+        mode="add-row",
+        root_selector=".risk-items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+    )
+
+    class Root:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == ".risk-items"
+            return Root()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    driver._configured_collection_rows = lambda _root, _spec: []
+
+    with pytest.raises(DynamicFieldContractError, match="riskItems.*未渲染最少明细行"):
+        driver._assert_configured_dynamic_collection_controls(Scope())
+
+
+def test_selected_optional_collection_still_requires_its_root(monkeypatch):
+    spec = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+
+    class MissingRoot:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == ".ownership"
+            return MissingRoot()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    monkeypatch.delenv("EI_ACTION_PATHS_JSON", raising=False)
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "股权结构", "删除"]')
+
+    with pytest.raises(
+        DynamicFieldContractError, match="ownershipStructureList.*未找到集合根节点"
+    ):
+        driver._assert_configured_dynamic_collection_controls(
+            Scope(), include_nested_operations=True
+        )
+
+
+def test_selected_optional_collection_still_validates_existing_row_controls(
+    monkeypatch,
+):
+    spec = DynamicCollectionSpec(
+        field_code="entInvestList",
+        mode="add-row",
+        root_selector=".investment",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(
+            DynamicCollectionChild(
+                "entInvestList.{index}.entName", "input", label="企业名称"
+            ),
+        ),
+        section_title="对外投资",
+        create_on_outer_add=False,
+    )
+
+    class Controls:
+        @staticmethod
+        def count():
+            return 0
+
+    class ChildScope:
+        @staticmethod
+        def locator(selector):
+            assert selector == "input"
+            return Controls()
+
+    class Root:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == ".investment"
+            return Root()
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    driver._configured_collection_rows = lambda _root, _spec: [object()]
+    driver._configured_collection_child_scope = (
+        lambda _row, _spec, _child, _index: ChildScope()
+    )
+    monkeypatch.delenv("EI_ACTION_PATHS_JSON", raising=False)
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "对外投资", "新增"]')
+
+    with pytest.raises(
+        DynamicFieldContractError, match="entInvestList.*子字段未唯一渲染"
+    ):
+        driver._assert_configured_dynamic_collection_controls(
+            Scope(), include_nested_operations=True
+        )
+
+
+def test_nested_delete_of_empty_optional_collection_uses_one_temporary_row(
+    monkeypatch,
+):
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "股权结构", "删除"]')
+    state = {"rows": 0, "add_clicks": 0}
+
+    class Title:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def scroll_into_view_if_needed():
+            return None
+
+    class DeleteButton:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def click():
+            state["rows"] -= 1
+
+    class Row:
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return DeleteButton()
+
+    class Rows:
+        @staticmethod
+        def count():
+            return state["rows"]
+
+        @staticmethod
+        def nth(_index):
+            return Row()
+
+    class AddButton:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def click():
+            state["rows"] += 1
+            state["add_clicks"] += 1
+
+    class Section:
+        @staticmethod
+        def locator(_selector):
+            return Rows()
+
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return AddButton()
+
+    class Confirmation:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Confirmation()
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+    class Scope:
+        @staticmethod
+        def get_by_text(*_args, **_kwargs):
+            return Title()
+
+    spec = DynamicCollectionSpec(
+        field_code="ownershipStructureList",
+        mode="add-row",
+        root_selector=".ownership",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="股权结构",
+        create_on_outer_add=False,
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page()
+    driver.dynamic_collections = [spec]
+    driver._nested_section_scope = lambda *_args: Section()
+    driver._wait_for_row_count_change = (
+        lambda *_args, **_kwargs: state["rows"]
+    )
+
+    assert driver._prepare_nested_operation(Scope()) == {}
+    assert state == {"rows": 0, "add_clicks": 1}
+
+
+def test_nested_delete_fills_retained_required_baseline_row(monkeypatch):
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增", "资金来源", "删除"]')
+    state = {"rows": 0, "add_clicks": 0}
+    filled_rows = []
+
+    class Title:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def scroll_into_view_if_needed():
+            return None
+
+    class DeleteButton:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def click():
+            state["rows"] -= 1
+
+    class Row:
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return DeleteButton()
+
+    class Rows:
+        @staticmethod
+        def count():
+            return state["rows"]
+
+        @staticmethod
+        def nth(_index):
+            return Row()
+
+    class AddButton:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+        @staticmethod
+        def click():
+            state["rows"] += 1
+            state["add_clicks"] += 1
+
+    class Section:
+        @staticmethod
+        def locator(_selector):
+            return Rows()
+
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return AddButton()
+
+    class Confirmation:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class Page:
+        @staticmethod
+        def locator(_selector):
+            return Confirmation()
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+    class Scope:
+        @staticmethod
+        def get_by_text(*_args, **_kwargs):
+            return Title()
+
+    spec = DynamicCollectionSpec(
+        field_code="financeSources",
+        mode="add-row",
+        root_selector=".finance",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(),
+        section_title="资金来源",
+        create_on_outer_add=True,
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page()
+    driver.dynamic_collections = [spec]
+    driver.source_fields = []
+    driver._nested_section_scope = lambda *_args: Section()
+    driver._wait_for_row_count_change = lambda *_args, **_kwargs: state["rows"]
+    driver._fill_configured_collection_row = (
+        lambda _spec, _row, row_index: filled_rows.append(row_index) or {
+            f"financeSources.{row_index}.sourceFrom": "财政资金"
+        }
+    )
+    driver._dom_field_has_value = lambda _field: True
+    driver._remember_configured_collection_evidence = lambda *_args: None
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields",
+        lambda _page, _row: [
+            DomField(
+                "financeSources.0.sourceFrom", "资金来源", "text", "input",
+                required=True,
+            )
+        ],
+    )
+
+    submitted = driver._prepare_nested_operation(Scope())
+
+    assert filled_rows == [0]
+    assert state == {"rows": 1, "add_clicks": 2}
+    assert submitted == {"资金来源.financeSources.0.sourceFrom": "财政资金"}
+
+
 def test_default_readback_excludes_values_filled_in_retained_collection_rows():
     driver = object.__new__(ModuleSmokeDriver)
     driver._collection_submission_codes = {"items"}
@@ -6699,7 +7459,11 @@ def test_configured_collection_row_preserves_existing_values_and_fills_only_empt
             "items.{index}.existing", "input", label="已有值", column_header="已有值"
         ),
         DynamicCollectionChild(
-            "items.{index}.missing", "input", label="空值", column_header="空值"
+            "items.{index}.missing",
+            "input",
+            label="空值",
+            column_header="空值",
+            max_length=50,
         ),
     )
     spec = DynamicCollectionSpec(
@@ -6726,20 +7490,20 @@ def test_configured_collection_row_preserves_existing_values_and_fills_only_empt
     )
     driver.data_strategy = type("Strategy", (), {
         "value_for": lambda self, definition, index: generated.append(
-            (definition.field_code, index)
+            (definition.field_code, index, definition.props.get("maxlength"))
         ) or "generated"
     })()
     driver.interactor = type("Interactor", (), {
         "fill": lambda self, resolved, value, *, root=None: filled.append(
-            (resolved.definition.field_code, value, root)
+            (resolved.definition.field_code, value, root, resolved.dom.maxlength)
         ) or value
     })()
 
     submitted = driver._fill_configured_collection_row(spec, object(), 2)
 
     assert submitted == {"items.2.missing": "generated"}
-    assert generated == [("items.2.missing", 2)]
-    assert filled == [("items.2.missing", "generated", scopes["空值"])]
+    assert generated == [("items.2.missing", 2, 50)]
+    assert filled == [("items.2.missing", "generated", scopes["空值"], 50)]
 
 
 def test_configured_collection_row_adjusts_only_generated_value_for_lte_relation():
@@ -7106,6 +7870,130 @@ def _unique_page_response(records, total):
         "https://host/netAsset/listPage",
         {"data": {"records": records, "total": total}},
     )
+
+
+def test_unique_list_capture_reloads_once_more_with_one_persistent_listener(
+    monkeypatch,
+):
+    spec = _net_asset_unique_spec()
+    response = _unique_page_response(
+        [{"id": "1", "belongSection": "1", "assetYear": 2027}], 1
+    )
+
+    class Page:
+        def __init__(self):
+            self.listener = None
+            self.reloads = 0
+            self.on_calls = 0
+            self.remove_calls = 0
+
+        def on(self, event, listener):
+            assert event == "response"
+            self.listener = listener
+            self.on_calls += 1
+
+        def remove_listener(self, event, listener):
+            assert event == "response"
+            assert listener is self.listener
+            self.remove_calls += 1
+
+        def reload(self, **_kwargs):
+            self.reloads += 1
+            if self.reloads == 2:
+                self.listener(response)
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    driver.data_strategy = type("Strategy", (), {
+        "declared_unique_constraints": staticmethod(lambda submitted=None: (spec,)),
+    })()
+    driver._unique_list_responses = []
+    driver._unique_list_listener = None
+    driver._unique_occupied_snapshot = {}
+    monkeypatch.setenv("EI_UNIQUE_LIST_TIMEOUT_MS", "1")
+
+    driver.prepare_unique_constraint_evidence()
+
+    assert page.reloads == 2
+    assert page.on_calls == 1
+    assert page.remove_calls == 1
+    assert driver._unique_occupied_snapshot[driver._unique_spec_key(spec)] == [
+        (frozenset({"1"}), frozenset({"2027"})),
+    ]
+
+
+def test_unique_list_capture_does_not_combine_partial_responses_across_attempts(
+    monkeypatch,
+):
+    first_spec = _net_asset_unique_spec()
+    second_spec = UniqueConstraintSpec(
+        form_code="SECOND_FORM",
+        field_codes=("name",),
+        repair_field="name",
+        message_includes=("已存在",),
+        list_url_includes=("/second/list",),
+        record_paths=("data.records",),
+    )
+    first_response = _unique_page_response(
+        [{"id": "1", "belongSection": "1", "assetYear": 2027}], 1
+    )
+    second_response = JsonResponse(
+        "https://host/second/list",
+        {"data": {"records": [{"id": "2", "name": "AUTO_name"}], "total": 1}},
+    )
+
+    class Page:
+        def __init__(self):
+            self.listener = None
+            self.reloads = 0
+            self.on_calls = 0
+            self.remove_calls = 0
+
+        def on(self, event, listener):
+            assert event == "response"
+            self.listener = listener
+            self.on_calls += 1
+
+        def remove_listener(self, event, listener):
+            assert event == "response"
+            assert listener is self.listener
+            self.remove_calls += 1
+
+        def reload(self, **_kwargs):
+            self.reloads += 1
+            self.listener(
+                first_response if self.reloads == 1 else second_response
+            )
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    driver.data_strategy = type("Strategy", (), {
+        "declared_unique_constraints": staticmethod(
+            lambda submitted=None: (first_spec, second_spec)
+        ),
+    })()
+    driver._unique_list_responses = []
+    driver._unique_list_listener = None
+    driver._unique_occupied_snapshot = {}
+    monkeypatch.setenv("EI_UNIQUE_LIST_TIMEOUT_MS", "1")
+
+    with pytest.raises(AssertionError, match="缺少真实列表响应"):
+        driver.prepare_unique_constraint_evidence()
+
+    assert page.reloads == 2
+    assert page.on_calls == 1
+    assert page.remove_calls == 1
+    assert driver._unique_occupied_snapshot == {}
 
 
 def _unique_paged_driver(monkeypatch, pages, *, captured_page=2, page_size=2):
@@ -7625,6 +8513,142 @@ def test_nested_open_form_keeps_non_numeric_text_comparison_strict():
         driver._assert_nested_values_in_open_form()
 
 
+def test_readback_partition_recognizes_section_prefixed_nested_array_path():
+    nested_code = "股权结构.ownershipStructureList.0.stockName"
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [
+        ("ownershipStructureList.*.stockName", "股东名称", False),
+    ]
+    driver._nested_evidence = [{
+        "section": "股权结构",
+        "field": "股东名称",
+        "code": "ownershipStructureList.0.stockName",
+        "submitted_key": nested_code,
+        "value": "AUTO_股东",
+    }]
+    submitted = {"name": "AUTO_企业", nested_code: "AUTO_股东"}
+
+    ordinary, nested = driver._partition_readback_required_codes(
+        submitted, set(submitted)
+    )
+
+    assert ordinary == {"name"}
+    assert nested == {nested_code}
+
+
+def test_nested_open_form_filters_evidence_to_requested_child_path():
+    ownership_code = "股权结构.ownershipStructureList.0.stockName"
+    investment_code = "对外投资.entInvestList.0.name"
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+    driver.page = NestedOpenFormPage({"股权结构": ["AUTO_股东"]})
+    driver._nested_evidence = [
+        {
+            "section": "股权结构",
+            "field": "股东名称",
+            "code": "ownershipStructureList.0.stockName",
+            "submitted_key": ownership_code,
+            "value": "AUTO_股东",
+        },
+        {
+            "section": "对外投资",
+            "field": "企业名称",
+            "code": "entInvestList.0.name",
+            "submitted_key": investment_code,
+            "value": "AUTO_投资企业",
+        },
+    ]
+
+    driver._assert_nested_values_in_open_form(
+        submitted={
+            ownership_code: "AUTO_股东",
+            investment_code: "AUTO_投资企业",
+        },
+        required_codes={ownership_code},
+    )
+
+
+def test_detail_readback_sends_only_nested_codes_to_nested_assertion(monkeypatch):
+    nested_code = "股权结构.ownershipStructureList.0.stockName"
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+    driver._nested_evidence = [{
+        "section": "股权结构",
+        "field": "股东名称",
+        "code": "ownershipStructureList.0.stockName",
+        "submitted_key": nested_code,
+        "value": "AUTO_股东",
+    }]
+    response = JsonResponse(
+        "https://host/detail/record-1",
+        {
+            "code": 200,
+            "data": {
+                "id": "record-1",
+                "ownershipStructureList": [{"stockName": "AUTO_股东"}],
+            },
+        },
+    )
+    captured = {}
+    monkeypatch.setattr(
+        driver, "_assert_business_success", lambda body, operation="新增": None
+    )
+    monkeypatch.setattr(
+        driver,
+        "_assert_detail_values",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("nested code reached flat detail assertion")
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_assert_nested_values_in_payload",
+        lambda payload, **kwargs: captured.update(kwargs),
+    )
+    submitted = {nested_code: "AUTO_股东"}
+
+    body = driver._assert_detail_response_readback(
+        response,
+        submitted,
+        required_codes={nested_code},
+        business_id="record-1",
+        record_markers=(),
+        save_payload={"ownershipStructureList": [{"stockName": "AUTO_股东"}]},
+    )
+
+    assert body == response.json()
+    assert captured["required_codes"] == {nested_code}
+    assert captured["submitted"] == submitted
+
+
+def test_missing_detail_codes_does_not_treat_nested_path_as_flat_key():
+    nested_code = "股权结构.ownershipStructureList.0.stockName"
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+    driver._nested_evidence = [{
+        "section": "股权结构",
+        "field": "股东名称",
+        "code": "ownershipStructureList.0.stockName",
+        "submitted_key": nested_code,
+        "value": "AUTO_股东",
+    }]
+    payload = {
+        "data": {
+            "id": "record-1",
+            "ownershipStructureList": [{"stockName": "AUTO_股东"}],
+        }
+    }
+
+    assert driver._missing_detail_required_codes(
+        payload,
+        {nested_code},
+        submitted={nested_code: "AUTO_股东"},
+        business_id="record-1",
+        record_markers=(),
+        detail_request=None,
+    ) == set()
+
+
 def test_detail_accepts_nested_display_value_when_save_and_detail_codes_match():
     ModuleSmokeDriver._assert_detail_values(
         {
@@ -7798,6 +8822,71 @@ def test_field_completion_report_uses_actual_visible_control_values(monkeypatch)
     assert driver._expected_not_rendered == ["未渲染字段 (missingCode)"]
     assert report.not_filled == ["金额 (amount)"]
     assert "字段未成功输入" in report.message()
+
+
+def test_field_completion_blocks_dynamic_value_over_persistence_length(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+    driver.dynamic_collections = [
+        DynamicCollectionSpec(
+            field_code="entInvestList",
+            mode="add-row",
+            root_selector=".ent-invest",
+            create_selector="button",
+            item_selector="tr",
+            min_rows=1,
+            children=(
+                DynamicCollectionChild(
+                    "entInvestList.{index}.name",
+                    "input",
+                    label="被投资企业名称",
+                    max_length=50,
+                ),
+            ),
+        ),
+    ]
+    driver.page = object()
+    monkeypatch.setattr("ei_ui_smoke.module_driver.scan_dom_fields", lambda page: [])
+
+    report = driver.check_field_completion({
+        "entInvestList.0.name": "UI自动化_20260817201810771600_8ae58af3_1_e1ccf050f9ce_1",
+    })
+
+    assert not report.ok
+    assert report.fill_failed == [
+        "被投资企业名称 (entInvestList.0.name): 长度 52 超过已确认持久化上限 50"
+    ]
+
+
+def test_field_completion_accepts_dynamic_value_at_persistence_length(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = []
+    driver.dynamic_collections = [
+        DynamicCollectionSpec(
+            field_code="entInvestList",
+            mode="add-row",
+            root_selector=".ent-invest",
+            create_selector="button",
+            item_selector="tr",
+            min_rows=1,
+            children=(
+                DynamicCollectionChild(
+                    "entInvestList.{index}.name",
+                    "input",
+                    label="被投资企业名称",
+                    max_length=50,
+                ),
+            ),
+        ),
+    ]
+    driver.page = object()
+    monkeypatch.setattr("ei_ui_smoke.module_driver.scan_dom_fields", lambda page: [])
+
+    report = driver.check_field_completion({
+        "entInvestList.0.name": "UI自动化_20260817201810771600_8ae58af3_1_e1ccf050f9ce",
+    })
+
+    assert report.ok
 
 
 def test_field_completion_does_not_map_option_text_by_source_order(monkeypatch):

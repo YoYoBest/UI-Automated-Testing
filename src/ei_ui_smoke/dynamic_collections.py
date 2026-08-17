@@ -13,6 +13,7 @@ class DynamicCollectionChild:
     label: str = ""
     required: bool = True
     column_header: str = ""
+    max_length: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,15 @@ def _parse_spec(entry: object, path: Path) -> DynamicCollectionSpec:
 def _parse_child(value: object, path: Path) -> DynamicCollectionChild:
     if not isinstance(value, dict):
         raise ValueError(f"{path} 的集合子字段必须是对象")
+    raw_max_length = value.get("maxLength")
+    try:
+        max_length = (
+            int(raw_max_length) if raw_max_length not in (None, "") else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} 的集合子字段 maxLength 必须是正整数") from exc
+    if max_length is not None and max_length < 1:
+        raise ValueError(f"{path} 的集合子字段 maxLength 必须是正整数")
     child = DynamicCollectionChild(
         field_code_template=str(value.get("fieldCodeTemplate") or "").strip(),
         selector=str(value.get("selector") or "").strip(),
@@ -122,6 +132,7 @@ def _parse_child(value: object, path: Path) -> DynamicCollectionChild:
         label=str(value.get("label") or "").strip(),
         required=bool(value.get("required", True)),
         column_header=str(value.get("columnHeader") or "").strip(),
+        max_length=max_length,
     )
     if "{index}" not in child.field_code_template or not child.selector:
         raise ValueError(f"{path} 的集合子字段缺少数组路径或 selector")
