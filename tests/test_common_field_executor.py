@@ -15,6 +15,7 @@ from ei_ui_smoke.common_field_executor import (
     CommonFieldExecutor,
     CommonFieldFormSession,
     FORM_CLOSE_SELECTOR,
+    TransactionBlockedByCachedFailure,
 )
 from ei_ui_smoke.dynamic_collections import DynamicCollectionSpec
 from ei_ui_smoke.dom import DOM_FIELD_SCRIPT
@@ -3916,6 +3917,34 @@ def test_transaction_execution_failure_is_cached_without_second_save():
     for _attempt in range(2):
         with pytest.raises(AssertionError, match="共享保存失败"):
             executor.execute_transaction_once(transaction, cache)
+
+    assert calls == [transaction]
+
+
+def test_transaction_execution_failure_blocks_later_report_items_without_second_save():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    cases = (
+        _transaction_case("ADD-011", "name", "text", "合法名称"),
+        _transaction_case("ADD-023", "summary", "textarea", "合法摘要"),
+    )
+    transaction = BoundCommonTransaction("TX-001", cases)
+    calls = []
+
+    def fail(current):
+        calls.append(current)
+        raise AssertionError("共享保存失败")
+
+    executor.execute_transaction = fail
+    cache = {}
+
+    with pytest.raises(AssertionError, match="共享保存失败"):
+        executor.execute_transaction_once(
+            transaction, cache, report_case_id=cases[0].pytest_id
+        )
+    with pytest.raises(TransactionBlockedByCachedFailure, match="前序异常阻断"):
+        executor.execute_transaction_once(
+            transaction, cache, report_case_id=cases[1].pytest_id
+        )
 
     assert calls == [transaction]
 

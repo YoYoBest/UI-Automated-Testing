@@ -4428,49 +4428,74 @@ class ModuleSmokeDriver:
         )
         return urlunsplit((parts.scheme, parts.netloc, detail_path, "", ""))
 
+    @classmethod
+    def _same_resource_detail_urls(
+        cls, save_url: str, business_id: str,
+    ) -> tuple[str, ...]:
+        """Return compatible exact-ID detail URLs without relying on list text."""
+        path_url = cls._same_resource_detail_url(save_url, business_id)
+        if not path_url:
+            return ()
+        parts = urlsplit(path_url)
+        detail_segments = [segment for segment in parts.path.split("/") if segment]
+        if len(detail_segments) < 2 or detail_segments[-2] != "detail":
+            return (path_url,)
+        query_url = urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                "/" + "/".join(detail_segments[:-1]),
+                urlencode({"id": cls._normalize_record_text(business_id)}),
+                "",
+            )
+        )
+        return tuple(dict.fromkeys((query_url, path_url)))
+
     def _request_same_resource_detail_response(
         self, save_response, business_id: str,
     ):
         """Fetch one exact-ID detail candidate with the current browser login."""
-        detail_url = self._same_resource_detail_url(
+        detail_urls = self._same_resource_detail_urls(
             getattr(save_response, "url", ""), business_id
         )
-        if not detail_url:
+        if not detail_urls:
             return None
         request_context = getattr(self.page, "request", None)
         get = getattr(request_context, "get", None)
         if not callable(get):
             return None
-        try:
-            response = get(detail_url)
-        except Exception:
-            return None
-        if not getattr(response, "ok", False):
-            return None
-        headers = dict(getattr(response, "headers", {}) or {})
-        content_type = str(headers.get("content-type", "")).lower()
-        if "json" not in content_type:
-            return None
-        try:
-            payload = response.json()
-        except Exception:
-            return None
-        wrapped = _RequestContextDetailResponse(
-            response, detail_url, payload, headers
-        )
-        if not self._request_contains_business_id(wrapped.request, business_id):
-            return None
         normalized_id = self._normalize_record_text(business_id)
-        if normalized_id not in self._record_scalar_texts(payload):
-            return None
-        direct_ids = {
-            self._direct_record_business_id(record)
-            for record in self._collect_dicts(payload)
-            if self._direct_record_business_id(record)
-        }
-        if direct_ids and normalized_id not in direct_ids:
-            return None
-        return wrapped
+        for detail_url in detail_urls:
+            try:
+                response = get(detail_url)
+            except Exception:
+                continue
+            if not getattr(response, "ok", False):
+                continue
+            headers = dict(getattr(response, "headers", {}) or {})
+            content_type = str(headers.get("content-type", "")).lower()
+            if "json" not in content_type:
+                continue
+            try:
+                payload = response.json()
+            except Exception:
+                continue
+            wrapped = _RequestContextDetailResponse(
+                response, detail_url, payload, headers
+            )
+            if not self._request_contains_business_id(wrapped.request, business_id):
+                continue
+            if normalized_id not in self._record_scalar_texts(payload):
+                continue
+            direct_ids = {
+                self._direct_record_business_id(record)
+                for record in self._collect_dicts(payload)
+                if self._direct_record_business_id(record)
+            }
+            if direct_ids and normalized_id not in direct_ids:
+                continue
+            return wrapped
+        return None
 
     @classmethod
     def _response_associates_business_id(cls, response, business_id: str) -> bool:

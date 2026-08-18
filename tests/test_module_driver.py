@@ -2309,13 +2309,28 @@ def test_same_resource_detail_url_keeps_resource_prefix_and_exact_id():
     ) == "https://host/fi-service/risk/detail/record%2F1"
 
 
+def test_same_resource_detail_urls_prefer_query_id_and_keep_path_fallback():
+    assert ModuleSmokeDriver._same_resource_detail_urls(
+        "https://host/ei-service/project/projStorage/add", "record/1"
+    ) == (
+        "https://host/ei-service/project/projStorage/detail?id=record%2F1",
+        "https://host/ei-service/project/projStorage/detail/record%2F1",
+    )
+
+
 def test_same_resource_detail_request_accepts_successful_json_with_exact_id():
     driver = object.__new__(ModuleSmokeDriver)
+    unsupported_query_response = ApiResponse(
+        "https://host/fi-service/risk/detail?id=record-1",
+        {"code": 404},
+        ok=False,
+        status=404,
+    )
     api_response = ApiResponse(
         "https://host/fi-service/risk/detail/record-1",
         {"code": 200, "data": {"id": "record-1", "name": "AUTO_risk"}},
     )
-    driver.page = RequestPage([api_response])
+    driver.page = RequestPage([unsupported_query_response, api_response])
     save = JsonResponse(
         "https://host/fi-service/risk/add",
         {"code": 200, "data": {"id": "record-1"}},
@@ -2326,11 +2341,33 @@ def test_same_resource_detail_request_accepts_successful_json_with_exact_id():
     assert result is not None
     assert result.json()["data"]["id"] == "record-1"
     assert driver.page.request.urls == [
+        "https://host/fi-service/risk/detail?id=record-1",
         "https://host/fi-service/risk/detail/record-1"
     ]
     assert ModuleSmokeDriver._request_contains_business_id(
         result.request, "record-1"
     )
+
+
+def test_same_resource_detail_request_accepts_query_id_detail_response():
+    driver = object.__new__(ModuleSmokeDriver)
+    api_response = ApiResponse(
+        "https://host/ezgo/ei-service/project/projStorage/detail?id=record-1",
+        {"status": "0", "data": {"id": "record-1", "projName": "AUTO_资源池"}},
+    )
+    driver.page = RequestPage([api_response])
+    save = JsonResponse(
+        "https://host/ezgo/ei-service/project/projStorage/add",
+        {"status": "0", "data": [{"id": "record-1"}]},
+    )
+
+    result = driver._request_same_resource_detail_response(save, "record-1")
+
+    assert result is not None
+    assert result.json()["data"]["id"] == "record-1"
+    assert driver.page.request.urls == [
+        "https://host/ezgo/ei-service/project/projStorage/detail?id=record-1"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2446,7 +2483,13 @@ def test_double_readback_stops_after_exact_business_id_detail_json(
             },
         },
     )
-    driver.page = RequestPage([exact_detail])
+    unsupported_query_detail = ApiResponse(
+        "https://host/fi-service/risk/detail?id=record-1",
+        {"code": 404},
+        ok=False,
+        status=404,
+    )
+    driver.page = RequestPage([unsupported_query_detail, exact_detail])
     driver.source_fields = [
         ("name", "名称", False),
         ("riskReason", "风险原因", False),
@@ -2494,7 +2537,13 @@ def test_saved_record_fetches_exact_detail_after_incomplete_associated_list(monk
             "data": {"id": "record-1", "name": "AUTO_risk"},
         },
     )
-    driver.page = RequestPage([exact_detail])
+    unsupported_query_detail = ApiResponse(
+        "https://host/fi-service/risk/detail?id=record-1",
+        {"code": 404},
+        ok=False,
+        status=404,
+    )
+    driver.page = RequestPage([unsupported_query_detail, exact_detail])
     driver._nested_evidence = []
     save = JsonResponse(
         "https://host/fi-service/risk/add",
@@ -2524,6 +2573,7 @@ def test_saved_record_fetches_exact_detail_after_incomplete_associated_list(monk
     assert result.mode == "add_and_detail_verified"
     assert result.detail_url.endswith("/risk/detail/record-1")
     assert driver.page.request.urls == [
+        "https://host/fi-service/risk/detail?id=record-1",
         "https://host/fi-service/risk/detail/record-1"
     ]
 

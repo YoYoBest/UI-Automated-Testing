@@ -114,6 +114,18 @@ INLINE_COMMAND_HOST_XPATH = (
 )
 
 
+class TransactionBlockedByCachedFailure(Exception):
+    """A logical report item did not run because its shared transaction failed."""
+
+    def __init__(self, transaction_id: str, root_case_id: str, error: Exception):
+        self.transaction_id = transaction_id
+        self.root_case_id = root_case_id
+        self.error = error
+        super().__init__(
+            f"事务 {transaction_id} 已由 {root_case_id} 的前序异常阻断：{error}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CommonFieldExecutionResult:
     case_id: str
@@ -1436,17 +1448,30 @@ class CommonFieldExecutor:
     def execute_transaction_once(
         self,
         transaction: BoundCommonTransaction,
-        cache: dict[str, tuple[tuple[CommonFieldExecutionResult, ...] | None, Exception | None]],
+        cache: dict[
+            str,
+            tuple[
+                tuple[CommonFieldExecutionResult, ...] | None,
+                Exception | None,
+                str,
+            ],
+        ],
+        *,
+        report_case_id: str = "",
     ) -> tuple[CommonFieldExecutionResult, ...]:
         """Execute one physical transaction once across separate report items."""
         key = transaction.transaction_id
         if key not in cache:
             try:
-                cache[key] = (self.execute_transaction(transaction), None)
+                cache[key] = (self.execute_transaction(transaction), None, report_case_id)
             except Exception as exc:
-                cache[key] = (None, exc)
-        results, error = cache[key]
+                cache[key] = (None, exc, report_case_id)
+        results, error, root_case_id = cache[key]
         if error is not None:
+            if report_case_id and root_case_id and report_case_id != root_case_id:
+                raise TransactionBlockedByCachedFailure(
+                    transaction.transaction_id, root_case_id, error
+                )
             raise error
         if results is None:
             raise AssertionError(f"事务 {transaction.transaction_id} 没有生成执行结果")

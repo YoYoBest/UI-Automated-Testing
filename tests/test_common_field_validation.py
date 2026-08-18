@@ -9,7 +9,10 @@ from ei_ui_smoke.allure_report import (
     set_allure_hidden_parameter,
     set_allure_common_case_metadata,
 )
-from ei_ui_smoke.common_field_executor import CommonFieldExecutor
+from ei_ui_smoke.common_field_executor import (
+    CommonFieldExecutor,
+    TransactionBlockedByCachedFailure,
+)
 from ei_ui_smoke.common_field_cases import (
     NotApplicableCommonReportItem,
     load_field_manifest,
@@ -107,9 +110,14 @@ def test_common_field_validation(
         display_case_id=display_case_id,
     )
     set_allure_hidden_parameter("transaction_id", transaction.transaction_id)
-    results = common_field_executor.execute_transaction_once(
-        transaction, common_field_transaction_cache
-    )
+    try:
+        results = common_field_executor.execute_transaction_once(
+            transaction,
+            common_field_transaction_cache,
+            report_case_id=report_case.pytest_id,
+        )
+    except TransactionBlockedByCachedFailure as exc:
+        pytest.skip("事务被前序字段失败阻断：" + str(exc))
     assert len(results) == len(cases), (
         f"事务 {transaction.transaction_id} 结果数量不一致："
         f"cases={len(cases)}, results={len(results)}"
