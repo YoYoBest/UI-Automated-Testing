@@ -17,6 +17,7 @@ from ei_ui_smoke.dynamic_collections import (
 )
 from ei_ui_smoke.models import DomField, FieldDefinition, ResolvedField
 from ei_ui_smoke.dom import DOM_FIELD_SCRIPT, scan_dom_fields
+from ei_ui_smoke.source_form import SourceDetailEndpoint
 
 
 class Request:
@@ -1056,7 +1057,7 @@ def test_verify_saved_record_passes_required_codes_to_detail_assertion(monkeypat
     captured = {}
     monkeypatch.setattr(driver, "_assert_business_success", lambda body, operation="新增": None)
     monkeypatch.setattr(driver, "_assert_nested_values_in_payload", lambda payload, **_kwargs: None)
-    monkeypatch.setattr(driver, "_open_detail", lambda markers, business_id: None)
+    monkeypatch.setattr(driver, "_open_detail", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         driver,
         "_find_detail_response",
@@ -1147,7 +1148,7 @@ def test_verify_saved_record_passes_required_codes_to_edit_form_assertion(monkey
     monkeypatch.setattr(
         driver, "_assert_nested_values_in_open_form", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(driver, "_open_detail", lambda markers, business_id: None)
+    monkeypatch.setattr(driver, "_open_detail", lambda *args, **kwargs: None)
     monkeypatch.setattr(driver, "_current_detail_edit_button", lambda markers: edit)
     monkeypatch.setattr(
         driver,
@@ -1275,6 +1276,7 @@ def test_verify_saved_record_accepts_current_list_readback(monkeypatch):
 def test_successful_automation_create_is_registered_before_readback_failure(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.delenv("EI_AUTOMATION_RUN_ID", raising=False)
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = type("Page", (), {"url": "https://host/projects/detail/record-1"})()
     driver.source_fields = [("name", "名称", False)]
@@ -1371,6 +1373,114 @@ def test_edit_save_with_business_id_is_not_registered(monkeypatch, tmp_path):
     assert not driver.automation_record_registry.exists()
 
 
+def _dialog_save_driver(monkeypatch, save_response):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {
+        "on": staticmethod(lambda *_args: None),
+        "wait_for_timeout": staticmethod(lambda *_args: None),
+    })()
+    driver._fill_failures = []
+    driver._collection_submission_codes = set()
+    driver._readback_excluded_submission_codes = set()
+    driver._wait_for_form_scope = lambda: object()
+    driver._wait_for_form_ready = lambda _scope: None
+    driver._fill_dialog = lambda: {"name": "更新后的名称"}
+    driver._upload_default_attachments = lambda _scope: None
+    driver._dom_field_has_value = lambda _field: True
+    save_button = type("Save", (), {
+        "count": staticmethod(lambda: 1),
+        "is_visible": staticmethod(lambda: True),
+        "is_enabled": staticmethod(lambda: True),
+    })()
+    driver._save_button = lambda _scope, _operation: save_button
+    driver._save_with_validation_repairs = (
+        lambda _scope, _save, responses, _submitted: responses.append(save_response)
+    )
+    driver._find_save_response = lambda _responses, _submitted: save_response
+    driver._assert_business_success = lambda _body, operation="保存": None
+    monkeypatch.setattr(
+        module_driver_module,
+        "scan_dom_fields",
+        lambda _page, _scope: [
+            DomField("name", "名称", "text", "#name", required=False)
+        ],
+    )
+    return driver
+
+
+def test_save_open_dialog_uses_response_id_and_returns_detail_verified(monkeypatch):
+    save = JsonResponse(
+        "https://host/api/projects/update",
+        {"code": 200, "data": {"id": "record-2"}},
+        payload={"name": "更新后的名称"},
+    )
+    driver = _dialog_save_driver(monkeypatch, save)
+    captured = {}
+
+    def verify(_save, submitted, **kwargs):
+        captured.update(kwargs)
+        return ModuleSmokeResult(
+            mode="add_and_detail_verified",
+            business_id=kwargs["business_id"],
+            detail_url="https://host/api/projects/detail?id=record-2",
+            submitted=submitted,
+            record_identity_payload={"data": {"id": "record-2"}},
+        )
+
+    driver._verify_saved_record_by_business_id_detail = verify
+
+    result = driver.save_open_dialog("编辑")
+
+    assert result.mode == "dialog_action_detail_verified"
+    assert result.business_id == "record-2"
+    assert captured["business_id"] == "record-2"
+    assert captured["required_codes"] == {"name"}
+
+
+def test_save_open_dialog_uses_only_explicit_established_id_when_response_has_none(
+    monkeypatch,
+):
+    save = JsonResponse(
+        "https://host/api/projects/update",
+        {"code": 200, "data": None},
+        payload={"name": "更新后的名称"},
+    )
+    driver = _dialog_save_driver(monkeypatch, save)
+    captured = {}
+    driver._verify_saved_record_by_business_id_detail = (
+        lambda _save, submitted, **kwargs: captured.update(kwargs)
+        or ModuleSmokeResult(
+            mode="add_and_detail_verified",
+            business_id=kwargs["business_id"],
+            detail_url="https://host/api/projects/detail?id=record-1",
+            submitted=submitted,
+        )
+    )
+
+    result = driver.save_open_dialog(
+        "编辑", established_business_id="record-1"
+    )
+
+    assert result.business_id == "record-1"
+    assert captured["business_id"] == "record-1"
+
+
+def test_save_open_dialog_rejects_missing_id_without_name_fallback(monkeypatch):
+    save = JsonResponse(
+        "https://host/api/projects/update",
+        {"code": 200, "data": None},
+        payload={"name": "AUTO_不能作为身份"},
+    )
+    driver = _dialog_save_driver(monkeypatch, save)
+    driver._fill_dialog = lambda: {"name": "AUTO_不能作为身份"}
+    driver._verify_saved_record_by_business_id_detail = lambda *_args, **_kwargs: (
+        pytest.fail("missing ID must stop before detail lookup")
+    )
+
+    with pytest.raises(AssertionError, match="禁止按名称或列表顺序回读"):
+        driver.save_open_dialog("编辑")
+
+
 def test_registry_keeps_same_business_id_in_different_page_scopes(tmp_path):
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = type("Page", (), {"url": "https://host/projects"})()
@@ -1400,7 +1510,53 @@ def test_registry_keeps_same_business_id_in_different_page_scopes(tmp_path):
     ]
 
 
-def test_registry_uses_scope_and_business_id_as_key_not_marker(tmp_path):
+def test_registered_automation_records_accepts_only_current_run(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "run-current")
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects"})()
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        json.dumps({"records": [
+            {"business_id": "old-1", "page_scope": "https://host/projects",
+             "run_id": "run-old"},
+            {"business_id": "current-1", "page_scope": "https://host/projects",
+             "run_id": "run-current"},
+        ]}),
+        encoding="utf-8",
+    )
+
+    assert [
+        record["business_id"]
+        for record in driver._registered_automation_records()
+    ] == ["current-1"]
+
+
+def test_registered_automation_records_accepts_current_process_proof_without_run_id(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.delenv("EI_AUTOMATION_RUN_ID", raising=False)
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {"url": "https://host/projects"})()
+    driver._current_process_created_record_keys = {
+        ("https://host/projects", "process-1")
+    }
+    driver.automation_record_registry = tmp_path / "automation-record-registry.json"
+    driver.automation_record_registry.write_text(
+        '{"records":[{"business_id":"process-1",'
+        '"page_scope":"https://host/projects","run_id":""}]}',
+        encoding="utf-8",
+    )
+
+    assert [
+        record["business_id"]
+        for record in driver._registered_automation_records()
+    ] == ["process-1"]
+
+
+def test_registry_uses_scope_and_business_id_as_key_not_marker(monkeypatch, tmp_path):
+    monkeypatch.delenv("EI_AUTOMATION_RUN_ID", raising=False)
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = type("Page", (), {"url": "https://host/projects"})()
     driver.automation_record_registry = tmp_path / "automation-record-registry.json"
@@ -1638,6 +1794,32 @@ def test_verify_saved_record_filters_unmapped_generated_required_codes_at_entry(
     assert captured == {"required_codes": {"matterName"}}
 
 
+def test_verify_saved_record_rejects_id_only_evidence_when_all_fields_are_generated(
+    monkeypatch,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._nested_evidence = []
+    save = JsonResponse(
+        "https://host/fi-service/projectStage/add",
+        {"code": 200, "data": {"id": "record-1"}},
+    )
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="回读字段全部是运行时生成 ID.*automation_detail_adapter",
+    ):
+        driver.verify_saved_record(
+            [save],
+            save,
+            {"el-id-123-45": "临时值"},
+            (),
+            required_codes={"el-id-123-45"},
+        )
+
+
 def test_verify_saved_record_rejects_empty_response_without_edit_detail_context(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     save = JsonResponse(
@@ -1653,6 +1835,38 @@ def test_verify_saved_record_rejects_empty_response_without_edit_detail_context(
 
     with pytest.raises(AssertionError, match="保存接口未返回业务主键"):
         driver.verify_saved_record([save], save, {"file": "attachment.pdf"}, ())
+
+
+def test_verify_saved_record_does_not_replace_missing_id_with_name_marker(
+    monkeypatch,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = type("Page", (), {
+        "get_by_text": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("name lookup is forbidden when save ID is missing")
+        ),
+    })()
+    save = JsonResponse(
+        "https://host/fi-service/projectStage/add",
+        {"status": "0", "msg": "操作成功", "data": None},
+    )
+    monkeypatch.setattr(
+        driver, "_assert_business_success", lambda body, operation="保存": None
+    )
+    monkeypatch.setattr(
+        driver, "_assert_nested_values_in_payload", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="禁止按名称或列表顺序回读",
+    ):
+        driver.verify_saved_record(
+            [save],
+            save,
+            {"matterName": "AUTO_事项"},
+            ("AUTO_事项",),
+        )
 
 
 def test_readback_label_strips_prompt_prefixes():
@@ -2280,6 +2494,13 @@ def test_fieldless_detail_response_defers_to_rendered_readback(monkeypatch):
         record_markers=("AUTO_project",),
         save_payload={},
     ) is None
+    assert driver._detail_readback_diagnostics == [{
+        "method": "GET",
+        "path": "",
+        "status": 0,
+        "failure_kind": "field_mapping_incomplete",
+        "classification": "automation_detail_adapter",
+    }]
 
 
 def test_partial_associated_list_defers_when_target_fields_are_missing(monkeypatch):
@@ -2316,6 +2537,160 @@ def test_same_resource_detail_urls_prefer_query_id_and_keep_path_fallback():
         "https://host/ei-service/project/projStorage/detail?id=record%2F1",
         "https://host/ei-service/project/projStorage/detail/record%2F1",
     )
+
+
+def test_source_detail_url_keeps_proxy_prefix_and_encodes_query_id():
+    endpoint = SourceDetailEndpoint(
+        method="GET",
+        path_template="/ei-service/projStorage/detail",
+        id_location="query",
+        id_query_key="id",
+        api_base_path="/ezgo",
+    )
+
+    assert ModuleSmokeDriver._source_detail_url(
+        endpoint,
+        "https://host/ezgo/ei-service/project/projStorage/add",
+        "record/1",
+    ) == "https://host/ezgo/ei-service/projStorage/detail?id=record%2F1"
+
+
+def test_source_detail_url_replaces_and_encodes_path_id():
+    endpoint = SourceDetailEndpoint(
+        method="GET",
+        path_template="/fi-service/risk/detail/{business_id}",
+        id_location="path",
+    )
+
+    assert ModuleSmokeDriver._source_detail_url(
+        endpoint,
+        "https://host/fi-service/risk/add",
+        "record/1",
+    ) == "https://host/fi-service/risk/detail/record%2F1"
+
+
+def test_source_declared_detail_is_requested_before_url_inference():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_detail_endpoints = (
+        SourceDetailEndpoint(
+            method="GET",
+            path_template="/ei-service/projStorage/detail",
+            id_location="query",
+            id_query_key="id",
+            api_base_path="/ezgo",
+        ),
+    )
+    declared_response = ApiResponse(
+        "https://host/ezgo/ei-service/projStorage/detail?id=record-1",
+        {"status": "0", "data": {"id": "record-1"}},
+    )
+    driver.page = RequestPage([declared_response])
+    save = JsonResponse(
+        "https://host/ezgo/ei-service/project/projStorage/add",
+        {"status": "0", "data": {"id": "record-1"}},
+    )
+
+    result = driver._request_same_resource_detail_response(save, "record-1")
+
+    assert result is not None
+    assert driver.page.request.urls == [
+        "https://host/ezgo/ei-service/projStorage/detail?id=record-1"
+    ]
+
+
+def test_source_detail_failure_falls_back_to_inferred_detail():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_detail_endpoints = (
+        SourceDetailEndpoint(
+            method="GET",
+            path_template="/ei-service/projStorage/detail",
+            id_location="query",
+            id_query_key="id",
+            api_base_path="/ezgo",
+        ),
+    )
+    driver.page = RequestPage([
+        ApiResponse(
+            "https://host/ezgo/ei-service/projStorage/detail?id=record-1",
+            {"code": 404},
+            ok=False,
+            status=404,
+        ),
+        ApiResponse(
+            "https://host/ezgo/ei-service/project/projStorage/detail?id=record-1",
+            {"status": "0", "data": {"id": "record-1"}},
+        ),
+    ])
+    save = JsonResponse(
+        "https://host/ezgo/ei-service/project/projStorage/add",
+        {"status": "0", "data": {"id": "record-1"}},
+    )
+
+    result = driver._request_same_resource_detail_response(save, "record-1")
+
+    assert result is not None
+    assert driver.page.request.urls == [
+        "https://host/ezgo/ei-service/projStorage/detail?id=record-1",
+        "https://host/ezgo/ei-service/project/projStorage/detail?id=record-1",
+    ]
+
+
+def test_detail_401_retries_with_browser_authenticated_context():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_detail_endpoints = (
+        SourceDetailEndpoint(
+            method="GET",
+            path_template="/fi-service/risk/detail",
+            id_location="query",
+            id_query_key="id",
+        ),
+    )
+    page = RequestPage([
+        ApiResponse(
+            "https://host/fi-service/risk/detail?id=record-1",
+            {"code": 401},
+            ok=False,
+            status=401,
+        ),
+    ])
+    page.evaluate = lambda _script, _url: {
+        "ok": True,
+        "status": 200,
+        "url": "https://host/fi-service/risk/detail?id=record-1",
+        "body": {"code": 200, "data": {"id": "record-1"}},
+    }
+    driver.page = page
+    save = JsonResponse(
+        "https://host/fi-service/risk/add",
+        {"code": 200, "data": {"id": "record-1"}},
+    )
+
+    result = driver._request_same_resource_detail_response(save, "record-1")
+
+    assert result is not None
+    assert result.json()["data"]["id"] == "record-1"
+    assert page.request.urls == [
+        "https://host/fi-service/risk/detail?id=record-1"
+    ]
+
+
+def test_detail_failure_diagnostic_does_not_disclose_query_or_payload(capsys):
+    driver = object.__new__(ModuleSmokeDriver)
+
+    driver._record_detail_readback_failure(
+        detail_url="https://host/fi-service/risk/detail?id=private-id&token=secret",
+        status=403,
+        failure_kind="http_error",
+    )
+
+    diagnostic = capsys.readouterr().out
+    assert "method=GET" in diagnostic
+    assert "path=/fi-service/risk/detail" in diagnostic
+    assert "status=403" in diagnostic
+    assert "failure_kind=http_error" in diagnostic
+    assert "classification=automation_detail_adapter" in diagnostic
+    assert "private-id" not in diagnostic
+    assert "secret" not in diagnostic
 
 
 def test_same_resource_detail_request_accepts_successful_json_with_exact_id():
@@ -4033,6 +4408,111 @@ def test_open_detail_uses_unique_submitted_display_values_without_name_marker():
     assert identity == "保存字段组合"
 
 
+def test_declared_unique_single_field_locates_row_despite_irrelevant_marker():
+    target = RecordRow(["资源池企业A", "2026"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["其他企业", "2026"]),
+        target,
+    ])
+
+    row, identity = driver._find_unique_record_container(
+        "saved-id",
+        ["过长项目名称，列表不会完整显示"],
+        allow_search=False,
+        declared_unique_identity_groups=(("资源池企业A",),),
+    )
+
+    assert row is target
+    assert identity == "声明唯一约束字段组合"
+
+
+def test_declared_unique_composite_group_requires_values_in_same_row():
+    target = RecordRow(["四川板块", "2031"])
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["四川板块", "2032"]),
+        RecordRow(["其他板块", "2031"]),
+        target,
+    ])
+
+    row, identity = driver._find_unique_record_container(
+        "",
+        [],
+        allow_search=False,
+        declared_unique_identity_groups=(("四川板块", "2031"),),
+    )
+
+    assert row is target
+    assert identity == "声明唯一约束字段组合"
+
+
+def test_declared_unique_single_field_rejects_ambiguous_rows():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RecordPage([
+        RecordRow(["资源池企业A", "2026"]),
+        RecordRow(["资源池企业A", "2027"]),
+    ])
+
+    with pytest.raises(AssertionError, match="声明唯一约束字段组合匹配到多条记录"):
+        driver._find_unique_record_container(
+            "",
+            [],
+            allow_search=False,
+            declared_unique_identity_groups=(("资源池企业A",),),
+        )
+
+
+def test_declared_unique_identity_groups_uses_only_fully_submitted_constraints():
+    spec = UniqueConstraintSpec(
+        form_code="POOL_RESOURCE",
+        field_codes=("projObjectName", "assetYear"),
+        repair_field="projObjectName",
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.data_strategy = type("Strategy", (), {
+        "declared_unique_constraints": staticmethod(lambda submitted: (spec,)),
+    })()
+
+    assert driver._declared_unique_identity_groups({
+        "projObjectName": "资源池企业A", "assetYear": "2026",
+    }) == (("资源池企业A", "2026"),)
+    assert driver._declared_unique_identity_groups({
+        "projObjectName": "资源池企业A", "assetYear": "",
+    }) == ()
+
+
+def test_open_detail_prefers_response_id_association_before_declared_key():
+    response_row = object()
+    driver = object.__new__(ModuleSmokeDriver)
+    calls = []
+    driver._find_response_associated_record_container = (
+        lambda payload, business_id, **kwargs: calls.append(
+            (payload, business_id, kwargs)
+        ) or (response_row, "响应关联字段=资源池企业A, 2026")
+    )
+    driver._find_unique_record_container = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("不应提前使用声明唯一键"))
+    driver._open_record_container_detail = lambda row: calls.append(("open", row))
+
+    driver._open_detail(
+        [],
+        "saved-id",
+        response_payload={"data": [{"id": "saved-id"}]},
+        declared_unique_identity_groups=(("资源池企业A",),),
+    )
+
+    assert calls == [
+        (
+            {"data": [{"id": "saved-id"}]},
+            "saved-id",
+            {"visible_only": True},
+        ),
+        ("open", response_row),
+    ]
+
+
 def test_edit_response_association_uses_source_display_fields_not_hidden_technical_values():
     driver = object.__new__(ModuleSmokeDriver)
     target = RecordRow(["江西板块", "2041", "325,644.32", "编辑", "删除"])
@@ -4919,6 +5399,16 @@ def test_generated_name_field_uses_semantic_label_before_position_fallback():
     assert driver._source_for_dom(dom, 1) == ("projName", "项目名称", False)
 
 
+def test_generated_enterprise_name_field_uses_resource_pool_semantic_identity():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("projName", "项目名称", False)]
+    dom = DomField("el-id-1", "企业名称", "text", "#enterprise-name")
+
+    assert driver._source_for_dom(dom, 1) == (
+        "projObjectName", "企业名称", False,
+    )
+
+
 def test_runtime_identity_rejects_generated_field_source_order_mismatch():
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = [
@@ -4932,6 +5422,16 @@ def test_runtime_identity_rejects_generated_field_source_order_mismatch():
 
     assert driver._runtime_identity_for_dom(unlabeled_select, 2)[0] == "el-id-58"
     assert driver._runtime_identity_for_dom(option_label_radio, 3)[0] == "el-id-61"
+
+
+def test_source_mapping_never_uses_dom_position_for_unidentified_control():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("firstField", "第一字段", False)]
+    dom = DomField("el-id-99", "", "text", "#el-id-99")
+
+    assert driver._source_for_dom(dom, 1) == (
+        "el-id-99", "", False,
+    )
 
 
 def test_element_generated_ids_are_not_business_field_codes():
@@ -5476,6 +5976,34 @@ def test_fill_dialog_explicit_choice_baseline_overrides_page_default(monkeypatch
     assert selected == [(radio_group, "未注册", {"prefer_last": False})]
 
 
+def test_fill_dialog_protects_selected_branch_from_preferred_default(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("inveProjType", "投资类型", False)]
+    driver.page = object()
+    driver._common_form_scope = None
+    driver._dom_field_has_value = lambda _field, **_kwargs: True
+    driver.data_strategy = type("Strategy", (), {
+        "preferred_choice_for": staticmethod(lambda _field: "POOL_RESOURCE"),
+        "value_for": staticmethod(
+            lambda *_args: pytest.fail("protected branch must not be regenerated")
+        ),
+    })()
+    driver._radio_group = lambda *_args, **_kwargs: pytest.fail(
+        "protected branch must not be selected again"
+    )
+    rendered = [
+        DomField(
+            "inveProjType", "投资类型", "radio", "#investment-type",
+            required=True,
+        )
+    ]
+    monkeypatch.setattr(
+        "ei_ui_smoke.module_driver.scan_dom_fields", lambda page: rendered
+    )
+
+    assert driver._fill_dialog(protected_codes={"inveProjType"}) == {}
+
+
 def test_fill_dialog_routes_required_year_picker_to_interactor(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = [("assetYear", "年度", False)]
@@ -6007,6 +6535,7 @@ def test_reusable_delete_record_rejects_registry_entry_from_different_scope(
 def test_reusable_delete_record_accepts_registered_automation_marker_and_id(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "run-current")
     class EmptyLocator:
         @property
         def first(self):
@@ -6032,6 +6561,7 @@ def test_reusable_delete_record_accepts_registered_automation_marker_and_id(
     driver.automation_record_registry.write_text(
         '{"records":[{"business_id":"auto-1",'
         '"page_scope":"https://host/projects",'
+        '"run_id":"run-current",'
         '"record_markers":["AUTO_delete_me"],'
         '"submitted":{"name":"AUTO_delete_me"},'
         '"record_identity_payload":{"id":"auto-1",'
@@ -6092,12 +6622,14 @@ def test_reusable_delete_record_ignores_business_rows_and_unaddressable_automati
 
 
 def test_reusable_delete_record_uses_registered_evidence_when_list_hides_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "run-current")
     target = RecordRow(["四川板块", "2031", "123.45", "编辑", "删除"])
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = RecordPage([RecordRow(["四川板块", "2032", "123.45"]), target])
     driver.automation_record_registry = tmp_path / "automation-record-registry.json"
     driver.automation_record_registry.write_text(
         '{"records":[{"business_id":"auto-1","page_scope":"https://host/projects",'
+        '"run_id":"run-current",'
         '"record_markers":[],"submitted":{"belongSection":"四川板块",'
         '"assetYear":"2031","netAssetAmount":123.45},"record_identity_payload":'
         '{"data":{"records":[{"id":"auto-1","belongSectionName":"四川板块",'

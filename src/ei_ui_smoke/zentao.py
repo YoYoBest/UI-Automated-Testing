@@ -170,10 +170,50 @@ def _is_expected_failure(result: dict[str, Any]) -> bool:
 
 
 def _classify_failure(
-    message: str, *, test_name: str = "", failure_url: str = ""
+    message: str,
+    *,
+    test_name: str = "",
+    failure_url: str = "",
+    classification: str = "",
 ) -> tuple[str, bool, bool]:
     """Classify the final failure using the operation and scenario context."""
-    lowered = " ".join((message, test_name, failure_url)).lower()
+    normalized_classification = classification.strip().lower()
+    lowered = " ".join(
+        (message, test_name, failure_url, normalized_classification)
+    ).lower()
+    framework_contract_tokens = (
+        "分支基线未完成",
+        "字段身份",
+        "自动化基线",
+        "重渲染定位",
+        "重渲染后定位",
+        "重渲染后字段定位",
+        "重渲染后控件定位",
+    )
+    source_branch_discovery_failed = (
+        "源码确认" in lowered and "分支发现失败" in lowered
+    )
+    detail_adapter_failed = (
+        any(token in lowered for token in ("详情接口", "详情回读"))
+        and any(
+            token in lowered
+            for token in (
+                "字段映射失败",
+                "字段映射不完整",
+                "字段无法映射",
+                "适配失败",
+                "适配错误",
+            )
+        )
+    )
+    if (
+        normalized_classification == "automation_detail_adapter"
+        or "classification=automation_detail_adapter" in lowered
+        or source_branch_discovery_failed
+        or detail_adapter_failed
+        or any(token in lowered for token in framework_contract_tokens)
+    ):
+        return "automation", False, False
     system_connectivity_tokens = (
         "err_connection", "err_name_not_resolved",
         "network connection failed", "connection refused",
@@ -190,13 +230,24 @@ def _classify_failure(
         return "environment", False, False
     if any(token in lowered for token in automation_tokens):
         return "automation", False, False
-    business_mutation_failed = (
+    request_failed_for_mutation = (
         "requestfailed" in lowered
         and any(token in lowered for token in ("/save", "/add", "/create", "/insert", "/update", "/delete", "/submit"))
-    ) or any(
-        token in lowered
-        for token in ("点击保存后", "保存接口", "新增保存", "提交接口")
     )
+    explicit_mutation_api_failure = request_failed_for_mutation or any(
+        token in lowered
+        for token in ("点击保存后", "保存接口", "提交接口")
+    ) or (
+        any(token in lowered for token in ("保存", "新增", "提交", "更新", "删除"))
+        and any(
+            token in lowered
+            for token in (
+                "http 4", "http 5", "http：4", "http：5",
+                "业务码失败", "业务状态失败", "业务失败",
+            )
+        )
+    )
+    business_mutation_failed = explicit_mutation_api_failure or "新增保存" in lowered
     security_scenario = any(
         token in lowered
         for token in ("<script", "html/脚本", "脚本字符", "xss", "csrf")
@@ -207,8 +258,23 @@ def _classify_failure(
         if business_mutation_failed:
             return "api", True, True
         return "environment", False, False
+    if explicit_mutation_api_failure:
+        return "api", True, False
+    detail_persistence_mismatch = (
+        any(
+            token in lowered
+            for token in (
+                "精确详情", "详情回读", "详情响应", "详情接口", "详情数据",
+            )
+        )
+        and any(
+            token in lowered
+            for token in ("不一致", "不匹配", "未保存", "保存值错误")
+        )
+    )
+    if detail_persistence_mismatch:
+        return "data-closure", True, False
     categories = (
-        ("api", ("保存接口", "网络连接失败", "业务接口", "接口响应")),
         ("security-permission", ("越权", "权限与页面", "隐藏按钮", "敏感数据", "脚本被执行", "xss", "csrf")),
         ("state-transition", ("状态流转", "状态未更新", "审批状态", "撤回", "驳回")),
         ("idempotency", ("重复新增", "重复提交", "重复扣减", "幂等")),
@@ -225,7 +291,13 @@ def _classify_failure(
         ("audit-trail", ("创建人", "修改人", "操作日志", "审计", "修改时间")),
         ("external-dependency", ("第三方", "外部依赖", "未降级", "依赖服务")),
         ("performance-capacity", ("页面卡", "请求超时", "响应超时", "性能", "超过阈值", "容量")),
-        ("data-closure", ("回显", "列表未出现", "数据不一致", "主键缺失", "重复选项", "详情")),
+        ("data-closure", (
+            "回显", "列表未出现", "数据不一致", "主键缺失", "重复选项",
+        )),
+        ("api", (
+            "网络连接失败", "业务接口失败", "接口响应业务失败",
+            "接口响应失败", "接口无响应", "接口异常",
+        )),
         ("operation-result", (
             "弹窗未关闭", "表单未关闭", "新增保存未完成",
             "删除未生效", "确认操作未执行", "保存无结果",
@@ -236,7 +308,13 @@ def _classify_failure(
     for category, tokens in categories:
         if any(token in lowered for token in tokens):
             return category, True, False
-    if any(token in lowered for token in ("http ", "接口", "响应", "response", "主键")):
+    if (
+        re.search(r"\bhttp\s*[45]\d{2}\b", lowered)
+        or any(
+            token in lowered
+            for token in ("response failed", "response error", "business code failed")
+        )
+    ):
         return "api", True, False
     return "unknown", False, True
 
@@ -331,7 +409,13 @@ def drafts_from_allure(results_dir: Path) -> list[BugDraft]:
         if error_detail:
             title += f"，{error_detail}"
         category, reportable, category_requires_review = _classify_failure(
-            message, test_name=test_name, failure_url=failure_url,
+            message,
+            test_name=test_name,
+            failure_url=failure_url,
+            classification=(
+                _value(labels, "classification")
+                or _value(parameters, "classification")
+            ),
         )
         fingerprint = _failure_fingerprint(
             module=display,

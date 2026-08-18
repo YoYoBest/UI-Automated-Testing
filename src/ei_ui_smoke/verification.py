@@ -13,6 +13,8 @@ BUSINESS_ID_KEYS = (
     "appId", "allId", "dataKey", "itemId",
 )
 
+BUSINESS_ID_ENVELOPES = ("data", "result", "body", "content")
+
 
 def response_matches(url: str, pattern: str) -> bool:
     if not pattern:
@@ -21,28 +23,94 @@ def response_matches(url: str, pattern: str) -> bool:
 
 
 def extract_business_id(payload: Any, keys: Iterable[str] = BUSINESS_ID_KEYS) -> str:
+    """Return one unambiguous primary-record ID from a save response.
+
+    Save responses may contain child-table rows, attachments, or audit records,
+    all of which commonly expose a generic ``id``.  Only direct response fields
+    and direct records reached through known response envelopes are eligible.
+    Arbitrary recursive traversal is deliberately forbidden.
+    """
     if payload in (None, ""):
         return ""
-    if isinstance(payload, (str, int)):
-        return str(payload)
-    if isinstance(payload, list):
-        for item in payload:
-            found = extract_business_id(item, keys)
-            if found:
-                return found
+    if isinstance(payload, (str, int)) and not isinstance(payload, bool):
+        return str(payload).strip()
+    if not isinstance(payload, dict):
         return ""
+
+    normalized_keys = tuple(str(key).lower() for key in keys)
+    candidates: list[str] = []
+    current: Any = payload
+    for _depth in range(6):
+        if isinstance(current, dict):
+            lowered = {str(key).lower(): value for key, value in current.items()}
+            direct = {
+                str(lowered[key]).strip()
+                for key in normalized_keys
+                if key in lowered and lowered[key] not in (None, "")
+            }
+            if len(direct) > 1:
+                return ""
+            if direct:
+                candidates.extend(direct)
+
+            envelopes = [
+                current.get(name)
+                for name in BUSINESS_ID_ENVELOPES
+                if current.get(name) not in (None, "")
+            ]
+            if not envelopes:
+                break
+            if len(envelopes) != 1:
+                envelope_ids = {
+                    identifier
+                    for envelope in envelopes
+                    if (identifier := _direct_envelope_business_id(
+                        envelope, normalized_keys
+                    ))
+                }
+                if len(envelope_ids) != 1:
+                    return ""
+                candidates.extend(envelope_ids)
+                break
+            current = envelopes[0]
+            continue
+
+        if isinstance(current, list):
+            if len(current) != 1:
+                return ""
+            current = current[0]
+            continue
+
+        if isinstance(current, (str, int)) and not isinstance(current, bool):
+            value = str(current).strip()
+            if value:
+                candidates.append(value)
+        break
+
+    unique = set(candidates)
+    return candidates[0] if len(unique) == 1 else ""
+
+
+def _direct_envelope_business_id(
+    payload: Any,
+    normalized_keys: tuple[str, ...],
+) -> str:
+    """Read an ID from one envelope level without traversing child objects."""
+    if isinstance(payload, (str, int)) and not isinstance(payload, bool):
+        return str(payload).strip()
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            return ""
+        payload = payload[0]
     if not isinstance(payload, dict):
         return ""
     lowered = {str(key).lower(): value for key, value in payload.items()}
-    for key in keys:
-        value = lowered.get(key.lower())
-        if value not in (None, ""):
-            return str(value)
-    for envelope in ("data", "result", "body", "content"):
-        found = extract_business_id(payload.get(envelope), keys)
-        if found:
-            return found
-    return ""
+    values = {
+        str(lowered[key]).strip()
+        for key in normalized_keys
+        if key in lowered and lowered[key] not in (None, "")
+    }
+    return next(iter(values)) if len(values) == 1 else ""
 
 
 def extract_runtime_data(response: Any) -> dict[str, Any]:

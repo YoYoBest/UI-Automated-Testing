@@ -8,7 +8,7 @@ from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
 from ei_ui_smoke.module_driver import ModuleSmokeDriver
-from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.source_form import discover_form_contract
 from ei_ui_smoke.tab_navigation import activate_page_tab
 
 
@@ -24,27 +24,34 @@ def test_selected_module_auto_add_or_page_access(browser_page, request):
     component = os.getenv("EI_COMPONENT", "")
     if tab_label := os.getenv("EI_PAGE_TAB", "").strip():
         activate_page_tab(browser_page, tab_label)
-    source_fields = discover_custom_form_fields(settings.source_root, component)
+    source_contract = discover_form_contract(settings.source_root, component)
     dynamic_collections = load_dynamic_collection_specs(
         project_root / "data",
         form_code=os.getenv("EI_FORM_CODE", "") or settings.form_code,
         component=component,
     )
-    result = ModuleSmokeDriver(
+    driver = ModuleSmokeDriver(
         browser_page,
         strategy,
-        source_fields=source_fields,
+        source_fields=list(source_contract.fields),
+        source_branch_candidates=source_contract.branch_candidates,
+        source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=data_pool.default_upload_file(),
         dynamic_collections=dynamic_collections,
         automation_record_registry=(
             project_root / "artifacts" / "automation-record-registry.json"
         ),
-    ).run()
-    if os.getenv("EI_REQUIRE_ADD", "false").lower() == "true":
+    )
+    require_add = os.getenv("EI_REQUIRE_ADD", "false").lower() == "true"
+    if not require_add:
+        driver.run()
+        return
+
+    branch_results = driver.run_all_branches()
+    assert branch_results, "所选模块未产生任何可验证的新增分支结果"
+    for result in branch_results:
         assert result.mode in {
             "add_and_detail_verified",
             "add_and_edit_form_verified",
             "add_and_list_verified",
-        }, (
-            "所选模块未完成新增及保存后数据核对"
-        )
+        }, "所选模块存在未完成新增及保存后数据核对的分支"

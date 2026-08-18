@@ -9,7 +9,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -58,6 +58,7 @@ from .zentao import ZentaoRunResult, process_allure_failures
 
 
 DEFAULT_SOURCE = r"D:\Auto_Testing\Project_Purvar\SHZY\ei-parent"
+DEFAULT_FI_SOURCE = r"D:\Auto_Testing\Project_Purvar\SHZY\fi-parent"
 DEFAULT_COMMON_CASES_DIR = Path(r"D:\Auto_Testing\UI-Test-Automation\tests\Common_Test_Cases")
 DEFAULT_COMMON_CASES_FILENAME = "公共用例_UI自动化.xlsx"
 DEFAULT_MODULE_CASES_FILENAME = "建设项目_个性化用例.xlsx"
@@ -82,6 +83,68 @@ NONSTANDARD_EDIT_FORM_ACTIONS = ("立项准备", "入库申请", "跟进")
 RUN_BUTTON_IDLE_TEXT = "开始执行"
 ZENTAO_REQUIRED_SETTINGS = ("ZENTAO_URL", "ZENTAO_USERNAME", "ZENTAO_PASSWORD")
 DEFER_SKILL_GATE_ENV = "EI_DEFER_SKILL_MAINTENANCE_GATE"
+
+
+@dataclass
+class ProjectProfile:
+    """One independently configured deployed application in the launcher."""
+
+    key: str
+    label: str
+    source: object
+    system_url: object
+    storage: object
+    username: object
+    password: object
+    enabled: object
+
+
+class _StaticValue:
+    """Small Tk-variable compatible value used by structural unit-test doubles."""
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+PROJECT_ORDER = ("EI", "FI")
+PROJECT_LABELS = {"EI": "EI 项目", "FI": "FI 项目"}
+
+
+def namespace_project_items(
+    project_key: str, project_label: str, items: list[ModuleItem],
+) -> list[ModuleItem]:
+    """Keep otherwise identical EI/FI menu identities distinct in one tree."""
+    return [
+        replace(
+            item,
+            id=f"{project_key}::{item.id}",
+            path=(project_label, *item.path),
+        )
+        for item in items
+    ]
+
+
+def project_key_from_item(item: ModuleItem) -> str:
+    """Return the launcher project namespace, retaining legacy EI item support."""
+    prefix, marker, _rest = item.id.partition("::")
+    return prefix if marker and prefix in PROJECT_ORDER else "EI"
+
+
+def is_project_all_item(item: ModuleItem) -> bool:
+    return item.id == "ALL" or item.id.endswith("::ALL")
+
+
+def ordered_project_all_items(items: list[ModuleItem]) -> list[ModuleItem]:
+    """Return one ALL shortcut per project in the launcher display order."""
+    all_items = {
+        project_key_from_item(item): item
+        for item in items
+        if is_project_all_item(item)
+    }
+    return [all_items[project_key] for project_key in PROJECT_ORDER if project_key in all_items]
 
 
 def run_button_running_text(headless: bool) -> str:
@@ -567,8 +630,10 @@ def default_module_cases_workbook(project_root: Path) -> str:
     return workbook.as_posix()
 
 
-def default_storage_state(project_root: Path) -> str:
-    configured = os.getenv("EI_STORAGE_STATE", "").strip()
+def default_storage_state(
+    project_root: Path, environment_key: str = "EI_STORAGE_STATE",
+) -> str:
+    configured = os.getenv(environment_key, "").strip()
     if configured:
         return configured
     state_file = project_root / "artifacts" / "auth-state.json"
@@ -1339,13 +1404,20 @@ def command_failure_names(target, command_env, test_file: str, output: str = "")
 
 
 def resolve_selected_targets(items: list[ModuleItem], selected_items: list[ModuleItem]) -> list[ModuleItem]:
-    select_all = any(item.id == "ALL" for item in selected_items)
+    selected_all_projects = {
+        project_key_from_item(item)
+        for item in selected_items
+        if is_project_all_item(item)
+    }
     selected_ids = {item.id for item in selected_items}
     selected = [
         item for item in items
-        if item.id != "ALL"
+        if not is_project_all_item(item)
         and is_executable_target(item)
-        and (select_all or item.id in selected_ids)
+        and (
+            project_key_from_item(item) in selected_all_projects
+            or item.id in selected_ids
+        )
     ]
     return selected
 
@@ -1552,14 +1624,36 @@ class Launcher(tk.Tk):
         self.url_history = load_url_history(self.url_history_file)
         self.configured_codes = self._load_configured_codes()
         self.items: list[ModuleItem] = []
+        self.project_items: dict[str, list[ModuleItem]] = {
+            project_key: [] for project_key in PROJECT_ORDER
+        }
         self.by_tree_id: dict[str, ModuleItem] = {}
         self.source = tk.StringVar(value=DEFAULT_SOURCE)
-        self.system_url = tk.StringVar(value=os.getenv("EI_BASE_URL", ""))
+        self.system_url = tk.StringVar(
+            value=os.getenv("EI_BASE_URL", "") or os.getenv("FI_BASE_URL", "")
+        )
         self.query = tk.StringVar()
         self.mode = tk.StringVar(value=DEFAULT_EXECUTION_MODE)
         self.headless = tk.BooleanVar(value=False)
         self.submit_zentao = tk.BooleanVar(value=default_submit_zentao())
         self.storage = tk.StringVar(value=default_storage_state(self.project_root))
+        self.projects = {
+            "EI": ProjectProfile(
+                "EI", PROJECT_LABELS["EI"], self.source, self.system_url,
+                self.storage, tk.StringVar(value=os.getenv("EI_USERNAME", "")),
+                tk.StringVar(value=os.getenv("EI_PASSWORD", "")),
+                tk.BooleanVar(value=True),
+            ),
+            "FI": ProjectProfile(
+                "FI", PROJECT_LABELS["FI"],
+                tk.StringVar(value=DEFAULT_FI_SOURCE),
+                self.system_url,
+                tk.StringVar(value=default_storage_state(self.project_root, "FI_STORAGE_STATE")),
+                tk.StringVar(value=os.getenv("FI_USERNAME", "")),
+                tk.StringVar(value=os.getenv("FI_PASSWORD", "")),
+                tk.BooleanVar(value=False),
+            ),
+        }
         self.common_cases_excel = tk.StringVar(
             value=os.getenv("EI_COMMON_CASES_EXCEL")
             or default_common_cases_workbook(self.project_root)
@@ -1572,8 +1666,8 @@ class Launcher(tk.Tk):
         )
         self.module_cases_sheet = tk.StringVar()
         self.module_case_ids = tk.StringVar()
-        self.username = tk.StringVar(value=os.getenv("EI_USERNAME", ""))
-        self.password = tk.StringVar(value=os.getenv("EI_PASSWORD", ""))
+        self.username = self.projects["EI"].username
+        self.password = self.projects["EI"].password
         self.status = tk.StringVar(value="请先选择源码目录并扫描模块。")
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="尚未执行")
@@ -1586,8 +1680,9 @@ class Launcher(tk.Tk):
     def _fit_to_screen(self) -> None:
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
-        width = max(900, int(screen_width * 0.8))
-        height = max(650, int(screen_height * 0.8))
+        # A bounded desktop width keeps form controls readable on ultra-wide screens.
+        width = min(1680, max(1080, int(screen_width * 0.8)))
+        height = min(1000, max(650, int(screen_height * 0.8)))
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -1626,6 +1721,15 @@ class Launcher(tk.Tk):
         )
         style.configure("TButton", background="#DCE3EA", foreground="#1F2937", bordercolor="#DCE3EA", lightcolor="#DCE3EA", darkcolor="#DCE3EA", padding=(13, 7), font=("Microsoft YaHei UI", 9), borderwidth=0, relief="flat")
         style.map("TButton", background=[("active", "#CAD4DE"), ("pressed", "#B8C5D1")], foreground=[("disabled", "#94A3B8")])
+        style.configure(
+            "Quiet.TButton", background="#EEF2F6", foreground="#334155",
+            bordercolor="#EEF2F6", lightcolor="#EEF2F6", darkcolor="#EEF2F6",
+            padding=(11, 7), font=("Microsoft YaHei UI", 9), borderwidth=0,
+        )
+        style.map(
+            "Quiet.TButton", background=[("active", "#E2E8F0"), ("pressed", "#CBD5E1")],
+            foreground=[("disabled", "#94A3B8")],
+        )
         style.configure("Primary.TButton", background="#2563EB", foreground="#FFFFFF", bordercolor="#2563EB", lightcolor="#2563EB", darkcolor="#2563EB", font=("Microsoft YaHei UI", 10, "bold"), padding=(22, 9), borderwidth=0)
         style.map("Primary.TButton", background=[("active", "#1D4ED8"), ("pressed", "#1E40AF")], foreground=[("disabled", "#D7E3FF")])
         style.configure("Accent.TButton", background="#377DFF", foreground="#FFFFFF", bordercolor="#377DFF", lightcolor="#377DFF", darkcolor="#377DFF", borderwidth=0)
@@ -1723,35 +1827,92 @@ class Launcher(tk.Tk):
             return "页面访问"
         return "待获取路由"
 
+    def _project_profile(self, project_key: str) -> ProjectProfile:
+        """Read a project configuration while retaining test-double compatibility."""
+        profiles = getattr(self, "projects", None)
+        if isinstance(profiles, dict) and project_key in profiles:
+            return profiles[project_key]
+        return ProjectProfile(
+            project_key, PROJECT_LABELS[project_key], self.source, self.system_url,
+            self.storage, self.username, self.password, _StaticValue(True),
+        )
+
+    def _rebuild_project_items(self) -> None:
+        self.items = [
+            item
+            for project_key in PROJECT_ORDER
+            for item in self.project_items.get(project_key, [])
+        ]
+
+    def _project_enabled(self, project_key: str) -> bool:
+        return bool(Launcher._project_profile(self, project_key).enabled.get())
+
     def _build(self) -> None:
         self._configure_styles()
         root = ttk.Frame(self, style="App.TFrame")
         root.pack(fill="both", expand=True)
-        connection = ttk.Frame(root, style="Surface.TFrame", padding=(16, 11))
+        connection = ttk.Frame(root, style="Surface.TFrame", padding=(18, 14))
         connection.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
-        ttk.Label(connection, text="测试环境", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
-        ttk.Label(connection, text="源码目录", style="Field.TLabel").grid(row=1, column=0, sticky="w")
-        ttk.Label(connection, text="已部署系统地址", style="Field.TLabel").grid(row=1, column=2, sticky="w", padx=(22, 0))
-        ttk.Entry(connection, textvariable=self.source).grid(row=2, column=0, sticky="ew", pady=(5, 0))
-        source_actions = ttk.Frame(connection, style="Surface.TFrame")
-        source_actions.grid(row=2, column=1, padx=(8, 0), pady=(5, 0))
-        ttk.Button(source_actions, text="浏览", command=self.choose_source).pack(side="left")
-        ttk.Button(source_actions, text="扫描", command=self.scan).pack(side="left", padx=(6, 0))
-        self.system_url_input = ttk.Combobox(
-            connection,
-            textvariable=self.system_url,
-            values=self.url_history,
-            state="normal",
+        ttk.Label(connection, text="测试环境", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 12)
         )
-        self.system_url_input.grid(row=2, column=2, sticky="ew", padx=(22, 0), pady=(5, 0))
-        self.system_url_input.bind("<Button-1>", self._show_url_history)
-        self.fetch_menu_button = ttk.Button(
-            connection, text="连接并获取菜单", command=self.fetch_runtime_menu,
+        environment_body = ttk.Frame(connection, style="Surface.TFrame")
+        environment_body.grid(row=1, column=0, sticky="ew")
+        ttk.Label(
+            environment_body, text="已部署系统地址", style="Field.TLabel"
+        ).grid(row=0, column=0, sticky="w")
+        url_input = ttk.Combobox(
+            environment_body, textvariable=self.system_url, values=self.url_history,
+            state="normal", width=82,
+        )
+        url_input.grid(
+            row=1, column=0, sticky="ew", pady=(6, 0)
+        )
+        url_input.bind("<Button-1>", self._show_url_history)
+        self.project_url_inputs = {"EI": url_input}
+        project_row = ttk.Frame(environment_body, style="Surface.TFrame")
+        project_row.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        for column, project_key in enumerate(PROJECT_ORDER):
+            profile = self.projects[project_key]
+            project_config = ttk.Frame(project_row, style="Surface.TFrame")
+            project_config.grid(
+                row=0, column=column, sticky="ew",
+                padx=(0, 12 if column == 0 else 0),
+            )
+            ttk.Checkbutton(
+                project_config, text=project_key, variable=profile.enabled,
+                style="Clean.TCheckbutton",
+            ).grid(row=0, column=0, sticky="w")
+            ttk.Entry(project_config, textvariable=profile.source, width=31).grid(
+                row=0, column=1, sticky="ew", padx=(8, 0)
+            )
+            ttk.Button(
+                project_config, text="浏览",
+                width=6, style="Quiet.TButton",
+                command=lambda key=project_key: self.choose_source(key),
+            ).grid(row=0, column=2, padx=(8, 0))
+            ttk.Button(
+                project_config, text="扫描",
+                width=6, style="Quiet.TButton",
+                command=lambda key=project_key: self.scan_project(key),
+            ).grid(row=0, column=3, padx=(6, 0))
+            project_config.columnconfigure(1, weight=1)
+        fetch_button = ttk.Button(
+            project_row, text="获取菜单", width=10,
+            command=self.fetch_runtime_menu_selected_projects,
             style="Accent.TButton",
         )
-        self.fetch_menu_button.grid(row=2, column=3, padx=(8, 0), pady=(5, 0))
+        fetch_button.grid(row=0, column=2, sticky="ew")
+        self.project_fetch_buttons = {
+            project_key: fetch_button for project_key in PROJECT_ORDER
+        }
+        # Legacy attribute aliases keep existing launcher integrations intact.
+        self.system_url_input = self.project_url_inputs["EI"]
+        self.fetch_menu_button = fetch_button
+        project_row.columnconfigure(0, weight=1, uniform="project-config")
+        project_row.columnconfigure(1, weight=1, uniform="project-config")
         connection.columnconfigure(0, weight=1)
-        connection.columnconfigure(2, weight=1)
+        environment_body.columnconfigure(0, weight=1)
 
         workspace = ttk.Frame(root, style="Surface.TFrame", padding=(16, 11))
         workspace.grid(row=1, column=0, sticky="nsew", padx=14)
@@ -1950,21 +2111,29 @@ class Launcher(tk.Tk):
         image = self._tree_expanded_image if self.tree.item(tree_id, "open") else self._tree_collapsed_image
         self.tree.item(tree_id, image=image)
 
-    def choose_source(self) -> None:
-        selected = filedialog.askdirectory(initialdir=self.source.get() or DEFAULT_SOURCE)
+    def choose_source(self, project_key: str = "EI") -> None:
+        profile = Launcher._project_profile(self, project_key)
+        selected = filedialog.askdirectory(
+            initialdir=profile.source.get() or (
+                DEFAULT_SOURCE if project_key == "EI" else DEFAULT_FI_SOURCE
+            )
+        )
         if selected:
-            self.source.set(selected)
-            self.scan()
+            profile.source.set(selected)
+            self.scan_project(project_key)
 
-    def choose_storage(self) -> None:
-        initial_dir, initial_file = storage_dialog_defaults(self.project_root, self.storage.get())
+    def choose_storage(self, project_key: str = "EI") -> None:
+        profile = Launcher._project_profile(self, project_key)
+        initial_dir, initial_file = storage_dialog_defaults(
+            self.project_root, profile.storage.get()
+        )
         selected = filedialog.askopenfilename(
             initialdir=str(initial_dir),
             initialfile=initial_file,
             filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
         )
         if selected:
-            self.storage.set(selected)
+            profile.storage.set(selected)
 
     def choose_common_cases_excel(self) -> None:
         initial_dir, initial_file = common_cases_dialog_defaults(
@@ -2104,32 +2273,134 @@ class Launcher(tk.Tk):
         return values
 
     def scan(self) -> None:
+        Launcher.scan_project(self, "EI")
+
+    def scan_project(self, project_key: str) -> None:
+        profile = Launcher._project_profile(self, project_key)
         try:
-            self.items = discover_modules(Path(self.source.get().strip()))
+            raw_items = discover_modules(Path(profile.source.get().strip()))
         except (OSError, ValueError) as exc:
-            self.items = []
+            self.project_items[project_key] = []
+            self._rebuild_project_items()
             self.render()
             self.status.set("扫描失败，请检查源码目录。")
             messagebox.showerror("扫描失败", str(exc))
             return
+        self.project_items[project_key] = namespace_project_items(
+            project_key, profile.label, raw_items
+        )
+        self._rebuild_project_items()
         self.render()
-        runnable = sum(item.runnable for item in self.items)
+        runnable = sum(item.runnable for item in raw_items)
         self.status.set(
-            f"源码发现 {len(self.items) - 1} 个页面，{runnable} 个解析到 formCode；请登录系统获取真实中文菜单和路由。"
+            f"{profile.label} 源码发现 {len(raw_items) - 1} 个页面，"
+            f"{runnable} 个解析到 formCode；请登录系统获取真实中文菜单和路由。"
         )
 
     def fetch_runtime_menu(self) -> None:
+        Launcher.fetch_runtime_menu_project(self, "EI")
+
+    def fetch_runtime_menu_selected_projects(self) -> None:
+        """Capture menu trees for the selected profiles through one UI command."""
+        selected_projects = [
+            project_key for project_key in PROJECT_ORDER
+            if Launcher._project_enabled(self, project_key)
+        ]
+        if not selected_projects:
+            messagebox.showwarning("请选择项目", "请至少勾选 EI 或 FI 后再获取菜单。")
+            return
         url = self.system_url.get().strip()
         if not url:
             messagebox.showwarning("缺少系统地址", "请填写已部署系统的登录页地址。")
             return
-        source_root = Path(self.source.get().strip())
-        username = self.username.get().strip()
-        password = self.password.get()
-        storage_state = self.storage.get().strip()
-        headless = self.headless.get()
         self.fetch_menu_button.configure(state="disabled")
-        self.status.set("正在登录并获取菜单，请在弹出的浏览器中完成登录...")
+        labels = "、".join(PROJECT_LABELS[project_key] for project_key in selected_projects)
+        self.status.set(f"正在登录并获取 {labels} 菜单，请在弹出的浏览器中完成登录...")
+        headless = self.headless.get()
+
+        def worker() -> None:
+            completed: list[tuple[str, list[ModuleItem], str]] = []
+            failures: list[tuple[str, str]] = []
+            for project_key in selected_projects:
+                profile = Launcher._project_profile(self, project_key)
+                try:
+                    source_root = Path(profile.source.get().strip())
+                    aligned_url = align_application_url(
+                        url, resolve_view_root(source_root).name
+                    )
+                    payload, saved_state = capture_menu(
+                        aligned_url,
+                        username=profile.username.get().strip(),
+                        password=profile.password.get(),
+                        storage_state=profile.storage.get().strip(),
+                        headless=headless,
+                        source_root=source_root,
+                    )
+                    completed.append((
+                        project_key, modules_from_menu(payload, source_root), saved_state,
+                    ))
+                except Exception as exc:
+                    failures.append((project_key, str(exc)))
+            self.after(
+                0,
+                Launcher._finish_selected_runtime_menus,
+                self,
+                completed,
+                failures,
+                url,
+            )
+
+        threading.Thread(
+            target=worker, name="runtime-menu-capture-selected", daemon=True
+        ).start()
+
+    def _finish_selected_runtime_menus(
+        self,
+        completed: list[tuple[str, list[ModuleItem], str]],
+        failures: list[tuple[str, str]],
+        used_url: str,
+    ) -> None:
+        self.fetch_menu_button.configure(state="normal")
+        for project_key, items, saved_state in completed:
+            profile = Launcher._project_profile(self, project_key)
+            self.project_items[project_key] = namespace_project_items(
+                project_key, profile.label, items
+            )
+            profile.storage.set(str((self.project_root / saved_state).resolve()))
+        if completed:
+            self._rebuild_project_items()
+            self.render()
+            self.url_history = save_url_history(self.url_history_file, used_url)
+            for input_widget in self.project_url_inputs.values():
+                input_widget.configure(values=self.url_history)
+        completed_labels = "、".join(PROJECT_LABELS[key] for key, _items, _state in completed)
+        if failures:
+            failed_labels = "、".join(PROJECT_LABELS[key] for key, _error in failures)
+            self.status.set(
+                f"已获取 {completed_labels or '0 个'} 菜单；{failed_labels} 获取失败。"
+            )
+            messagebox.showerror(
+                "菜单获取未全部完成",
+                "\n\n".join(f"{PROJECT_LABELS[key]}：{error}" for key, error in failures),
+            )
+            return
+        self.status.set(f"已获取 {completed_labels} 菜单，请在下方选择模块。")
+
+    def fetch_runtime_menu_project(self, project_key: str) -> None:
+        profile = Launcher._project_profile(self, project_key)
+        url = profile.system_url.get().strip()
+        if not url:
+            messagebox.showwarning("缺少系统地址", "请填写已部署系统的登录页地址。")
+            return
+        source_root = Path(profile.source.get().strip())
+        username = profile.username.get().strip()
+        password = profile.password.get()
+        storage_state = profile.storage.get().strip()
+        headless = self.headless.get()
+        fetch_buttons = getattr(self, "project_fetch_buttons", {})
+        button = fetch_buttons.get(project_key, self.fetch_menu_button)
+        button.configure(state="disabled")
+        self.status.set(f"正在登录并获取 {profile.label} 菜单，请在弹出的浏览器中完成登录...")
 
         def worker() -> None:
             try:
@@ -2146,14 +2417,24 @@ class Launcher(tk.Tk):
                 )
                 items = modules_from_menu(payload, source_root)
             except Exception as exc:
-                self.after(0, self._finish_runtime_menu_error, str(exc))
+                if project_key == "EI" and not hasattr(self, "project_items"):
+                    self.after(0, self._finish_runtime_menu_error, str(exc))
+                else:
+                    self.after(0, self._finish_runtime_menu_error, str(exc), project_key)
                 return
-            self.after(0, self._finish_runtime_menu, items, saved_state, url)
+            if project_key == "EI" and not hasattr(self, "project_items"):
+                self.after(0, self._finish_runtime_menu, items, saved_state, url)
+            else:
+                self.after(
+                    0, self._finish_runtime_menu, items, saved_state, url, project_key
+                )
 
         threading.Thread(target=worker, name="runtime-menu-capture", daemon=True).start()
 
-    def _finish_runtime_menu_error(self, error: str) -> None:
-        self.fetch_menu_button.configure(state="normal")
+    def _finish_runtime_menu_error(self, error: str, project_key: str = "EI") -> None:
+        getattr(self, "project_fetch_buttons", {}).get(
+            project_key, self.fetch_menu_button
+        ).configure(state="normal")
         self.status.set("获取菜单失败。")
         messagebox.showerror("获取菜单失败", error)
 
@@ -2162,48 +2443,75 @@ class Launcher(tk.Tk):
         items: list[ModuleItem],
         saved_state: str,
         used_url: str = "",
+        project_key: str = "EI",
     ) -> None:
-        self.fetch_menu_button.configure(state="normal")
+        profile = Launcher._project_profile(self, project_key)
+        getattr(self, "project_fetch_buttons", {}).get(
+            project_key, self.fetch_menu_button
+        ).configure(state="normal")
         self.url_history = save_url_history(self.url_history_file, used_url)
-        self.system_url_input.configure(values=self.url_history)
-        self.items = items
-        self.storage.set(str((self.project_root / saved_state).resolve()))
+        for input_widget in getattr(self, "project_url_inputs", {}).values():
+            input_widget.configure(values=self.url_history)
+        # Compatibility for structural tests which build only the old widget.
+        if not getattr(self, "project_url_inputs", None):
+            self.system_url_input.configure(values=self.url_history)
+        if hasattr(self, "project_items"):
+            self.project_items[project_key] = namespace_project_items(
+                project_key, profile.label, items
+            )
+            self._rebuild_project_items()
+        else:
+            self.items = items
+        profile.storage.set(str((self.project_root / saved_state).resolve()))
         self.render()
-        leaves = sum(is_executable_target(item) for item in self.items if item.id != "ALL")
+        leaves = sum(is_executable_target(item) for item in items if item.id != "ALL")
         mismatches = sum(
-            1 for item in self.items
+            1 for item in items
             if item.id != "ALL" and item.runnable and item.component and not item.source_file
         )
         mismatch_text = f"；{mismatches} 个页面与所选源码不匹配，未生成猜测按钮" if mismatches else ""
         self.status.set(
-            f"已从登录接口获取 {len(self.items) - 1} 个菜单节点，{leaves} 个叶子模块可执行"
+            f"已从登录接口获取 {profile.label} 的 {len(items) - 1} 个菜单节点，{leaves} 个叶子模块可执行"
             f"{mismatch_text}。"
         )
 
 
     def _show_url_history(self, _event=None) -> None:
         if self.url_history:
-            self.after_idle(lambda: self.tk.call("ttk::combobox::Post", self.system_url_input))
+            widget = getattr(_event, "widget", None) or self.system_url_input
+            self.after_idle(lambda: self.tk.call("ttk::combobox::Post", widget))
 
     def render(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self.by_tree_id.clear()
         filtered = search_modules(self.items, self.query.get())
+        # Project-wide execution shortcuts remain fixed at the top, while the
+        # project menu trees below retain their source/runtime hierarchy.
+        all_items = ordered_project_all_items(self.items)
+        visible_items = [item for item in filtered if not is_project_all_item(item)]
+        for item in all_items:
+            project_key = project_key_from_item(item)
+            tree_id = self.tree.insert(
+                "", "end", text=f"{PROJECT_LABELS[project_key]} / ALL",
+                values=("", "全部可运行模块"), tags=("all",),
+                image=self._tree_blank_image,
+            )
+            self.by_tree_id[tree_id] = item
         parent_paths = {
             item.path[:depth]
-            for item in filtered
+            for item in visible_items
             for depth in range(1, len(item.path))
         }
         branch_ids: dict[tuple[str, ...], str] = {}
-        visual_row = 0
-        for item in filtered:
+        visual_row = len(all_items)
+        for item in visible_items:
             parent = ""
             for depth, label in enumerate(item.path):
                 branch = item.path[: depth + 1]
                 if branch not in branch_ids:
                     leaf = depth == len(item.path) - 1
                     should_open = should_open_tree_branch(item, depth, self.query.get())
-                    if item.id == "ALL" and leaf:
+                    if is_project_all_item(item) and leaf:
                         tag = "all"
                     elif item.operation and leaf:
                         tag = "action"
@@ -2216,7 +2524,7 @@ class Launcher(tk.Tk):
                         self._tree_expanded_image if should_open else self._tree_collapsed_image
                     ) if has_children else self._tree_blank_image
                     tree_id = self.tree.insert(parent, "end", text=label, open=should_open,
-                        values=(item.form_code if leaf else "", self._test_type(item) if leaf and item.id != "ALL" else ("全部可运行模块" if leaf else "")),
+                        values=(item.form_code if leaf else "", self._test_type(item) if leaf and not is_project_all_item(item) else ("全部可运行模块" if leaf else "")),
                         tags=(tag,), image=indicator)
                     branch_ids[branch] = tree_id
                     visual_row += 1
@@ -2228,7 +2536,7 @@ class Launcher(tk.Tk):
     def select_all_runnable(self) -> None:
         tree_ids = [
             tree_id for tree_id, item in self.by_tree_id.items()
-            if is_executable_target(item) and item.id != "ALL"
+            if is_executable_target(item) and not is_project_all_item(item)
         ]
         self.tree.selection_set(tree_ids)
         self.update_selection_status()
@@ -2280,17 +2588,45 @@ class Launcher(tk.Tk):
         if not targets:
             messagebox.showwarning("请选择模块", "请选择一个或多个模块，父模块会自动包含其可执行子模块。")
             return
-        if not self.storage.get() and (not self.username.get() or not self.password.get()):
-            messagebox.showwarning("缺少登录信息", "请选择登录状态 JSON，或输入用户名和密码。")
-            return
-        try:
-            aligned_url = align_application_url(
-                self.system_url.get().strip(),
-                resolve_view_root(Path(self.source.get().strip())).name,
-            )
-        except (OSError, ValueError) as exc:
-            messagebox.showwarning("源码目录无效", str(exc))
-            return
+        targets_by_project = {
+            project_key: [
+                target for target in targets
+                if project_key_from_item(target) == project_key
+            ]
+            for project_key in PROJECT_ORDER
+        }
+        targets_by_project = {
+            project_key: project_targets
+            for project_key, project_targets in targets_by_project.items()
+            if project_targets
+        }
+        aligned_urls: dict[str, str] = {}
+        for project_key in targets_by_project:
+            profile = Launcher._project_profile(self, project_key)
+            if not Launcher._project_enabled(self, project_key):
+                messagebox.showwarning(
+                    "项目未启用",
+                    f"已选择 {profile.label} 模块，请先勾选该项目后再执行。",
+                )
+                return
+            if not profile.storage.get() and (
+                not profile.username.get() or not profile.password.get()
+            ):
+                messagebox.showwarning(
+                    "缺少登录信息",
+                    f"{profile.label} 请分别选择登录状态 JSON，或配置用户名和密码。",
+                )
+                return
+            try:
+                aligned_urls[project_key] = align_application_url(
+                    profile.system_url.get().strip(),
+                    resolve_view_root(Path(profile.source.get().strip())).name,
+                )
+            except (OSError, ValueError) as exc:
+                messagebox.showwarning(
+                    f"{profile.label} 源码目录或系统地址无效", str(exc)
+                )
+                return
         mode = self.mode.get()
         resource_pool_mode_errors = [
             (target, resource_pool_mode_preflight_error(target, mode))
@@ -2378,74 +2714,87 @@ class Launcher(tk.Tk):
                     )
                     return
                 effective_module_case_ids = selected_module_case_ids or module_case_ids
-        env = os.environ.copy()
-        env.update({
-            "EI_PARENT_ROOT": self.source.get(), "EI_DATA_MODE": self.mode.get(),
-            "EI_BASE_URL": aligned_url.rstrip("/"),
-            "EI_HEADLESS": str(self.headless.get()).lower(), "EI_STORAGE_STATE": self.storage.get(),
-            "EI_USERNAME": self.username.get(), "EI_PASSWORD": self.password.get(),
-            "EI_AUTOMATION_RUN_ID": (
-                f"{time.strftime('%Y%m%d%H%M%S')}{time.time_ns() % 1_000_000:06d}_"
-                f"{uuid.uuid4().hex[:8]}"
-            ),
-        })
         commands = []
         preflight_errors = []
-        for target in targets:
-            if error := target_preflight_error(target):
-                preflight_errors.append((target, error))
+        root_run_id = (
+            f"{time.strftime('%Y%m%d%H%M%S')}{time.time_ns() % 1_000_000:06d}_"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        # Each project is planned independently.  In particular, action batches
+        # must not carry the EI browser/session environment into FI actions.
+        for project_key in PROJECT_ORDER:
+            project_targets = targets_by_project.get(project_key, [])
+            if not project_targets:
                 continue
-            command_env = env.copy()
-            command_env.pop("EI_REQUIRE_ADD", None)
-            form_url = build_module_url(aligned_url, target.route)
-            command_env.update({
-                "EI_MODULE_ID": target.id,
-                "EI_MODULE_NAME": "/".join(target.path),
-                "EI_FORM_CODE": target.form_code,
-                "EI_FORM_URL": form_url,
-                "EI_COMPONENT": target.component,
-                "EI_ACTION": target.operation,
-                "EI_REQUIRES_BUSINESS_ID": str(target.requires_business_id).lower(),
+            profile = Launcher._project_profile(self, project_key)
+            aligned_url = aligned_urls[project_key]
+            project_env = os.environ.copy()
+            project_env.update({
+                "EI_PARENT_ROOT": profile.source.get(), "EI_DATA_MODE": mode,
+                "EI_BASE_URL": aligned_url.rstrip("/"),
+                "EI_HEADLESS": str(self.headless.get()).lower(),
+                "EI_STORAGE_STATE": profile.storage.get(),
+                "EI_USERNAME": profile.username.get(), "EI_PASSWORD": profile.password.get(),
+                "EI_AUTOMATION_PROJECT": project_key,
+                "EI_AUTOMATION_RUN_ID": f"{root_run_id}_{project_key.lower()}",
             })
-            if target.tab_label:
-                command_env["EI_PAGE_TAB"] = target.tab_label
-            else:
-                command_env.pop("EI_PAGE_TAB", None)
-            if target.requires_business_id:
-                command_env["EI_ENTRY_URL"] = detail_parent_url(form_url)
-            else:
-                command_env.pop("EI_ENTRY_URL", None)
-            if target.operation_path:
-                command_env["EI_ACTION_PATH"] = json.dumps(
-                    target.operation_path, ensure_ascii=False
-                )
-            else:
-                command_env.pop("EI_ACTION_PATH", None)
-            if target.operation:
-                test_file = "tests/test_module_action.py"
-                if requires_add_cycle(target.operation, target.operation_path):
+            project_commands = []
+            for target in project_targets:
+                if error := target_preflight_error(target):
+                    preflight_errors.append((target, error))
+                    continue
+                command_env = project_env.copy()
+                command_env.pop("EI_REQUIRE_ADD", None)
+                form_url = build_module_url(aligned_url, target.route)
+                command_env.update({
+                    "EI_MODULE_ID": target.id,
+                    "EI_MODULE_NAME": "/".join(target.path),
+                    "EI_FORM_CODE": target.form_code,
+                    "EI_FORM_URL": form_url,
+                    "EI_COMPONENT": target.component,
+                    "EI_ACTION": target.operation,
+                    "EI_REQUIRES_BUSINESS_ID": str(target.requires_business_id).lower(),
+                })
+                if target.tab_label:
+                    command_env["EI_PAGE_TAB"] = target.tab_label
+                else:
+                    command_env.pop("EI_PAGE_TAB", None)
+                if target.requires_business_id:
+                    command_env["EI_ENTRY_URL"] = detail_parent_url(form_url)
+                else:
+                    command_env.pop("EI_ENTRY_URL", None)
+                if target.operation_path:
+                    command_env["EI_ACTION_PATH"] = json.dumps(
+                        target.operation_path, ensure_ascii=False
+                    )
+                else:
+                    command_env.pop("EI_ACTION_PATH", None)
+                if target.operation:
+                    test_file = "tests/test_module_action.py"
+                    if requires_add_cycle(target.operation, target.operation_path):
+                        command_env["EI_REQUIRE_ADD"] = "true"
+                else:
+                    test_file = (
+                        "tests/test_form_smoke.py" if self._can_run(target)
+                        else "tests/test_module_smoke.py"
+                    )
+                if test_file == "tests/test_module_smoke.py" and target.supports_add:
                     command_env["EI_REQUIRE_ADD"] = "true"
-            else:
-                test_file = "tests/test_form_smoke.py" if self._can_run(target) else "tests/test_module_smoke.py"
-            if test_file == "tests/test_module_smoke.py" and target.supports_add:
-                command_env["EI_REQUIRE_ADD"] = "true"
-            commands.append((target, command_env, test_file))
-        commands = suppress_pages_covered_by_actions(commands)
-        commands = add_standard_common_field_commands(
-            commands, mode=mode, workbook=common_workbook,
-            case_ids=effective_common_case_ids,
-            project_root=self.project_root,
-        )
-        commands = add_standard_module_case_commands(
-            commands, mode=mode, workbook=module_workbook,
-            case_ids=effective_module_case_ids,
-            project_root=self.project_root,
-        )
-        commands = suppress_base_commands_covered_by_excel_cases(commands)
-        commands = group_action_commands(commands)
-        commands = prioritize_progress_discovery_commands(commands)
+                project_commands.append((target, command_env, test_file))
+            project_commands = suppress_pages_covered_by_actions(project_commands)
+            project_commands = add_standard_common_field_commands(
+                project_commands, mode=mode, workbook=common_workbook,
+                case_ids=effective_common_case_ids, project_root=self.project_root,
+            )
+            project_commands = add_standard_module_case_commands(
+                project_commands, mode=mode, workbook=module_workbook,
+                case_ids=effective_module_case_ids, project_root=self.project_root,
+            )
+            project_commands = suppress_base_commands_covered_by_excel_cases(project_commands)
+            project_commands = group_action_commands(project_commands)
+            commands.extend(prioritize_progress_discovery_commands(project_commands))
         logical_target_count = len(command_target_names(commands)) + len(preflight_errors)
-        base_url = aligned_url.rstrip("/")
+        base_url = next(iter(aligned_urls.values())).rstrip("/")
         headless = self.headless.get()
         self.run_button.configure(
             state="disabled", text=run_button_running_text(headless)
@@ -2488,27 +2837,51 @@ class Launcher(tk.Tk):
                 configured_probes = load_environment_api_probes(
                     self.project_root / DEFAULT_PROBES_FILE
                 )
-                required_probes = {
-                    probe.id: probe
-                    for command in commands
-                    for _target, command_env, _test_file
-                    in command_preflight_commands(command)
-                    for probe in matching_probes(configured_probes, command_env)
-                }
-                storage_state = str(commands[0][1].get("EI_STORAGE_STATE", ""))
-                source_root = str(commands[0][1].get("EI_PARENT_ROOT", ""))
-                probe_results = probe_environment_apis(
-                    required_probes.values(), base_url=base_url,
-                    storage_state=storage_state,
-                )
-                commands, environment_blocks = filter_environment_preflight_commands(
-                    commands, probe_results,
-                )
-                environment_warnings = update_version_mismatch_state(
-                    probe_results,
-                    source_version=source_revision(source_root),
-                    state_file=self.project_root / DEFAULT_VERSION_STATE_FILE,
-                )
+                project_commands = {project_key: [] for project_key in PROJECT_ORDER}
+                for command in commands:
+                    project_key = str(
+                        command[1].get("EI_AUTOMATION_PROJECT", "EI")
+                    ).upper()
+                    project_commands.setdefault(project_key, []).append(command)
+                filtered_commands = []
+                probe_results = []
+                project_environments = {}
+                for project_key in PROJECT_ORDER:
+                    commands_for_project = project_commands.get(project_key, [])
+                    if not commands_for_project:
+                        continue
+                    first_environment = commands_for_project[0][1]
+                    project_environments[project_key] = {
+                        "base_url": str(first_environment.get("EI_BASE_URL", "")),
+                        "source_root": str(first_environment.get("EI_PARENT_ROOT", "")),
+                    }
+                    required_probes = {
+                        probe.id: probe
+                        for command in commands_for_project
+                        for _target, command_env, _test_file
+                        in command_preflight_commands(command)
+                        for probe in matching_probes(configured_probes, command_env)
+                    }
+                    project_probe_results = probe_environment_apis(
+                        required_probes.values(),
+                        base_url=project_environments[project_key]["base_url"],
+                        storage_state=str(first_environment.get("EI_STORAGE_STATE", "")),
+                    )
+                    project_runnable, project_blocks = filter_environment_preflight_commands(
+                        commands_for_project, project_probe_results,
+                    )
+                    filtered_commands.extend(project_runnable)
+                    environment_blocks.extend(project_blocks)
+                    probe_results.extend(project_probe_results)
+                    environment_warnings.extend(update_version_mismatch_state(
+                        project_probe_results,
+                        source_version=source_revision(
+                            project_environments[project_key]["source_root"]
+                        ),
+                        state_file=self.project_root / "artifacts" /
+                        f"environment-api-version-state-{project_key.lower()}.json",
+                    ))
+                commands = filtered_commands
                 preflight_report = log_dir / "environment-api-preflight.json"
                 write_environment_preflight_report(
                     preflight_report, probe_results, environment_blocks, environment_warnings,
@@ -2544,7 +2917,9 @@ class Launcher(tk.Tk):
 
             logical_target_names = command_target_names(commands)
             write_environment(allure_paths.results, {
-                "base_url": base_url, "data_mode": mode, "headless": headless,
+                "base_url": base_url, "projects": json.dumps(
+                    project_environments if commands else {}, ensure_ascii=False,
+                ), "data_mode": mode, "headless": headless,
                 "module_count": len(logical_target_names) + len(preflight_errors),
                 "environment_blocked_count": len(environment_blocks),
                 "environment_version_warnings": len(environment_warnings),

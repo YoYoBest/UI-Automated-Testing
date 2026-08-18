@@ -26,7 +26,7 @@ from ei_ui_smoke.module_driver import (
     RecordNotDeletableError,
 )
 from ei_ui_smoke.module_resolver import resolve_form_code
-from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.source_form import discover_form_contract
 from ei_ui_smoke.common_delete_cases import CommonDeleteCase, load_common_delete_cases
 from ei_ui_smoke.urls import detail_parent_url
 
@@ -197,7 +197,7 @@ def _crud_driver(browser_page, request):
     form_code = form_code or module_key
     data_pool = GlobalDataPool.from_directory(project_root / "data")
     strategy = create_data_strategy(mode, data_pool, form_code)
-    source_fields = discover_custom_form_fields(settings.source_root, component)
+    source_contract = discover_form_contract(settings.source_root, component)
     dynamic_collections = load_dynamic_collection_specs(
         project_root / "data",
         form_code=form_code,
@@ -206,7 +206,9 @@ def _crud_driver(browser_page, request):
     return ModuleSmokeDriver(
         browser_page,
         strategy,
-        source_fields=source_fields,
+        source_fields=list(source_contract.fields),
+        source_branch_candidates=source_contract.branch_candidates,
+        source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=data_pool.default_upload_file(),
         dynamic_collections=dynamic_collections,
         automation_record_registry=(
@@ -217,6 +219,7 @@ def _crud_driver(browser_page, request):
 
 def test_crud_driver_ignores_literal_none_form_code(monkeypatch):
     captured = {}
+    branch_candidate = object()
 
     class RequestConfig:
         @staticmethod
@@ -247,18 +250,30 @@ def test_crud_driver_ignores_literal_none_form_code(monkeypatch):
         ) or object(),
     )
     monkeypatch.setattr(
-        f"{__name__}.discover_custom_form_fields", lambda *_args: []
+        f"{__name__}.discover_form_contract",
+        lambda *_args: SimpleNamespace(
+            fields=(),
+            branch_candidates=(branch_candidate,),
+            detail_endpoints=(),
+        ),
     )
     monkeypatch.setattr(
         f"{__name__}.load_dynamic_collection_specs", lambda *_args, **_kwargs: []
     )
     monkeypatch.setattr(
-        f"{__name__}.ModuleSmokeDriver", lambda *_args, **_kwargs: object()
+        f"{__name__}.ModuleSmokeDriver",
+        lambda *_args, **kwargs: captured.update(
+            {"branch_candidates": kwargs["source_branch_candidates"]}
+        ) or object(),
     )
 
     _crud_driver(object(), Request())
 
-    assert captured == {"mode": "standard", "form_code": "BUILD_NETASSETS_MAINTAIL"}
+    assert captured == {
+        "mode": "standard",
+        "form_code": "BUILD_NETASSETS_MAINTAIL",
+        "branch_candidates": (branch_candidate,),
+    }
 
 
 def test_crud_driver_resolves_form_code_when_action_environment_omits_it(monkeypatch):
@@ -291,7 +306,12 @@ def test_crud_driver_resolves_form_code_when_action_environment_omits_it(monkeyp
         f"{__name__}.create_data_strategy",
         lambda _mode, _pool, form_code: captured.update({"form_code": form_code}) or object(),
     )
-    monkeypatch.setattr(f"{__name__}.discover_custom_form_fields", lambda *_args: [])
+    monkeypatch.setattr(
+        f"{__name__}.discover_form_contract",
+        lambda *_args: SimpleNamespace(
+            fields=(), branch_candidates=(), detail_endpoints=()
+        ),
+    )
     monkeypatch.setattr(f"{__name__}.load_dynamic_collection_specs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(f"{__name__}.ModuleSmokeDriver", lambda *_args, **_kwargs: object())
 
@@ -1029,6 +1049,7 @@ def test_independent_actions_have_distinct_stable_data_scopes():
 def test_dialog_action_accepts_inline_edit_form(monkeypatch):
     page = _InlineEditPage()
     saved_actions = []
+    created = SimpleNamespace(business_id="9001")
 
     monkeypatch.setitem(
         globals(),
@@ -1039,18 +1060,40 @@ def test_dialog_action_accepts_inline_edit_form(monkeypatch):
         globals(),
         "_crud_driver",
         lambda browser_page, request: SimpleNamespace(
-            save_open_dialog=lambda action: (
-                saved_actions.append(action)
-                or SimpleNamespace(mode="dialog_action_saved")
+            save_open_dialog=lambda action, *, established_business_id="": (
+                saved_actions.append((action, established_business_id))
+                or SimpleNamespace(mode="dialog_action_detail_verified")
             )
         ),
     )
 
-    result = _run_selected_action(page, request=None, action="编辑")
+    result = _run_selected_action(
+        page, request=None, action="编辑", created=created
+    )
 
-    assert result.mode == "dialog_action_saved"
+    assert result.mode == "dialog_action_detail_verified"
     assert page.edit_target.clicked
-    assert saved_actions == ["编辑"]
+    assert saved_actions == [("编辑", "9001")]
+
+
+def test_add_action_verifies_every_runtime_branch(monkeypatch):
+    verified = SimpleNamespace(mode="add_and_detail_verified", business_id="1")
+    final = SimpleNamespace(mode="add_and_list_verified", business_id="2")
+    calls = []
+
+    monkeypatch.delenv("EI_ACTION_PATH", raising=False)
+    monkeypatch.setitem(
+        globals(),
+        "_crud_driver",
+        lambda _page, _request: SimpleNamespace(
+            run_all_branches=lambda: calls.append("all") or (verified, final)
+        ),
+    )
+
+    result = _run_selected_action(object(), request=None, action="新增")
+
+    assert result is final
+    assert calls == ["all"]
 
 
 def test_cancel_edit_enters_inline_edit_before_cancelling(monkeypatch):
@@ -1281,9 +1324,13 @@ def _run_selected_action(browser_page, request, action: str, created=None):
         return deleted
 
     if action.startswith(ADD_ACTIONS):
-        result = _crud_driver(browser_page, request).run()
-        assert result.mode in ADD_VERIFIED_MODES, f"页面操作“{action}”未完成新增及保存后数据核对"
-        return result
+        branch_results = _crud_driver(browser_page, request).run_all_branches()
+        assert branch_results, f"页面操作“{action}”未产生任何可验证的新增分支结果"
+        for result in branch_results:
+            assert result.mode in ADD_VERIFIED_MODES, (
+                f"页面操作“{action}”存在未完成新增及保存后数据核对的分支"
+            )
+        return branch_results[-1]
 
     if _is_cancel_edit_action(action):
         return _run_cancel_edit_action(browser_page, action, created)
@@ -1294,8 +1341,11 @@ def _run_selected_action(browser_page, request, action: str, created=None):
         before_dialogs = browser_page.locator(ACTION_FORM_SELECTOR).count()
         target.click()
         _wait_for_action_form_effect(browser_page, before_dialogs, action)
-        result = _crud_driver(browser_page, request).save_open_dialog(action)
-        assert result.mode == "dialog_action_saved"
+        result = _crud_driver(browser_page, request).save_open_dialog(
+            action,
+            established_business_id=getattr(created, "business_id", ""),
+        )
+        assert result.mode == "dialog_action_detail_verified"
         return result
 
     target = _visible_action(browser_page, action)

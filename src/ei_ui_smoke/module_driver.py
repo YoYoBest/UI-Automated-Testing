@@ -19,6 +19,7 @@ from .dynamic_collections import DynamicCollectionSpec
 from .failure_evidence import capture_failure_evidence
 from .interactions import FieldInteractor
 from .models import DomField, FieldDefinition, ResolvedField
+from .source_form import SourceBranchCandidate, SourceDetailEndpoint
 from .verification import BUSINESS_ID_KEYS, extract_business_id
 
 
@@ -83,6 +84,8 @@ DETAIL_DISPLAY_ALIASES = {
     "financeSources.*.sourceFrom": ("financeSources.*.sourceFromName",),
 }
 
+DETAIL_READBACK_ADAPTER_CLASSIFICATION = "automation_detail_adapter"
+
 
 @dataclass(slots=True)
 class ModuleSmokeResult:
@@ -93,6 +96,17 @@ class ModuleSmokeResult:
     submitted: dict[str, Any] | None = None
     record_markers: tuple[str, ...] = ()
     record_identity_payload: Any = None
+    branch_conditions: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleBranchSelection:
+    """One runtime-confirmed value for a source-proven linkage field."""
+
+    field_code: str
+    value: str
+    label: str = ""
+    operator: str = "eq"
 
 
 class RecordNotDeletableError(AssertionError):
@@ -101,6 +115,10 @@ class RecordNotDeletableError(AssertionError):
 
 class DynamicFieldContractError(AssertionError):
     """A rendered dynamic collection cannot be safely created or filled."""
+
+
+class RuntimeBranchUnavailable(AssertionError):
+    """A source candidate is not selectable in the current deployed form."""
 
 
 class _RequestContextDetailResponse:
@@ -141,6 +159,24 @@ class _UniqueListReplayResponse:
         self.status = int(result.get("status") or 0)
         self.url = str(result.get("url") or request_url)
         self._body = result.get("body")
+        self.headers = {
+            "content-type": (
+                "application/json"
+                if isinstance(self._body, (dict, list))
+                else "text/plain"
+            )
+        }
+        self.request = type(
+            "BrowserAuthenticatedDetailRequest",
+            (),
+            {
+                "method": "GET",
+                "resource_type": "fetch",
+                "url": request_url,
+                "post_data_json": None,
+                "post_data": "",
+            },
+        )()
 
     def json(self) -> Any:
         if isinstance(self._body, (dict, list)):
@@ -239,8 +275,14 @@ class ModuleSmokeDriver:
     }
     RECORD_IDENTITY_LABEL_SUFFIXES = ("名称", "全称", "简称", "标题")
     RECORD_IDENTITY_PROMPT_PREFIXES = ("请输入", "请填写", "请录入", "请选择", "请上传")
+    CREATE_VERIFIED_MODES = {
+        "add_and_detail_verified",
+        "add_and_edit_form_verified",
+        "add_and_list_verified",
+    }
     SEMANTIC_LABEL_CODES = {
         "项目名称": "projName",
+        "企业名称": "projObjectName",
         "企业全称": "projObjectName",
         "投资人名称": "investorName",
         "基金名称": "fundName",
@@ -252,6 +294,8 @@ class ModuleSmokeDriver:
         page,
         data_strategy,
         source_fields: list[tuple[str, str, bool]] | None = None,
+        source_branch_candidates: Iterable[SourceBranchCandidate] | None = None,
+        source_detail_endpoints: Iterable[SourceDetailEndpoint] | None = None,
         default_upload_file=None,
         dynamic_collections: list[DynamicCollectionSpec] | None = None,
         automation_record_registry: Path | None = None,
@@ -260,6 +304,8 @@ class ModuleSmokeDriver:
         self.data_strategy = data_strategy
         self.interactor = FieldInteractor(page)
         self.source_fields = source_fields or []
+        self.source_branch_candidates = tuple(source_branch_candidates or ())
+        self.source_detail_endpoints = tuple(source_detail_endpoints or ())
         self.default_upload_file = default_upload_file
         self.dynamic_collections = dynamic_collections or []
         self.last_field_report = FieldCompletionReport([], [], [])
@@ -277,6 +323,7 @@ class ModuleSmokeDriver:
         self._pending_unique_reservations: list[tuple[Any, tuple[Any, ...], str]] = []
         self._form_open_response_capture: dict[str, Any] | None = None
         self.automation_record_registry = automation_record_registry
+        self._current_process_created_record_keys: set[tuple[str, str]] = set()
 
     def prepare_unique_constraint_evidence(self) -> None:
         """Capture a complete, authenticated occupied-key snapshot before Add."""
@@ -367,8 +414,46 @@ class ModuleSmokeDriver:
         self.commit_pending_unique_reservations()
         return result
 
+    def run_all_branches(
+        self, *, submit: bool = False,
+    ) -> tuple[ModuleSmokeResult, ...]:
+        """Save and read back one fresh record for every effective form branch."""
+
+        if os.getenv("EI_REQUIRE_ADD", "false").lower() != "true":
+            return (self.run(submit=submit),)
+        branch_cases = self._discover_runtime_branch_cases()
+        if not branch_cases:
+            return (self.run(submit=submit),)
+        results: list[ModuleSmokeResult] = []
+        for selections in branch_cases:
+            try:
+                result = self._run_create(
+                    provision_only=False,
+                    submit=submit,
+                    branch_selections=selections,
+                )
+            except Exception:
+                self.release_pending_unique_reservations()
+                raise
+            self.commit_pending_unique_reservations()
+            if result.mode not in self.CREATE_VERIFIED_MODES:
+                raise AssertionError(
+                    "分支新增未完成保存后回读："
+                    f"conditions={result.branch_conditions or selections}; mode={result.mode}"
+                )
+            result.branch_conditions = tuple(
+                (selection.field_code, selection.label or selection.value)
+                for selection in selections
+            )
+            results.append(result)
+        return tuple(results)
+
     def _run_create(
-        self, *, provision_only: bool = False, submit: bool = False,
+        self,
+        *,
+        provision_only: bool = False,
+        submit: bool = False,
+        branch_selections: tuple[ModuleBranchSelection, ...] = (),
     ) -> ModuleSmokeResult:
         # Detail actions such as Edit do not themselves require an Add button,
         # but their isolated parent-data provisioner always does.  Do not let
@@ -383,19 +468,32 @@ class ModuleSmokeDriver:
         self._submitted_display_values = {}
         self._collection_submission_codes = set()
         self._readback_excluded_submission_codes = set()
+        self._common_form_scope = None
         automation_registry_scope = self._automation_registry_scope()
         self.prepare_unique_constraint_evidence()
         add = self._wait_for_add_button()
         add.click()
         scope = self._wait_for_form_scope()
         self._wait_for_form_ready(scope)
-        self._form_scope_for_collections = scope
         submitted: dict[str, Any] = {}
+        if branch_selections:
+            scope, selected_values = self._apply_branch_selections(
+                scope, branch_selections
+            )
+            submitted.update(selected_values)
+        self._common_form_scope = scope
+        self._form_scope_for_collections = scope
+        protected_branch_codes = {
+            selection.field_code for selection in branch_selections
+        }
         attempts = max(1, int(os.getenv("EI_FIELD_FILL_ATTEMPTS", "2")))
         all_failures: list[str] = []
         retry_codes: set[str] | None = None
         for attempt in range(1, attempts + 1):
-            submitted.update(self._fill_dialog(only_codes=retry_codes))
+            submitted.update(self._fill_dialog(
+                only_codes=retry_codes,
+                protected_codes=protected_branch_codes,
+            ))
             all_failures = list(self._fill_failures)
             attachment_error = ""
             try:
@@ -498,14 +596,6 @@ class ModuleSmokeDriver:
             submitted, required_codes
         )
         filtered_all_requested_codes = bool(requested_codes) and not required_codes
-        if (
-            (require_edit_and_detail or saved_from_current_detail_edit)
-            and filtered_all_requested_codes
-        ):
-            raise AssertionError(
-                "详情与编辑双回读要求的字段全部是运行时生成 ID，"
-                "没有稳定业务字段可核对"
-            )
         if not save_response.ok:
             raise AssertionError(
                 f"保存接口失败：HTTP {save_response.status} {save_response.url}; "
@@ -540,21 +630,23 @@ class ModuleSmokeDriver:
             synchronize_support=True,
         )
         echo_values = list(record_markers)
+        declared_unique_identity_groups = self._declared_unique_identity_groups(
+            submitted
+        )
         display_identity_values = (
             self._delete_display_identity_values(submitted, [])
             if business_id and not echo_values
             else []
         )
-        # An edit starts from an already-associated detail record.  Its update
-        # response may deliberately return no record data, so use the detail
-        # and reopened-edit readback below as the identity proof instead.
-        if not business_id and not echo_values and not saved_from_current_detail_edit:
-            raise AssertionError(f"保存接口未返回业务主键，且没有可用于定位记录的名称字段：{body!r}")
-        if (
-            not business_id and echo_values
-            and not any(self.page.get_by_text(value, exact=False).count() for value in echo_values)
-        ):
-            raise AssertionError(f"保存成功但列表未回显本次数据：{echo_values}")
+        # An edit starts from an already-associated detail record and some
+        # update endpoints legitimately return no body.  Every create flow,
+        # however, must obtain a primary ID; names and markers are not record
+        # identity and cannot safely replace an ID-addressed readback.
+        if not business_id and not saved_from_current_detail_edit:
+            raise AssertionError(
+                "保存接口未返回业务主键（必须是唯一主记录 ID），"
+                "禁止按名称或列表顺序回读"
+            )
         if provision_only:
             return ModuleSmokeResult(
                 mode="add_provisioned",
@@ -563,6 +655,12 @@ class ModuleSmokeDriver:
                 submitted=submitted,
                 record_markers=record_markers,
                 record_identity_payload=record_identity_payload,
+            )
+        if filtered_all_requested_codes and not explicit_empty_readback:
+            raise AssertionError(
+                "保存成功后的自动化校验失败：回读字段全部是运行时生成 ID，"
+                "没有稳定业务字段可核对；"
+                f"classification={DETAIL_READBACK_ADAPTER_CLASSIFICATION}"
             )
         if require_edit_and_detail or saved_from_current_detail_edit:
             api_verified = self._verify_saved_record_by_business_id_detail(
@@ -624,16 +722,6 @@ class ModuleSmokeDriver:
                         record_markers=record_markers,
                         record_identity_payload=associated_detail_body,
                     )
-                if filtered_all_requested_codes and not explicit_empty_readback:
-                    return ModuleSmokeResult(
-                        mode="add_and_detail_verified",
-                        business_id=business_id,
-                        save_url=save_response.url,
-                        detail_url=requested_detail.url,
-                        submitted=submitted,
-                        record_markers=record_markers,
-                        record_identity_payload=associated_detail_body,
-                    )
         if detail_body is None and self._try_current_page_list_readback(
             submitted,
             record_markers,
@@ -680,16 +768,12 @@ class ModuleSmokeDriver:
                     record_markers=record_markers,
                     record_identity_payload=associated_detail_body,
                 )
-        if filtered_all_requested_codes and not explicit_empty_readback:
-            raise AssertionError(
-                "原回读字段全部是运行时生成 ID，且没有取得按本次业务 ID "
-                "请求的同资源详情响应，无法证明保存结果"
-            )
         if detail_body is None:
             if associated_detail_body is None:
                 self._open_detail(
                     echo_values,
                     business_id,
+                    declared_unique_identity_groups=declared_unique_identity_groups,
                     **(
                         {"display_identity_values": display_identity_values}
                         if display_identity_values else {}
@@ -700,6 +784,7 @@ class ModuleSmokeDriver:
                     echo_values,
                     business_id,
                     response_payload=associated_detail_body,
+                    declared_unique_identity_groups=declared_unique_identity_groups,
                     **(
                         {"display_identity_values": display_identity_values}
                         if display_identity_values else {}
@@ -710,6 +795,7 @@ class ModuleSmokeDriver:
                 echo_values,
                 business_id,
                 response_payload=detail_body,
+                declared_unique_identity_groups=declared_unique_identity_groups,
                 **(
                     {"display_identity_values": display_identity_values}
                     if display_identity_values else {}
@@ -1165,6 +1251,11 @@ class ModuleSmokeDriver:
                 )
             ):
                 raise
+            self._record_detail_readback_failure(
+                detail_url=str(getattr(detail_response, "url", "")),
+                status=int(getattr(detail_response, "status", 0) or 0),
+                failure_kind="field_mapping_incomplete",
+            )
             return None
         missing = self._missing_detail_required_codes(
             detail_body,
@@ -1975,7 +2066,7 @@ class ModuleSmokeDriver:
         return candidates
 
     def _registered_automation_records(self) -> list[dict[str, Any]]:
-        """Read registry records whose authoritative scope/ID key is intact."""
+        """Read only records owned by this run or created by this process."""
         path = getattr(self, "automation_record_registry", None)
         if path is None or not path.is_file():
             return []
@@ -1987,6 +2078,10 @@ class ModuleSmokeDriver:
         if not isinstance(records, list):
             return []
         scope = self._automation_registry_scope()
+        current_run_id = str(os.getenv("EI_AUTOMATION_RUN_ID", "") or "").strip()
+        process_created_keys = set(
+            getattr(self, "_current_process_created_record_keys", set()) or set()
+        )
         seen_keys: set[tuple[str, str]] = set()
         valid: list[dict[str, Any]] = []
         for record in records:
@@ -1995,6 +2090,11 @@ class ModuleSmokeDriver:
             business_id = self._normalize_record_text(record.get("business_id"))
             key = (scope, business_id)
             if not business_id or key in seen_keys:
+                continue
+            record_run_id = str(record.get("run_id") or "").strip()
+            if key not in process_created_keys and (
+                not current_run_id or record_run_id != current_run_id
+            ):
                 continue
             seen_keys.add(key)
             valid.append(record)
@@ -2089,7 +2189,20 @@ class ModuleSmokeDriver:
         if not normalized_scope:
             return
         markers = self._automation_owned_markers(list(result.record_markers))
-        run_id = self._automation_registry_run_id(markers)
+        run_id = (
+            str(os.getenv("EI_AUTOMATION_RUN_ID", "") or "").strip()
+            or self._automation_registry_run_id(markers)
+        )
+        process_created_keys = getattr(
+            self, "_current_process_created_record_keys", None
+        )
+        if not isinstance(process_created_keys, set):
+            process_created_keys = set()
+            self._current_process_created_record_keys = process_created_keys
+        process_created_keys.add((
+            normalized_scope,
+            self._normalize_record_text(result.business_id),
+        ))
         entry = {
             "schema_version": 2,
             "registry_key": f"{normalized_scope}::{result.business_id}",
@@ -2385,8 +2498,13 @@ class ModuleSmokeDriver:
         self._prepare_nested_operation(scope)
         return ModuleSmokeResult(mode="nested_action_verified")
 
-    def save_open_dialog(self, operation: str) -> ModuleSmokeResult:
-        """Fill and save a dialog opened by edit or another business action."""
+    def save_open_dialog(
+        self,
+        operation: str,
+        *,
+        established_business_id: str = "",
+    ) -> ModuleSmokeResult:
+        """Save an existing-record dialog and verify its exact-ID detail data."""
         scope = self._wait_for_form_scope()
         self._wait_for_form_ready(scope)
         submitted = self._fill_dialog()
@@ -2424,8 +2542,45 @@ class ModuleSmokeDriver:
         except Exception:
             body = save_response.text()
         self._assert_business_success(body, operation=operation)
+        response_business_id = self._normalize_record_text(extract_business_id(body))
+        established_id = self._normalize_record_text(established_business_id)
+        business_id = response_business_id or established_id
+        if not business_id:
+            raise AssertionError(
+                f"页面操作“{operation}”保存响应未返回业务主键，且调用方未提供"
+                "已建立的详情业务 ID；禁止按名称或列表顺序回读"
+            )
+
+        requested_codes = self._default_readback_required_codes(submitted)
+        required_codes = self._stable_readback_required_codes(
+            submitted, requested_codes
+        )
+        if requested_codes and not required_codes:
+            raise AssertionError(
+                f"页面操作“{operation}”保存后没有稳定业务字段可回读；"
+                f"classification={DETAIL_READBACK_ADAPTER_CLASSIFICATION}"
+            )
+        verified = self._verify_saved_record_by_business_id_detail(
+            save_response,
+            submitted,
+            business_id=business_id,
+            required_codes=required_codes,
+            record_markers=(),
+            save_payload=self._request_payload(save_response.request),
+        )
+        if verified is None:
+            raise AssertionError(
+                f"页面操作“{operation}”保存成功，但无法通过业务 ID 精确详情接口"
+                "核对提交字段；"
+                f"classification={DETAIL_READBACK_ADAPTER_CLASSIFICATION}"
+            )
         return ModuleSmokeResult(
-            mode="dialog_action_saved", save_url=save_response.url, submitted=submitted
+            mode="dialog_action_detail_verified",
+            business_id=business_id,
+            save_url=save_response.url,
+            detail_url=verified.detail_url,
+            submitted=submitted,
+            record_identity_payload=verified.record_identity_payload,
         )
 
     def _field_report_ok(self, report: FieldCompletionReport) -> bool:
@@ -2912,6 +3067,39 @@ class ModuleSmokeDriver:
         if not callable(resolver):
             return ()
         return tuple(resolver(submitted))
+
+    def _declared_unique_identity_groups(
+        self, submitted: dict[str, Any],
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return submitted values that are proven unique by module config.
+
+        A single display value is safe only when a matching declared constraint
+        explicitly names that one field. Ordinary display values retain the
+        existing two-value proof.
+        """
+        groups: list[tuple[str, ...]] = []
+        for spec in self._declared_unique_constraints(submitted):
+            values: list[str] = []
+            for code in getattr(spec, "field_codes", ()):
+                key = str(code or "").strip()
+                value = submitted.get(key)
+                if (
+                    not key
+                    or self._is_generated_identifier(key)
+                    or value in (None, "", [])
+                    or isinstance(value, (list, tuple, set, frozenset, dict))
+                ):
+                    values = []
+                    break
+                normalized = self._normalize_record_text(value)
+                if not normalized:
+                    values = []
+                    break
+                values.append(normalized)
+            group = tuple(values)
+            if group and group not in groups:
+                groups.append(group)
+        return tuple(groups)
 
     def _declared_unique_constraint_for_message(
         self, message: str, submitted: dict[str, Any],
@@ -3732,6 +3920,532 @@ class ModuleSmokeDriver:
         )
         return re.sub(r"\s+", " ", text).strip()[:maximum]
 
+    def _discover_runtime_branch_cases(
+        self,
+    ) -> tuple[tuple[ModuleBranchSelection, ...], ...]:
+        """Confirm source-proven branch drivers against the current rendered form."""
+
+        cases: list[tuple[ModuleBranchSelection, ...]] = []
+        options_by_driver: dict[str, list[ModuleBranchSelection]] = {}
+        contexts = sorted(
+            self._branch_driver_probe_contexts(),
+            key=lambda item: len(item[1]),
+        )
+        for driver_code, source_prerequisites in contexts:
+            runtime_prefixes: list[tuple[ModuleBranchSelection, ...]] = [()]
+            for prerequisite in source_prerequisites:
+                available = options_by_driver.get(
+                    prerequisite.field_code.lower(), []
+                )
+                choices = self._runtime_prerequisite_options(
+                    prerequisite, available
+                )
+                if not choices:
+                    runtime_prefixes = []
+                    break
+                runtime_prefixes = [
+                    (*prefix, choice)
+                    for prefix in runtime_prefixes
+                    for choice in choices
+                ]
+            for prerequisites in runtime_prefixes:
+                options = self._probe_runtime_branch_options(
+                    driver_code, prerequisites
+                )
+                known = options_by_driver.setdefault(driver_code.lower(), [])
+                for option in options:
+                    if not any(
+                        self._normalized_choice_value(existing.value)
+                        == self._normalized_choice_value(option.value)
+                        for existing in known
+                    ):
+                        known.append(option)
+                    cases.append((*prerequisites, option))
+        unique: list[tuple[ModuleBranchSelection, ...]] = []
+        seen: set[tuple[tuple[str, str], ...]] = set()
+        for case in cases:
+            key = tuple(
+                (item.field_code.lower(), self._normalized_choice_value(item.value))
+                for item in case
+            )
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(case)
+        return tuple(unique)
+
+    @classmethod
+    def _runtime_prerequisite_options(
+        cls,
+        prerequisite: ModuleBranchSelection,
+        available: Iterable[ModuleBranchSelection],
+    ) -> tuple[ModuleBranchSelection, ...]:
+        options = tuple(available)
+        if not options:
+            return (
+                (prerequisite,)
+                if prerequisite.operator == "eq" and prerequisite.value
+                else ()
+            )
+        wanted = cls._normalized_choice_value(prerequisite.value)
+        if prerequisite.operator == "runtime":
+            return options
+        matches = tuple(
+            option for option in options
+            if wanted in {
+                cls._normalized_choice_value(option.value),
+                cls._normalized_choice_value(option.label),
+            }
+        )
+        if prerequisite.operator == "neq":
+            return tuple(option for option in options if option not in matches)
+        # Some Element Plus options expose only display text, while the source
+        # condition compares an internal code. Probe each real option and let
+        # child-driver visibility confirm the mapping.
+        return matches or options
+
+    def _branch_driver_probe_contexts(
+        self,
+    ) -> tuple[tuple[str, tuple[ModuleBranchSelection, ...]], ...]:
+        drivers = tuple(dict.fromkeys(
+            candidate.driver_field
+            for candidate in self.source_branch_candidates
+            if candidate.driver_field
+        ))
+
+        def prerequisites_for(
+            driver_code: str,
+            stack: tuple[str, ...] = (),
+        ) -> tuple[tuple[ModuleBranchSelection, ...], ...]:
+            if driver_code in stack:
+                raise AssertionError(
+                    "源码分支关系存在循环依赖：" + " -> ".join((*stack, driver_code))
+                )
+            incoming = [
+                candidate
+                for candidate in self.source_branch_candidates
+                if candidate.affected_field == driver_code
+                and candidate.effect == "visible"
+                and candidate.driver_field != driver_code
+            ]
+            if not incoming:
+                return ((),)
+            paths: list[tuple[ModuleBranchSelection, ...]] = []
+            for candidate in incoming:
+                for prefix in prerequisites_for(
+                    candidate.driver_field, (*stack, driver_code)
+                ):
+                    paths.append((*prefix, ModuleBranchSelection(
+                        candidate.driver_field,
+                        candidate.value,
+                        operator=candidate.operator,
+                    )))
+            return tuple(paths) or ((),)
+
+        contexts: list[tuple[str, tuple[ModuleBranchSelection, ...]]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for driver_code in drivers:
+            for prerequisites in prerequisites_for(driver_code):
+                key = (
+                    driver_code.lower(),
+                    tuple(
+                        (item.field_code.lower(), self._normalized_choice_value(item.value))
+                        for item in prerequisites
+                    ),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    contexts.append((driver_code, prerequisites))
+        return tuple(contexts)
+
+    def _probe_runtime_branch_options(
+        self,
+        driver_code: str,
+        prerequisites: tuple[ModuleBranchSelection, ...],
+    ) -> tuple[ModuleBranchSelection, ...]:
+        add = self._wait_for_add_button()
+        add.click()
+        scope = self._wait_for_form_scope()
+        self._wait_for_form_ready(scope)
+        self._common_form_scope = scope
+        try:
+            if prerequisites:
+                try:
+                    scope, _selected = self._apply_branch_selections(
+                        scope, prerequisites
+                    )
+                except AssertionError as exc:
+                    print(
+                        "MODULE_BRANCH_RUNTIME_SKIPPED "
+                        f"field={driver_code} reason=prerequisite_not_available:"
+                        f"{self._sanitize_diagnostic_scalar(exc)}",
+                        flush=True,
+                    )
+                    return ()
+            try:
+                field = self._branch_dom_field(scope, driver_code)
+            except RuntimeBranchUnavailable as exc:
+                print(
+                    "MODULE_BRANCH_RUNTIME_SKIPPED "
+                    f"field={driver_code} reason={self._sanitize_diagnostic_scalar(exc)}",
+                    flush=True,
+                )
+                return ()
+            return self._runtime_branch_options(scope, driver_code, field)
+        except RuntimeBranchUnavailable as exc:
+            print(
+                "MODULE_BRANCH_RUNTIME_SKIPPED "
+                f"field={driver_code} reason={self._sanitize_diagnostic_scalar(exc)}",
+                flush=True,
+            )
+            return ()
+        finally:
+            self._close_branch_probe_form(scope)
+            self._common_form_scope = None
+
+    def _apply_branch_selections(
+        self,
+        scope,
+        selections: Iterable[ModuleBranchSelection],
+    ) -> tuple[Any, dict[str, Any]]:
+        submitted: dict[str, Any] = {}
+        for selection in selections:
+            scope = self._wait_for_branch_form_stable(scope)
+            field = self._branch_dom_field(scope, selection.field_code)
+            actual = self._select_branch_value(
+                scope, selection.field_code, field, selection.value
+            )
+            scope = self._wait_for_branch_form_stable(scope)
+            submitted[selection.field_code] = actual or selection.label or selection.value
+        return scope, submitted
+
+    def _branch_dom_field(self, scope, field_code: str):
+        matches = []
+        for index, field in enumerate(scan_dom_fields(self.page, scope), 1):
+            direct = (
+                field.field_code
+                and not self._is_generated_identifier(field.field_code)
+                and self._source_code_matches_runtime(field_code, field.field_code)
+            )
+            if not direct:
+                identity = self._runtime_identity_for_dom(field, index)
+                direct = bool(
+                    identity[-1]
+                    and self._source_code_matches_runtime(field_code, identity[3])
+                )
+            if direct and field.kind in {"select", "radio", "checkbox"}:
+                matches.append(field)
+        if not matches:
+            raise RuntimeBranchUnavailable(
+                f"当前页面未渲染源码联动字段：{field_code}"
+            )
+        if len(matches) > 1:
+            kinds = {field.kind for field in matches}
+            codes = {
+                str(field.field_code or "").lower() for field in matches
+                if field.field_code
+            }
+            if not (kinds <= {"radio", "checkbox"} and len(codes) == 1):
+                raise AssertionError(
+                    f"联动字段运行时身份不唯一：{field_code}; matches={len(matches)}"
+                )
+        return matches[0]
+
+    def _runtime_branch_options(
+        self, scope, field_code: str, field,
+    ) -> tuple[ModuleBranchSelection, ...]:
+        if field.kind == "radio":
+            controls = self._radio_group(
+                field_code,
+                field.selector,
+                dom_scope=scope,
+                field_label=field.label,
+            )
+            options: list[ModuleBranchSelection] = []
+            for index in range(controls.count()):
+                control = controls.nth(index)
+                values = self._radio_choice_values(control)
+                raw = next((
+                    control.get_attribute(attribute)
+                    for attribute in ("value", "data-value", "aria-label")
+                    if control.get_attribute(attribute) not in (None, "")
+                ), "")
+                label = next((value for value in reversed(values) if value), raw)
+                value = str(raw or label).strip()
+                if value:
+                    options.append(ModuleBranchSelection(field_code, value, label))
+            return self._deduplicate_branch_options(options)
+        if field.kind == "checkbox":
+            controls = self._branch_checkbox_controls(
+                scope, field_code, field
+            )
+            if controls.count() <= 1:
+                return (
+                    ModuleBranchSelection(field_code, "false", "false"),
+                    ModuleBranchSelection(field_code, "true", "true"),
+                )
+            options: list[ModuleBranchSelection] = []
+            for index in range(controls.count()):
+                control = controls.nth(index)
+                raw = next((
+                    str(control.get_attribute(attribute) or "").strip()
+                    for attribute in ("value", "data-value", "aria-label")
+                    if str(control.get_attribute(attribute) or "").strip()
+                ), "")
+                label = str(control.locator("xpath=..").inner_text() or "").strip()
+                if raw or label:
+                    options.append(ModuleBranchSelection(
+                        field_code, raw or label, label or raw
+                    ))
+            return self._deduplicate_branch_options(options)
+
+        wrapper = self._branch_select_wrapper(scope, field)
+        if not wrapper.count() or not wrapper.is_visible():
+            raise AssertionError(f"联动字段没有可用选择控件：{field_code}")
+        wrapper.scroll_into_view_if_needed()
+        wrapper.click(force=True)
+        deadline = time.monotonic() + max(
+            0.5, int(os.getenv("EI_SELECT_OPTIONS_TIMEOUT_MS", "5000")) / 1000
+        )
+        options: list[ModuleBranchSelection] = []
+        while time.monotonic() < deadline:
+            controls_id = self._select_controls_id(wrapper)
+            popper = (
+                self.page.locator(f"#{controls_id}")
+                if controls_id
+                else self.page.locator(
+                    ".el-select__popper:visible,.el-cascader__dropdown:visible,"
+                    ".el-popper:visible:has(.el-select-dropdown__item)"
+                ).last
+            )
+            if popper.count() and popper.is_visible():
+                nodes = popper.locator(
+                    ".el-select-dropdown__item:not(.is-disabled),"
+                    ".el-cascader-node:not(.is-disabled)"
+                )
+                for index in range(nodes.count()):
+                    node = nodes.nth(index)
+                    if not node.is_visible():
+                        continue
+                    label = str(node.inner_text() or "").strip()
+                    if not label or any(
+                        token in label for token in ("请选择", "全部", "暂无", "无数据", "加载")
+                    ):
+                        continue
+                    keyed = node.locator(
+                        "xpath=ancestor-or-self::*[@data-key or @data-value or @value][1]"
+                    )
+                    value = ""
+                    if keyed.count():
+                        for attribute in ("data-key", "data-value", "value"):
+                            value = str(keyed.get_attribute(attribute) or "").strip()
+                            if value:
+                                break
+                    options.append(ModuleBranchSelection(
+                        field_code, value or label, label
+                    ))
+                if options:
+                    break
+            self.page.wait_for_timeout(150)
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if not options:
+            raise AssertionError(f"联动字段没有可枚举的运行时选项：{field_code}")
+        return self._deduplicate_branch_options(options)
+
+    @classmethod
+    def _deduplicate_branch_options(
+        cls, options: Iterable[ModuleBranchSelection],
+    ) -> tuple[ModuleBranchSelection, ...]:
+        unique: list[ModuleBranchSelection] = []
+        seen: set[str] = set()
+        for option in options:
+            key = cls._normalized_choice_value(option.value)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(option)
+        return tuple(unique)
+
+    def _branch_select_wrapper(self, scope, field):
+        scanned = scope.locator(field.selector).first
+        if scanned.count():
+            try:
+                if scanned.evaluate(
+                    "el => el.matches('.el-select__wrapper,.el-input__wrapper')"
+                ):
+                    return scanned
+            except Exception:
+                pass
+            nested = scanned.locator(
+                ".el-select__wrapper,.el-cascader .el-input__wrapper"
+            ).first
+            if nested.count():
+                return nested
+            ancestor = scanned.locator(
+                "xpath=ancestor::*[contains(@class,'el-select__wrapper') "
+                "or contains(@class,'el-input__wrapper')][1]"
+            )
+            if ancestor.count():
+                return ancestor
+        source_label = next((
+            label for code, label, _qcc in self.source_fields
+            if self._source_code_matches_runtime(code, field.field_code)
+        ), "")
+        label = field.label or source_label
+        row = scope.locator(
+            ".purvar_form_item,.el-form-item,.ant-form-item"
+        ).filter(has_text=label).first
+        return row.locator(
+            ".el-select__wrapper,.el-cascader .el-input__wrapper"
+        ).first
+
+    def _select_branch_value(
+        self, scope, field_code: str, field, preferred_value: str,
+    ) -> str:
+        if field.kind == "radio":
+            controls = self._radio_group(
+                field_code,
+                field.selector,
+                dom_scope=scope,
+                field_label=field.label,
+            )
+            return self._select_radio_choice(controls, preferred_value)
+        if field.kind == "checkbox":
+            controls = self._branch_checkbox_controls(
+                scope, field_code, field
+            )
+            if controls.count() > 1:
+                wanted_value = self._normalized_choice_value(preferred_value)
+                matches = []
+                for index in range(controls.count()):
+                    candidate = controls.nth(index)
+                    values = [
+                        candidate.get_attribute(attribute)
+                        for attribute in ("value", "data-value", "aria-label")
+                    ]
+                    try:
+                        values.append(candidate.locator("xpath=..").inner_text())
+                    except Exception:
+                        pass
+                    if wanted_value in {
+                        self._normalized_choice_value(value)
+                        for value in values if value not in (None, "")
+                    }:
+                        matches.append(candidate)
+                if len(matches) != 1:
+                    raise AssertionError(
+                        f"复选联动字段没有唯一匹配选项：{field_code}="
+                        f"{preferred_value}; matches={len(matches)}"
+                    )
+                matches[0].check(force=True)
+                return preferred_value
+            control = controls.first
+            wanted = self._normalized_choice_value(preferred_value) in {
+                "1", "true", "yes", "on", "是"
+            }
+            try:
+                (control.check if wanted else control.uncheck)(force=True)
+            except Exception:
+                checked = bool(control.is_checked())
+                if checked != wanted:
+                    control.click(force=True)
+            return "true" if wanted else "false"
+        return self._select_by_label(
+            field.label,
+            field_code=field_code,
+            selector=field.selector,
+            dom_scope=scope,
+            preferred_value=preferred_value,
+        )
+
+    def _branch_checkbox_controls(self, scope, field_code: str, field):
+        scanned = scope.locator(field.selector).first
+        if scanned.count():
+            nested = scanned.locator(
+                'input[type="checkbox"],[role="checkbox"]'
+            )
+            if nested.count():
+                return nested
+            try:
+                if scanned.evaluate(
+                    "el => el.matches('input[type=checkbox],[role=checkbox]')"
+                ):
+                    return scope.locator(field.selector)
+            except Exception:
+                pass
+        escaped = str(field_code).replace('"', '\\"')
+        return scope.locator(
+            f'[prop="{escaped}"] input[type="checkbox"],'
+            f'[prop="{escaped}"] [role="checkbox"],'
+            f'[data-field-code="{escaped}"] input[type="checkbox"],'
+            f'[data-field-code="{escaped}"] [role="checkbox"]'
+        )
+
+    def _wait_for_branch_form_stable(self, scope):
+        timeout_ms = int(os.getenv("EI_BRANCH_STABLE_TIMEOUT_MS", "8000"))
+        stable_ms = int(os.getenv("EI_BRANCH_STABLE_MS", "700"))
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable_since = None
+        previous = None
+        while time.monotonic() < deadline:
+            try:
+                if not scope.count() or not scope.is_visible():
+                    scope = self._wait_for_form_scope(timeout=max(
+                        500, int((deadline - time.monotonic()) * 1000)
+                    ))
+            except (AttributeError, TypeError):
+                pass
+            loading = scope.locator(
+                ".el-loading-mask:visible,.ant-spin-spinning:visible,"
+                "[aria-busy='true']:visible,[data-loading='true']:visible"
+            )
+            has_loading = bool(loading.count() and loading.first.is_visible())
+            fields = scan_dom_fields(self.page, scope)
+            signature = tuple(sorted(
+                (field.field_code, field.label, field.kind, field.required, field.readonly)
+                for field in fields
+            ))
+            now = time.monotonic()
+            if fields and not has_loading and signature == previous:
+                if stable_since is not None and now - stable_since >= stable_ms / 1000:
+                    self._common_form_scope = scope
+                    return scope
+            else:
+                previous = signature
+                stable_since = now if fields and not has_loading else None
+            self.page.wait_for_timeout(100)
+        raise AssertionError(
+            f"联动字段切换后表单在 {timeout_ms / 1000:g} 秒内未稳定"
+        )
+
+    def _close_branch_probe_form(self, scope) -> None:
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            if not scope.count() or not scope.is_visible():
+                return
+            close = scope.locator(
+                "button:has-text('取消'),button:has-text('关闭'),button[aria-label='Close']"
+            ).last
+            if close.count() and close.is_visible():
+                close.click(force=True)
+            confirm = self.page.locator(
+                ".el-message-box:visible button:has-text('确定'),"
+                "[role='alertdialog']:visible button:has-text('确定')"
+            ).last
+            if confirm.count() and confirm.is_visible():
+                confirm.click(force=True)
+            deadline = time.monotonic() + 3
+            while scope.count() and scope.is_visible() and time.monotonic() < deadline:
+                self.page.wait_for_timeout(100)
+            if scope.count() and scope.is_visible():
+                raise AssertionError("分支探测表单无法安全关闭")
+        except (AttributeError, TypeError):
+            return
+
     def _wait_for_form_scope(self, timeout: int = 15_000):
         """Return only the new form instance that exposes editable controls."""
         deadline = time.monotonic() + timeout / 1000
@@ -4451,48 +5165,215 @@ class ModuleSmokeDriver:
         )
         return tuple(dict.fromkeys((query_url, path_url)))
 
+    @classmethod
+    def _source_detail_url(
+        cls,
+        endpoint: SourceDetailEndpoint,
+        save_url: str,
+        business_id: str,
+    ) -> str:
+        """Build one same-origin exact-ID URL from a source-proven contract."""
+        normalized_id = cls._normalize_record_text(business_id)
+        if str(endpoint.method or "").upper() != "GET" or not normalized_id:
+            return ""
+
+        origin = urlsplit(str(save_url or ""))
+        if not origin.scheme or not origin.netloc:
+            return ""
+
+        declared = urlsplit(str(endpoint.path_template or "").strip())
+        if (
+            declared.scheme
+            or declared.netloc
+            or declared.query
+            or declared.fragment
+            or not declared.path.startswith("/")
+        ):
+            return ""
+        detail_path = "/" + declared.path.lstrip("/")
+
+        base_value = str(endpoint.api_base_path or "").strip()
+        if base_value:
+            base = urlsplit(base_value)
+            if base.scheme or base.netloc or base.query or base.fragment:
+                return ""
+            base_path = "/" + base.path.strip("/")
+            if base_path != "/" and not (
+                detail_path == base_path
+                or detail_path.startswith(base_path + "/")
+            ):
+                detail_path = base_path.rstrip("/") + detail_path
+
+        id_location = str(endpoint.id_location or "").lower()
+        if id_location == "query":
+            query_key = str(endpoint.id_query_key or "").strip()
+            if not query_key or "{business_id}" in detail_path:
+                return ""
+            query = urlencode({query_key: normalized_id})
+        elif id_location == "path":
+            if detail_path.count("{business_id}") != 1:
+                return ""
+            detail_path = detail_path.replace(
+                "{business_id}", quote(normalized_id, safe=""),
+            )
+            query = ""
+        else:
+            return ""
+        return urlunsplit((origin.scheme, origin.netloc, detail_path, query, ""))
+
+    def _detail_readback_candidates(
+        self, save_url: str, business_id: str,
+    ) -> tuple[tuple[str, str], ...]:
+        """Prefer source declarations and retain URL inference as compatibility."""
+        candidates: list[tuple[str, str]] = []
+        for endpoint in getattr(self, "source_detail_endpoints", ()):
+            detail_url = self._source_detail_url(
+                endpoint, save_url, business_id,
+            )
+            if detail_url:
+                candidates.append(("declared", detail_url))
+        for index, detail_url in enumerate(
+            self._same_resource_detail_urls(save_url, business_id)
+        ):
+            candidates.append((
+                "inferred-query" if index == 0 else "inferred-path",
+                detail_url,
+            ))
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for source, detail_url in candidates:
+            if detail_url in seen:
+                continue
+            seen.add(detail_url)
+            unique.append((source, detail_url))
+        return tuple(unique)
+
+    def _record_detail_readback_failure(
+        self,
+        *,
+        detail_url: str,
+        status: int,
+        failure_kind: str,
+    ) -> None:
+        """Emit a query-free diagnostic that cannot disclose auth or payloads."""
+        event = {
+            "method": "GET",
+            "path": urlsplit(str(detail_url or "")).path,
+            "status": int(status or 0),
+            "failure_kind": str(failure_kind),
+            "classification": DETAIL_READBACK_ADAPTER_CLASSIFICATION,
+        }
+        diagnostics = getattr(self, "_detail_readback_diagnostics", None)
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+            self._detail_readback_diagnostics = diagnostics
+        diagnostics.append(event)
+        print(
+            "DETAIL_READBACK_CANDIDATE_FAILED "
+            f"classification={event['classification']} "
+            f"method={event['method']} path={event['path']} "
+            f"status={event['status']} failure_kind={event['failure_kind']}",
+            flush=True,
+        )
+
     def _request_same_resource_detail_response(
         self, save_response, business_id: str,
     ):
-        """Fetch one exact-ID detail candidate with the current browser login."""
-        detail_urls = self._same_resource_detail_urls(
-            getattr(save_response, "url", ""), business_id
+        """Fetch one exact-ID detail, preferring the source-declared endpoint."""
+        detail_candidates = self._detail_readback_candidates(
+            getattr(save_response, "url", ""), business_id,
         )
-        if not detail_urls:
+        self._detail_readback_diagnostics = []
+        if not detail_candidates:
+            self._record_detail_readback_failure(
+                detail_url=getattr(save_response, "url", ""),
+                status=0,
+                failure_kind="endpoint_unavailable",
+            )
             return None
         request_context = getattr(self.page, "request", None)
         get = getattr(request_context, "get", None)
         if not callable(get):
+            self._record_detail_readback_failure(
+                detail_url=getattr(save_response, "url", ""),
+                status=0,
+                failure_kind="request_context_unavailable",
+            )
             return None
         normalized_id = self._normalize_record_text(business_id)
-        for detail_url in detail_urls:
+        for _source, detail_url in detail_candidates:
             try:
                 response = get(detail_url)
             except Exception:
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=0,
+                    failure_kind="transport_error",
+                )
                 continue
+
+            status = int(getattr(response, "status", 0) or 0)
+            if status in {401, 403}:
+                try:
+                    response = self._browser_authenticated_get_response(detail_url)
+                except Exception:
+                    self._record_detail_readback_failure(
+                        detail_url=detail_url,
+                        status=status,
+                        failure_kind="transport_error",
+                    )
+                    continue
+                status = int(getattr(response, "status", 0) or 0)
+
             if not getattr(response, "ok", False):
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="http_error",
+                )
                 continue
             headers = dict(getattr(response, "headers", {}) or {})
             content_type = str(headers.get("content-type", "")).lower()
             if "json" not in content_type:
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="non_json",
+                )
                 continue
             try:
                 payload = response.json()
             except Exception:
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="invalid_json",
+                )
                 continue
             wrapped = _RequestContextDetailResponse(
                 response, detail_url, payload, headers
             )
             if not self._request_contains_business_id(wrapped.request, business_id):
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="business_id_missing",
+                )
                 continue
-            if normalized_id not in self._record_scalar_texts(payload):
+            response_id = self._normalize_record_text(extract_business_id(payload))
+            if not response_id:
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="business_id_missing",
+                )
                 continue
-            direct_ids = {
-                self._direct_record_business_id(record)
-                for record in self._collect_dicts(payload)
-                if self._direct_record_business_id(record)
-            }
-            if direct_ids and normalized_id not in direct_ids:
+            if response_id != normalized_id:
+                self._record_detail_readback_failure(
+                    detail_url=detail_url,
+                    status=status,
+                    failure_kind="business_id_mismatch",
+                )
                 continue
             return wrapped
         return None
@@ -5746,7 +6627,7 @@ class ModuleSmokeDriver:
         """
         evaluate = getattr(self.page, "evaluate", None)
         if not callable(evaluate):
-            raise AssertionError("删除后详情查询缺少浏览器登录上下文")
+            raise AssertionError("详情查询缺少浏览器登录上下文")
         try:
             result = evaluate(
                 """async (requestUrl) => {
@@ -5771,9 +6652,9 @@ class ModuleSmokeDriver:
                 url,
             )
         except Exception as exc:
-            raise AssertionError("删除后详情查询无法使用浏览器登录上下文") from exc
+            raise AssertionError("详情查询无法使用浏览器登录上下文") from exc
         if not isinstance(result, dict):
-            raise AssertionError("删除后详情查询未返回结构化响应")
+            raise AssertionError("详情查询未返回结构化响应")
         return _UniqueListReplayResponse(result, url)
 
     @classmethod
@@ -5982,32 +6863,43 @@ class ModuleSmokeDriver:
         *,
         response_payload: Any = None,
         display_identity_values: list[str] | None = None,
+        declared_unique_identity_groups: tuple[tuple[str, ...], ...] = (),
     ) -> None:
+        response_error = None
+        if response_payload is not None:
+            try:
+                row, _identity = self._find_response_associated_record_container(
+                    response_payload, business_id, visible_only=True
+                )
+            except AssertionError as exc:
+                response_error = exc
+            else:
+                self._open_record_container_detail(row)
+                return
         try:
             row, _identity = self._find_unique_record_container(
                 business_id,
                 echo_values,
                 display_identity_values=display_identity_values,
+                declared_unique_identity_groups=declared_unique_identity_groups,
             )
         except AssertionError as exc:
             if response_payload is None:
                 raise AssertionError(
                     "保存后无法在当前列表定位本次记录，不能打开详情核对"
                 ) from exc
-            try:
-                row, _identity = self._find_response_associated_record_container(
-                    response_payload, business_id, visible_only=True
-                )
-            except AssertionError as response_exc:
-                probe = self._probe_response_associated_detail_row(
-                    response_payload, business_id, visible_only=True
-                )
-                if probe is None:
-                    raise AssertionError(
-                        "保存后无法用业务 ID 或关联响应唯一定位本次记录，"
-                        "不能打开详情核对"
-                    ) from response_exc
-                return
+            probe = self._probe_response_associated_detail_row(
+                response_payload, business_id, visible_only=True
+            )
+            if probe is None:
+                raise AssertionError(
+                    "保存后无法用业务 ID、关联响应或声明唯一约束唯一定位本次记录，"
+                    "不能打开详情核对"
+                ) from (response_error or exc)
+            return
+        self._open_record_container_detail(row)
+
+    def _open_record_container_detail(self, row) -> None:
         classes = row.get_attribute("class") or ""
         if any(card_class in classes for card_class in (
             "mujijin-cardBox", "platform-card", "fund-card", "el-tree-node__content",
@@ -6753,6 +7645,7 @@ class ModuleSmokeDriver:
         *,
         allow_search: bool = True,
         display_identity_values: list[str] | None = None,
+        declared_unique_identity_groups: tuple[tuple[str, ...], ...] = (),
     ):
         containers = self.page.locator(
             ".el-table__row:visible,.ant-table-row:visible,"
@@ -6825,6 +7718,33 @@ class ModuleSmokeDriver:
         if len(prefix_matches) == 1:
             return prefix_matches[0]
         if not prefix_matches:
+            declared_ambiguities: list[tuple[str, ...]] = []
+            for group in declared_unique_identity_groups:
+                matches = []
+                for item in items:
+                    cells = item.locator("td,[role='cell']")
+                    texts = (
+                        cells.all_inner_texts()
+                        if cells.count() else item.inner_text().splitlines()
+                    )
+                    cell_texts = {
+                        self._normalize_record_text(text)
+                        for text in texts
+                        if self._normalize_record_text(text)
+                    }
+                    if all(
+                        self._auxiliary_display_value_matches(value, cell_texts)
+                        for value in group
+                    ):
+                        matches.append(item)
+                if len(matches) == 1:
+                    return matches[0], "声明唯一约束字段组合"
+                if len(matches) > 1:
+                    declared_ambiguities.append(group)
+            if declared_ambiguities:
+                raise AssertionError(
+                    "声明唯一约束字段组合匹配到多条记录，无法唯一打开"
+                )
             stable_values = {
                 self._normalize_record_text(marker)
                 for marker in (display_identity_values or ())
@@ -6854,7 +7774,11 @@ class ModuleSmokeDriver:
                     )
             if allow_search and self._search_record_list_by_markers(markers):
                 return self._find_unique_record_container(
-                    business_id, markers, allow_search=False
+                    business_id,
+                    markers,
+                    allow_search=False,
+                    display_identity_values=display_identity_values,
+                    declared_unique_identity_groups=declared_unique_identity_groups,
                 )
             raise AssertionError(
                 "保存后无法精确定位本次新增记录："
@@ -7911,10 +8835,16 @@ class ModuleSmokeDriver:
         only_codes: set[str] | None = None,
         *,
         dom_scope=None,
+        protected_codes: set[str] | None = None,
     ) -> dict[str, Any]:
         source_identity = dom_scope is None
         if dom_scope is None:
             dom_scope = getattr(self, "_common_form_scope", None)
+        protected = {
+            str(code).strip().lower()
+            for code in (protected_codes or set())
+            if str(code).strip()
+        }
         submitted: dict[str, Any] = {}
         failures: list[str] = []
         optional_failures: list[str] = []
@@ -7965,6 +8895,11 @@ class ModuleSmokeDriver:
             source_qcc = plan.source_qcc
             source_code = plan.source_code
             if only_codes is not None and field_code.lower() not in only_codes:
+                continue
+            if protected.intersection({
+                str(field_code or "").lower(),
+                str(source_code or "").lower(),
+            }):
                 continue
             definition = FieldDefinition(
                 field_code=field_code, field_name=field_label,
@@ -8730,9 +9665,9 @@ class ModuleSmokeDriver:
             return generated_choice
         if self._generated_choice_has_only_option_label(dom):
             return (dom.field_code, dom.label, bool(dom.qcc_remote))
-        if index <= len(self.source_fields):
-            return self.source_fields[index - 1]
-        return (dom.field_code, dom.label, False)
+        # Source order is not a business identity. Vue branches, CSS grids, and
+        # teleported controls can all change DOM order without changing fields.
+        return (dom.field_code, dom.label, bool(dom.qcc_remote))
 
     def _unique_generated_choice_source_for_dom(self, dom):
         if not self._generated_choice_has_only_option_label(dom):

@@ -17,7 +17,7 @@ from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
 from ei_ui_smoke.models import DomField
-from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.source_form import discover_form_contract
 
 
 DEFAULT_WORKBOOK = Path(__file__).parent / "Common_Test_Cases" / "建设项目_个性化用例.xlsx"
@@ -605,12 +605,15 @@ def module_case_executor():
     module_key = os.getenv("EI_MODULE_ID") or settings.form_code or "MODULE"
     form_code = os.getenv("EI_FORM_CODE", "") or settings.form_code or module_key
     pool = GlobalDataPool.from_directory(project_root / "data")
+    source_contract = discover_form_contract(
+        settings.source_root, os.getenv("EI_COMPONENT", "")
+    )
     executor = CommonFieldExecutor(
         None,
         create_data_strategy("standard", pool, form_code),
-        source_fields=discover_custom_form_fields(
-            settings.source_root, os.getenv("EI_COMPONENT", "")
-        ),
+        source_fields=list(source_contract.fields),
+        source_branch_candidates=source_contract.branch_candidates,
+        source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=pool.default_upload_file(),
         dynamic_collections=load_dynamic_collection_specs(
             project_root / "data",

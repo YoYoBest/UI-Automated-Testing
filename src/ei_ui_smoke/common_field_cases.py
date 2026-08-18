@@ -280,15 +280,18 @@ def discover_common_fields(
     definitions_list = list(definitions)
     by_code = {field.field_code: field for field in definitions_list if field.field_code}
     result: list[DiscoveredCommonField] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     for dom in dom_fields:
         definition = by_code.get(dom.field_code) or _definition_by_label(definitions_list, dom.label)
         field_key = (definition.field_code if definition else dom.field_code).strip()
-        if not field_key or field_key.startswith("el-id-") or field_key in seen:
+        if not field_key or field_key.startswith("el-id-"):
             continue
-        seen.add(field_key)
         label = (definition.field_name if definition and definition.field_name else dom.label).strip()
         kind = _effective_common_kind(dom, definition, field_key, label)
+        runtime_identity = (field_key, dom.selector, kind)
+        if runtime_identity in seen:
+            continue
+        seen.add(runtime_identity)
         common_type = classify_common_field_type(label, kind, field_key)
         if not common_type:
             continue

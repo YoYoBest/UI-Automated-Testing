@@ -26,6 +26,44 @@ def test_extract_file_type_item_id_from_success_response():
     assert extract_business_id({"status": "0", "data": None, "itemId": "10001"}) == "10001"
 
 
+def test_extract_business_id_rejects_child_table_only_id():
+    response = {
+        "status": "0",
+        "data": {
+            "ownershipStructureList": [
+                {"id": "child-row-1", "shareholderName": "测试股东"},
+            ],
+        },
+    }
+
+    assert extract_business_id(response) == ""
+
+
+def test_extract_business_id_rejects_conflicting_main_record_ids():
+    response = {
+        "status": "0",
+        "businessId": "record-1",
+        "data": {"id": "record-2"},
+    }
+
+    assert extract_business_id(response) == ""
+
+
+def test_extract_business_id_rejects_multiple_response_records():
+    response = {
+        "status": "0",
+        "data": [{"id": "record-1"}, {"id": "record-2"}],
+    }
+
+    assert extract_business_id(response) == ""
+
+
+def test_extract_business_id_accepts_one_record_in_known_envelope():
+    response = {"status": "0", "data": [{"id": "record-1"}]}
+
+    assert extract_business_id(response) == "record-1"
+
+
 def test_save_url_pattern_supports_glob_and_substring():
     url = "https://host/api/fund/save?id=1"
     assert response_matches(url, "*/api/fund/save*")

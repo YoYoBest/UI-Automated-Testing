@@ -62,6 +62,18 @@ def test_binds_choice_rules_only_to_matching_runtime_control_kinds():
     ]
 
 
+def test_discovery_preserves_same_business_code_at_distinct_runtime_controls():
+    fields = discover_common_fields([
+        DomField("name", "名称", "text", "#primary-name"),
+        DomField("name", "名称", "text", "#secondary-name"),
+    ])
+
+    assert [field.selector for field in fields] == [
+        "#primary-name",
+        "#secondary-name",
+    ]
+
+
 def test_character_content_rules_bind_to_text_and_textarea_only():
     fields = discover_common_fields([
         DomField("name", "项目名称", "text", "#name"),

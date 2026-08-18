@@ -22,7 +22,7 @@ from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.detail_navigation import detail_context_preparer_from_env
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
-from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.source_form import discover_form_contract
 
 
 @pytest.fixture(scope="module")
@@ -33,9 +33,10 @@ def common_field_executor(pytestconfig):
     form_code = os.getenv("EI_FORM_CODE", "") or settings.form_code or module_key
     pool = GlobalDataPool.from_directory(project_root / "data")
     strategy = create_data_strategy("standard", pool, form_code)
-    source_fields = discover_custom_form_fields(
+    source_contract = discover_form_contract(
         settings.source_root, os.getenv("EI_COMPONENT", "")
     )
+    source_fields = list(source_contract.fields)
     manifest_path = (
         pytestconfig.getoption("--common-fields-manifest")
         or os.getenv("EI_COMMON_FIELDS_MANIFEST", "")
@@ -56,6 +57,8 @@ def common_field_executor(pytestconfig):
         None,
         strategy,
         source_fields=source_fields,
+        source_branch_candidates=source_contract.branch_candidates,
+        source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=pool.default_upload_file(),
         dynamic_collections=load_dynamic_collection_specs(
             project_root / "data",

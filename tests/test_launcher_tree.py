@@ -63,6 +63,8 @@ from ei_ui_smoke.launcher import (
     effective_case_sheets,
     preferred_case_ids,
     prioritize_progress_discovery_commands,
+    namespace_project_items,
+    project_key_from_item,
     read_pytest_progress_events,
     register_discovered_validation_counts,
     omit_discovered_validation_commands,
@@ -1701,6 +1703,78 @@ def test_runtime_menu_capture_uses_url_aligned_to_source_view(monkeypatch, tmp_p
     assert finished == [([], "artifacts/auth-state.json", original_url)]
 
 
+def test_selected_project_menu_capture_only_processes_checked_projects(
+    monkeypatch, tmp_path
+):
+    captured_sources = []
+
+    def fake_capture_menu(_url, **kwargs):
+        captured_sources.append(kwargs["source_root"])
+        return {"data": {}}, "artifacts/auth-state.json"
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    profiles = {}
+    for project_key, enabled in (("EI", True), ("FI", False)):
+        source_root = tmp_path / project_key.lower()
+        (source_root / f"{project_key.lower()}-view" / "src" / "views").mkdir(
+            parents=True
+        )
+        profiles[project_key] = SimpleNamespace(
+            key=project_key,
+            label=f"{project_key} 项目",
+            source=_StubValue(str(source_root)),
+            system_url=_StubValue("https://host/ei-view/#/login"),
+            storage=_StubValue("auth-state.json"),
+            username=_StubValue(""),
+            password=_StubValue(""),
+            enabled=_StubValue(enabled),
+        )
+    monkeypatch.setattr(launcher_module, "capture_menu", fake_capture_menu)
+    monkeypatch.setattr(launcher_module, "modules_from_menu", lambda _payload, _root: [])
+    monkeypatch.setattr(launcher_module.threading, "Thread", ImmediateThread)
+    launcher = SimpleNamespace(
+        projects=profiles,
+        system_url=_StubValue("https://host/ei-view/#/login"),
+        headless=_StubValue(True),
+        fetch_menu_button=_StubWidget(),
+        status=_StubValue(""),
+        after=lambda _delay, callback, *args: callback(*args),
+        project_items={"EI": [], "FI": []},
+        project_root=tmp_path,
+        url_history_file=tmp_path / "launcher-history.json",
+        project_url_inputs={},
+        url_history=[],
+        render=lambda: None,
+    )
+    launcher._rebuild_project_items = lambda: Launcher._rebuild_project_items(launcher)
+    launcher._finish_selected_runtime_menus = (
+        lambda completed, failures, used_url: Launcher._finish_selected_runtime_menus(
+            launcher, completed, failures, used_url
+        )
+    )
+
+    Launcher.fetch_runtime_menu_selected_projects(launcher)
+
+    assert captured_sources == [Path(profiles["EI"].source.get())]
+    assert launcher.project_items["EI"] == []
+    assert launcher.project_items["FI"] == []
+
+    profiles["FI"].enabled = _StubValue(True)
+    captured_sources.clear()
+    Launcher.fetch_runtime_menu_selected_projects(launcher)
+
+    assert captured_sources == [
+        Path(profiles["EI"].source.get()),
+        Path(profiles["FI"].source.get()),
+    ]
+
+
 def test_run_selected_builds_environment_and_form_url_from_aligned_url(
     monkeypatch, tmp_path
 ):
@@ -1840,6 +1914,101 @@ def test_run_selected_uses_all_sheets_and_ids_when_sheet_and_id_selection_are_em
         "tests/test_common_field_discovery.py",
         "tests/test_common_field_validation.py",
     ]
+
+
+def test_project_namespaces_keep_identical_module_ids_and_all_selection_isolated():
+    raw = launcher_module.ModuleItem(
+        id="FUND::add", name="新增", path=("基金管理", "新增"),
+        route="/fund", runnable=True, operation="新增",
+    )
+    ei_all, ei_item = namespace_project_items("EI", "EI 项目", [
+        launcher_module.ModuleItem("ALL", "全部模块", ("ALL",), runnable=True), raw,
+    ])
+    fi_all, fi_item = namespace_project_items("FI", "FI 项目", [
+        launcher_module.ModuleItem("ALL", "全部模块", ("ALL",), runnable=True), raw,
+    ])
+
+    assert ei_item.id == "EI::FUND::add"
+    assert fi_item.id == "FI::FUND::add"
+    assert project_key_from_item(fi_item) == "FI"
+    assert resolve_selected_targets([ei_all, ei_item, fi_all, fi_item], [ei_all]) == [ei_item]
+
+
+def test_project_all_shortcuts_are_ordered_before_module_trees():
+    ei_all = launcher_module.ModuleItem(
+        "EI::ALL", "全部模块", ("EI 项目", "ALL"), runnable=True,
+    )
+    fi_all = launcher_module.ModuleItem(
+        "FI::ALL", "全部模块", ("FI 项目", "ALL"), runnable=True,
+    )
+    ordinary = launcher_module.ModuleItem(
+        "EI::FUND", "基金管理", ("EI 项目", "基金管理"), runnable=True,
+    )
+
+    shortcuts = launcher_module.ordered_project_all_items([fi_all, ordinary, ei_all])
+
+    assert [item.id for item in shortcuts] == ["EI::ALL", "FI::ALL"]
+
+
+def test_run_selected_plans_ei_then_fi_with_independent_session_environment(
+    monkeypatch, tmp_path,
+):
+    ei_root = tmp_path / "ei-parent"
+    fi_root = tmp_path / "fi-parent"
+    (ei_root / "ei-view" / "src" / "views").mkdir(parents=True)
+    (fi_root / "fi-view" / "src" / "views").mkdir(parents=True)
+    targets = [
+        launcher_module.ModuleItem(
+            "EI::FUND::add", "新增", ("EI 项目", "基金管理", "新增"),
+            route="/fund", runnable=True, operation="新增",
+        ),
+        launcher_module.ModuleItem(
+            "FI::FUND::add", "新增", ("FI 项目", "基金管理", "新增"),
+            route="/fund", runnable=True, operation="新增",
+        ),
+    ]
+    started = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            started.append(self)
+
+    def profile(key, root, url, state):
+        return SimpleNamespace(
+            key=key, label=f"{key} 项目", source=_StubValue(str(root)),
+            system_url=_StubValue(url), storage=_StubValue(state),
+            username=_StubValue(""), password=_StubValue(""), enabled=_StubValue(True),
+        )
+
+    monkeypatch.setattr(launcher_module.threading, "Thread", DeferredThread)
+    launcher = SimpleNamespace(
+        _selected_targets=lambda: targets,
+        projects={
+            "EI": profile("EI", ei_root, "https://host/ei-view/", "ei.json"),
+            "FI": profile("FI", fi_root, "https://host/fi-view/", "fi.json"),
+        },
+        mode=_StubValue("probe"), submit_zentao=_StubValue(False),
+        common_cases_excel=_StubValue(""), module_cases_excel=_StubValue(""),
+        headless=_StubValue(True), project_root=tmp_path,
+        run_button=_StubWidget(), status=_StubValue(""),
+        _set_execution_progress=lambda *_args: None,
+        _execute_commands_worker=lambda *_args: None,
+    )
+
+    Launcher.run_selected(launcher)
+
+    assert len(started) == 1
+    commands, _preflight, _mode, _base_url, _headless, _submit = started[0].args
+    assert [command[1]["EI_AUTOMATION_PROJECT"] for command in commands] == ["EI", "FI"]
+    assert [command[1]["EI_BASE_URL"] for command in commands] == [
+        "https://host/ei-view", "https://host/fi-view",
+    ]
+    assert [command[1]["EI_STORAGE_STATE"] for command in commands] == ["ei.json", "fi.json"]
+    assert [len(json.loads(command[1]["EI_ACTIONS_JSON"])) for command in commands] == [1, 1]
 
 
 def test_first_two_menu_levels_are_open_and_deeper_levels_are_collapsed():

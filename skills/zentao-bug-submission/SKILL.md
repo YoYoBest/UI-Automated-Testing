@@ -35,6 +35,7 @@ description: 将 UI-Smoke-Testing 的 Allure failed/broken 结果转换为禅道
 - 分类以最终失败证据和运行上下文优先于用例名称或包装文案。页面入口本身连接失败、连接被拒绝或域名无法解析归为 `environment`；页面和会话正常、但某个保存操作出现“网络连接失败”或没有保存接口响应时归为 `api` 产品缺陷，尤其是同一批次相邻保存成功时，不得把特定输入触发的接口异常过滤成环境问题。
 - 分类时同时传入失败消息、用例场景和失败 URL。仅页面/会话连接重置归为不可上报的 `environment`；`requestfailed` 指向业务写接口或点击保存后发生重置时归为可上报的 `api`。若该写接口失败发生在 HTML/脚本、XSS 或 CSRF 安全场景，优先归为 `security-permission`、保留请求失败摘要并标记人工复核。
 - 分类器必须先排除已确认的自动化契约错误，再匹配“接口/响应”等泛化产品关键词。包含 `rapid_click_blocked_by_ui` 且证据表明第二次点击被 UI 阻止、仅一次业务响应的失败归为 `automation` 且不提交；“新增保存未完成：表单未关闭”或“弹窗未关闭”归为 `operation-result` 且可提交。
+- Allure 已提供结构化 `classification` 时优先采用该证据。`分支基线未完成`、字段身份不唯一/定位失败、重渲染重绑失败、`automation_detail_adapter` 和详情接口字段映射不完整均归为 `automation`、`reportable=false`；这些是框架适配缺口，不能因包含“详情接口”而误分为数据问题。真实保存 HTTP/业务码失败归为 `api`；只有保存已成功、业务 ID 精确关联的详情记录可读且提交值与持久化值明确不一致时，才归为 `data-closure` 并允许上报。
 - 为每条记录保留 `failure_category`、`reportable`、`expected_failure`、`dedup_fingerprint`、`detection_source` 和 `occurrence_count`。
 - 用“系统 + 模块/操作 + 用例规则 + 规范化错误”计算稳定 SHA-256 指纹。规范化时移除动态 Element ID、UUID、时间戳、自动化名称、业务长主键、内存地址和堆栈行号。指纹未命中时必须再按完整标题做第二层去重；同标题历史 Bug 仍存在则把新指纹关联到原 ID，不得重复新建或编辑原 Bug。
 - 同一轮相同指纹只保留一条草稿并累计出现次数、合并截图。跨轮使用 `artifacts/zentao/zentao-dedup-index.json` 累计首次/最近出现时间和次数；已有 Bug ID 的指纹必须先验证禅道详情仍存在，再决定是否跳过。

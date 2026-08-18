@@ -372,6 +372,77 @@ def test_rapid_click_success_outcome_is_not_reported_as_api_bug():
     assert _classify_failure(message) == ("automation", False, False)
 
 
+def test_framework_contract_failures_are_non_reportable_automation():
+    messages = (
+        "分支基线未完成：非股权必填项为空",
+        "源码确认的联动字段分支发现失败：progressType",
+        "当前表单字段身份错配：projectName",
+        "重渲染后字段定位失败：projectType",
+        "自动化基线构建失败：缺少必填字段",
+        "详情接口字段映射失败：没有可比较字段",
+        "详情接口字段映射不完整：missing=projectName",
+        "详情接口适配失败：无法绑定业务 ID",
+        "保存成功后的自动化校验失败；classification=automation_detail_adapter",
+    )
+
+    for message in messages:
+        assert _classify_failure(message) == ("automation", False, False)
+
+
+def test_explicit_detail_adapter_classification_is_non_reportable():
+    assert _classify_failure(
+        "详情接口返回 HTTP 500",
+        classification="automation_detail_adapter",
+    ) == ("automation", False, False)
+
+
+def test_detail_adapter_classification_metadata_is_kept_out_of_bug_drafts(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "allure-results-adapter"
+    results.mkdir()
+    (results / "case-result.json").write_text(json.dumps({
+        "name": "详情接口回读",
+        "status": "broken",
+        "statusDetails": {"message": "详情读取失败：HTTP 500"},
+        "parameters": [{
+            "name": "classification", "value": "'automation_detail_adapter'",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    result = process_allure_failures(results, tmp_path / "zentao", environment={})
+    payload = json.loads(
+        (tmp_path / "zentao" / "automation-environment-adapter.json")
+        .read_text(encoding="utf-8")
+    )
+
+    assert result.draft_count == 0
+    assert payload[0]["failure_category"] == "automation"
+    assert payload[0]["reportable"] is False
+
+
+def test_save_failure_and_exact_detail_mismatch_keep_product_boundaries():
+    api_failures = (
+        "保存失败：HTTP 500",
+        "保存响应业务码失败：code=500",
+    )
+    data_closure_failures = (
+        "保存成功但精确详情值不一致",
+        "保存成功但详情接口响应与提交值不匹配",
+    )
+
+    for message in api_failures:
+        assert _classify_failure(message) == ("api", True, False)
+    for message in data_closure_failures:
+        assert _classify_failure(message) == ("data-closure", True, False)
+
+
+def test_generic_detail_word_does_not_override_specific_page_failure():
+    assert _classify_failure("详情页按钮缺失") == (
+        "page-function", True, False,
+    )
+
+
 def test_form_remains_open_after_save_is_reportable_operation_failure():
     assert _classify_failure("新增保存未完成：表单未关闭") == (
         "operation-result", True, False,

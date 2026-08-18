@@ -113,6 +113,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 - 页面入口是“仅渲染一个本地组件”的透明包装器时，扫描回归必须覆盖该子组件按钮及祖先容器上的 `$hasButton` 权限；同时保留一个含布局或多个子组件的反例，证明普通嵌套组件按钮不会被提升。
 - 修改对话框子模块发现后，使用 public API 组合覆盖“透明包装入口 -> 同文件静态常量 `componentPath` -> 被引用表单的多个静态标题分区”。精确断言同名操作的完整 `operation_path`、源码顺序、外层权限过滤和真实对话框标题；共享同一对话框的新增/编辑调用还要分别成链并继承各自权限。保留未引用组件、无法解析标题和多组件归属不明的反例，证明不会扫目录、跨对话框组合或把按钮串入上一分区。
 - 通用新增的源码字段发现复用同一条透明包装和静态组件引用链，使运行时字段映射到真实业务码；多个字段表单候选并存时保持未解析。详细填写与回读规则由 `generic-module-crud-smoke` 维护。
+- On the uniquely resolved Add-form source, expose direct `v-if`, `v-show`, and dynamic `:required` string equality/inequality as exact branch candidates. For compound/computed expressions, retain only stable form-model field references as `runtime` probe hints; never calculate the expression or guess its values. Dynamic `:field-code`/`:prop` and auxiliary `v-model:*` still cannot define the affected field identity. Pass all candidates to runtime discovery: the deployed page owns the real selectable options and rendered state, independent runtime choice controls remain eligible, and a source-confirmed driver or affected field must not disappear silently. Reopen a clean form between independent probes, carry parent conditions when a driver appears only inside another branch, and store only runtime-confirmed display branches in the manifest.
+- Resolve the Add form source once per execution entry through the aggregate form contract, and reuse that same selection for stable fields, branch candidates, and an optional exact-detail endpoint. Module smoke, module action, common-field discovery/validation, and personalized Add fixtures must consume this aggregate result instead of calling the field/branch/detail compatibility wrappers independently. A detail contract is eligible only when it is one unambiguous static GET used by that form, binds the record ID directly in a query or path, and shares the created resource prefix; preserve the deployment API base prefix. Reject dynamic URLs, complex ID construction, unrelated resources, and multiple candidates instead of guessing. Pass the resulting endpoint into the CRUD driver; endpoint request order, authentication fallback, strict ID extraction, and persistence comparison remain owned by `generic-module-crud-smoke`.
 - 若列表页在 `openAdd`/`openCreate`/`openNew` 处理器中声明静态 `componentPath`，字段发现优先解析该新增处理器的组件；同页其他编辑、入库、跟进弹窗不构成歧义。没有唯一明确新增处理器时仍保持未解析，并为该优先级添加临时目录回归测试。
 - 页面入口自身没有字段但渲染唯一一个相对 import 的本地字段组件时，源码字段发现应跟进该字段组件，使详情内联编辑等场景仍能拿到稳定业务字段码；存在多个含字段本地组件时保持未解析。字段填写、已有值保持和 generated choice 控件规则继续由 `generic-module-crud-smoke` 维护。
 - 源码字段发现遇到表格插槽内的 `el-form-item :prop="\`list.${index}.field\`"` 时，先把动态行号归一为 `list.*.field`，再用同文件表格列配置里的 `prop + label` 补全业务标签，例如 `amount` -> `预算金额（万元）`。这样运行时新增行的 `list.0.field` 能稳定匹配源码字段，不因行号或 Element Plus 生成 ID 漂移。
@@ -124,6 +126,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 ## 新增与持久化校验
 
 把新增测试实现为完整闭环：生成并记录预期值，经 UI 填写和提交，检查保存响应并提取业务主键，再通过当前页唯一列表/只读区域、详情接口或重新打开的编辑表单逐字段比较实际值与本次预期值。
+
+模块新增入口必须把聚合源码契约中的 `branch_candidates` 传给 `ModuleSmokeDriver`。当 `EI_REQUIRE_ADD=true` 时，普通模块冒烟和外层新增动作调用 `run_all_branches()`，要求结果非空且每一项都是 `add_and_detail_verified`、`add_and_edit_form_verified` 或 `add_and_list_verified`；任何一个分支失败都使本次模块失败。父分支源码码值未暴露在部署选项 DOM 时，由运行时逐项探测子 driver 的显隐来确认真实父选项。`provision_only`、删除/编辑前置和嵌套动作继续调用单次 `run()`，避免为准备一条记录重复创建所有分支数据。
 
 同时检查 HTTP 状态和业务状态。HTTP 200 不代表业务成功；继续检查响应中的 `code`、`status`、`success` 和错误消息。以下任一情况必须使测试失败：
 
@@ -359,6 +363,16 @@ exit $pytestExit
 ## Parametrized Common-field Reporting
 
 ## Independent Module-Action Data Scope
+
+## Dual-Project Launcher Execution
+
+- The desktop launcher may schedule EI and FI together only as separate project profiles. Each profile owns its source root, storage state and optional credentials; when both applications share one deployment, expose one common base URL and align it to each selected source view before menu capture or execution. Keep legacy single-project fields mapped to EI for existing scripts.
+- Keep storage-state paths internal to the launcher UI. Menu capture creates or refreshes them after interactive login, and normal execution reuses them; users need not select or edit the JSON path.
+- Keep the dual-project launcher compact: put the one shared deployed address above one horizontal EI/FI configuration row. The two rows must share full-width left and right boundaries, and their inputs must expand with the available width; EI/FI source groups split the remaining width evenly, while source-action/menu buttons stay fixed. Do not add a separator merely between those two rows. One trailing menu button captures only checked projects in EI/FI order and merges their namespaced menus. Do not add placeholder columns merely to expose internal state.
+- Namespace menu and action IDs as `EI::...` or `FI::...`, and prefix their visible tree paths with the project label. Render the two project-specific `ALL` shortcuts as the first top-level tree items in EI/FI order, before the project menu trees. `ALL` applies only to its own project namespace, so same-name or same-ID modules never collide.
+- Keep the legacy EI `scan()` and `fetch_runtime_menu()` entry points as wrappers around the project-aware implementation, using class-bound helpers rather than instance-only dispatch so existing launch scripts and structural launcher tests retain their single-project contract. Schedule selected-project background completion callbacks through the same class-bound helper with `self` passed explicitly; lightweight launcher harnesses may intentionally provide state without binding every `Launcher` method.
+- Build command plans, action batches, page/action suppression, field-discovery prioritization and API preflight separately for each project. Append the resulting groups in configured order (EI, then FI); never combine them into one browser/pytest session.
+- Set `EI_AUTOMATION_PROJECT` and a project-suffixed `EI_AUTOMATION_RUN_ID` on every command. Preflight must use that command group's own URL, source root and storage state, and Allure environment data must list all participating project environments without credentials or storage-state content.
 
 - Before scheduling resource-pool targets that require an outer Add lifecycle, evaluate the selected execution mode in the launcher. Allow `probe` and `standard`; for `stable`, show one launcher warning and schedule no command, rather than allowing pytest to create repeated broken results. Keep this mode decision out of the generic data-strategy factory.
 

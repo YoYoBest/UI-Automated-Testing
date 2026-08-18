@@ -40,6 +40,7 @@ from .module_driver import (
     INLINE_FORM,
     ModuleSmokeDriver,
 )
+from .source_form import SourceBranchCandidate, SourceDetailEndpoint
 from .dynamic_collections import DynamicCollectionSpec
 
 
@@ -143,6 +144,13 @@ class _ActiveCommonFieldForm:
     scope: Any
     handle: Any
     url: str
+
+
+@dataclass(slots=True)
+class _BranchNetworkTracker:
+    pending: set[int]
+    last_activity: float
+    listeners: tuple[tuple[str, Callable], ...]
 
 
 class CommonFieldFormSession:
@@ -301,6 +309,8 @@ class CommonFieldExecutor:
         data_strategy,
         *,
         source_fields: list[tuple[str, str, bool]] | None = None,
+        source_branch_candidates: Iterable[SourceBranchCandidate] | None = None,
+        source_detail_endpoints: Iterable[SourceDetailEndpoint] | None = None,
         default_upload_file: Path | None = None,
         dynamic_collections: list[DynamicCollectionSpec] | None = None,
         prepare_form_context: Callable[[object], None] | None = None,
@@ -311,10 +321,12 @@ class CommonFieldExecutor:
             os.getenv("EI_ENTRY_URL") or os.getenv("EI_FORM_URL") or ""
         ).strip()
         self.prepare_form_context = prepare_form_context
+        self.source_branch_candidates = tuple(source_branch_candidates or ())
         self.driver = ModuleSmokeDriver(
             page,
             data_strategy,
             source_fields=source_fields,
+            source_detail_endpoints=source_detail_endpoints,
             default_upload_file=default_upload_file,
             dynamic_collections=dynamic_collections,
             automation_record_registry=automation_record_registry,
@@ -370,10 +382,28 @@ class CommonFieldExecutor:
             fields = discover_common_fields(
                 self._wait_for_fields_stable(scope), definitions
             )
+            branch_fields = self._discover_baseline_branch_fields(
+                scope, fields, definitions
+            )
+            source_affected_codes = {
+                candidate.affected_field
+                for candidate in getattr(self, "source_branch_candidates", ())
+            }
+            confirmed_source_branch_codes = {
+                field.field_key
+                for field in branch_fields
+                if field.field_key in source_affected_codes
+            }
+            if confirmed_source_branch_codes:
+                fields = [
+                    field for field in fields
+                    if field.field_key not in confirmed_source_branch_codes
+                ]
             fields = self._merge_discovered_fields(
                 fields,
-                self._discover_baseline_branch_fields(scope, fields, definitions),
+                branch_fields,
             )
+            scope = getattr(self, "_branch_discovery_scope", scope)
             fields.extend(self._discover_form_commands(scope))
             if not fields:
                 raise AssertionError("新增表单中没有发现可应用通用规则的字段")
@@ -420,53 +450,161 @@ class CommonFieldExecutor:
         }:
             return []
         base_fields = list(fields)
-        base_keys = {field.field_key for field in base_fields if field.field_key}
+        base_by_key = {
+            field.field_key: field for field in base_fields if field.field_key
+        }
+        source_branch_candidates = tuple(
+            getattr(self, "source_branch_candidates", ())
+        )
+        candidate_driver_codes = {
+            candidate.driver_field
+            for candidate in source_branch_candidates
+            if candidate.driver_field
+        }
+        candidate_affected_by_driver: dict[str, set[str]] = {}
+        for candidate in source_branch_candidates:
+            candidate_affected_by_driver.setdefault(
+                candidate.driver_field, set()
+            ).add(candidate.affected_field)
+        probe_fields = [
+            field
+            for field in base_fields
+            if not field.readonly and field.kind in {"select", "radio"}
+        ]
+        conditionally_revealed_drivers = {
+            candidate.affected_field
+            for candidate in source_branch_candidates
+            if candidate.affected_field in candidate_driver_codes
+        }
+        available_driver_codes = {
+            field.field_key for field in probe_fields if field.field_key
+        }
+        missing_source_drivers = sorted(
+            candidate_driver_codes
+            - available_driver_codes
+            - conditionally_revealed_drivers
+        )
+        if missing_source_drivers:
+            raise AssertionError(
+                "源码确认的联动字段未在当前可编辑表单中找到："
+                + ", ".join(missing_source_drivers)
+            )
         discovered: list[DiscoveredCommonField] = []
-        for field in base_fields:
-            if field.readonly or field.kind not in {"select", "radio"}:
-                continue
+        clean_reopen = getattr(self, "_form_session", None) is not None
+        current_scope = scope
+        queued_driver_keys = {
+            (field.field_key, branch_condition_key(field.branch_conditions))
+            for field in probe_fields
+        }
+        probed_source_drivers: set[str] = set()
+        probe_index = 0
+        while probe_index < len(probe_fields):
+            field = probe_fields[probe_index]
+            probe_index += 1
             try:
-                option_labels = self._branch_option_labels(field, scope)
+                if clean_reopen:
+                    current_scope = self._reopen_clean_branch_discovery_form()
+                    if field.branch_conditions:
+                        self._apply_branch_conditions(
+                            field.branch_conditions, current_scope
+                        )
+                        current_scope = self._active_form_scope() or current_scope
+                    current_driver = self._branch_driver_field(
+                        field.field_key, current_scope
+                    )
+                else:
+                    if field.branch_conditions:
+                        self._apply_branch_conditions(
+                            field.branch_conditions, current_scope
+                        )
+                        current_scope = self._active_form_scope() or current_scope
+                    current_driver = field
+                option_labels = self._branch_option_labels(
+                    current_driver, current_scope
+                )
+                if not option_labels:
+                    if field.field_key in candidate_driver_codes:
+                        raise AssertionError(
+                            "源码确认的联动字段没有可枚举的运行时选项："
+                            f"{field.field_key}"
+                        )
+                    continue
+                option_labels = self._branch_options_to_probe(
+                    field.field_key,
+                    option_labels,
+                    source_driver_codes=candidate_driver_codes,
+                )
                 if not option_labels:
                     continue
-                max_options = max(
-                    1,
-                    int(os.getenv("EI_COMMON_FIELD_BRANCH_MAX_OPTIONS", "8")),
-                )
-                if len(option_labels) > max_options:
-                    print(
-                        "COMMON_FIELD_BRANCH_DISCOVERY_SKIPPED "
-                        f"field={field.field_key} reason=too_many_options "
-                        f"count={len(option_labels)} max={max_options}",
-                        flush=True,
-                    )
-                    continue
-                for option_index, option_label in enumerate(option_labels):
-                    self._select_branch_option(
-                        field,
-                        scope,
-                        option_label,
-                        option_index=option_index,
-                    )
-                    self.page.wait_for_timeout(500)
-                    branch_fields = discover_common_fields(
-                        self._wait_for_fields_stable(
-                            scope,
-                            timeout_ms=int(
-                                os.getenv(
-                                    "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
-                                )
+                observed_source_affected: set[str] = set()
+                for option_label in option_labels:
+                    if clean_reopen:
+                        current_scope = self._reopen_clean_branch_discovery_form()
+                        if field.branch_conditions:
+                            self._apply_branch_conditions(
+                                field.branch_conditions, current_scope
+                            )
+                            current_scope = (
+                                self._active_form_scope() or current_scope
+                            )
+                        current_driver = self._branch_driver_field(
+                            field.field_key, current_scope
+                        )
+                    network_tracker = self._start_branch_network_tracker()
+                    try:
+                        self._select_branch_option(
+                            current_driver,
+                            current_scope,
+                            option_label,
+                        )
+                        self.page.wait_for_timeout(500)
+                        branch_fields = discover_common_fields(
+                            self._wait_for_fields_stable(
+                                current_scope,
+                                timeout_ms=int(
+                                    os.getenv(
+                                        "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                                    )
+                                ),
+                                stable_ms=int(
+                                    os.getenv("EI_COMMON_FIELD_BRANCH_STABLE_MS", "700")
+                                ),
+                                network_tracker=network_tracker,
                             ),
-                            stable_ms=int(
-                                os.getenv("EI_COMMON_FIELD_BRANCH_STABLE_MS", "700")
-                            ),
-                        ),
-                        definitions,
-                    )
-                    condition = ((field.field_key, option_label),)
+                            definitions,
+                        )
+                    finally:
+                        self._stop_branch_network_tracker(network_tracker)
+                    condition = branch_condition_key((
+                        *field.branch_conditions,
+                        (field.field_key, option_label),
+                    ))
+                    condition_driver_codes = {
+                        driver_code for driver_code, _value in condition
+                    }
                     branch_added = 0
                     for branch_field in branch_fields:
-                        if branch_field.field_key in base_keys:
+                        if branch_field.field_key in candidate_affected_by_driver.get(
+                            field.field_key, set()
+                        ):
+                            observed_source_affected.add(branch_field.field_key)
+                        baseline_field = base_by_key.get(branch_field.field_key)
+                        source_affected = (
+                            branch_field.field_key
+                            in candidate_affected_by_driver.get(field.field_key, set())
+                        )
+                        if (
+                            branch_field.field_key in condition_driver_codes
+                            and not source_affected
+                        ):
+                            continue
+                        if (
+                            baseline_field is not None
+                            and not source_affected
+                            and self._same_branch_field_state(
+                                baseline_field, branch_field
+                            )
+                        ):
                             continue
                         discovered.append(
                             replace(
@@ -475,23 +613,180 @@ class CommonFieldExecutor:
                             )
                         )
                         branch_added += 1
+                        driver_key = (
+                            branch_field.field_key,
+                            condition,
+                        )
+                        if (
+                            branch_field.field_key in candidate_driver_codes
+                            and not branch_field.readonly
+                            and branch_field.kind in {"select", "radio"}
+                            and driver_key not in queued_driver_keys
+                        ):
+                            queued_driver_keys.add(driver_key)
+                            probe_fields.append(replace(
+                                branch_field,
+                                branch_conditions=condition,
+                            ))
                     print(
                         "COMMON_FIELD_BRANCH_DISCOVERED "
                         f"driver={field.field_key} option={option_label!r} "
                         f"fields={branch_added}",
                         flush=True,
                     )
+                missing_source_affected = sorted(
+                    candidate_affected_by_driver.get(field.field_key, set())
+                    - observed_source_affected
+                )
+                if missing_source_affected:
+                    raise AssertionError(
+                        "源码确认的联动字段未能覆盖声明的受影响控件："
+                        f"driver={field.field_key}; fields="
+                        + ", ".join(missing_source_affected)
+                    )
+                if field.field_key in candidate_driver_codes:
+                    probed_source_drivers.add(field.field_key)
             except Exception as exc:
+                try:
+                    self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                if field.field_key in candidate_driver_codes:
+                    raise AssertionError(
+                        "源码确认的联动字段分支发现失败："
+                        f"{field.field_key}; reason={exc}"
+                    ) from exc
                 print(
                     "COMMON_FIELD_BRANCH_DISCOVERY_SKIPPED "
                     f"field={field.field_key} reason={exc}",
                     flush=True,
                 )
+        unprobed_source_drivers = sorted(
+            candidate_driver_codes - probed_source_drivers
+        )
+        if unprobed_source_drivers:
+            raise AssertionError(
+                "源码确认的联动字段未形成可执行运行时分支："
+                + ", ".join(unprobed_source_drivers)
+            )
+        if clean_reopen:
+            current_scope = self._reopen_clean_branch_discovery_form()
+        self._branch_discovery_scope = current_scope
+        return discovered
+
+    def _reopen_clean_branch_discovery_form(self):
+        self.close_form()
+        scope = self.open_fresh_add_form()
+        self._wait_for_fields_stable(scope)
+        return scope
+
+    def _start_branch_network_tracker(self) -> _BranchNetworkTracker | None:
+        """Track only requests that can hydrate a branch after a choice change."""
+        page_on = getattr(self.page, "on", None)
+        page_remove = getattr(self.page, "remove_listener", None)
+        if not callable(page_on) or not callable(page_remove):
+            return None
+        tracker = _BranchNetworkTracker(set(), time.monotonic(), ())
+
+        def request_started(request) -> None:
+            if not self._branch_request_is_trackable(request):
+                return
+            tracker.pending.add(id(request))
+            tracker.last_activity = time.monotonic()
+
+        def request_settled(request) -> None:
+            request_id = id(request)
+            if request_id not in tracker.pending:
+                return
+            tracker.pending.discard(request_id)
+            tracker.last_activity = time.monotonic()
+
+        listeners = (
+            ("request", request_started),
+            ("requestfinished", request_settled),
+            ("requestfailed", request_settled),
+        )
+        attached = []
+        try:
+            for event, listener in listeners:
+                page_on(event, listener)
+                attached.append((event, listener))
+        except Exception:
+            for event, listener in reversed(attached):
                 try:
-                    self.page.keyboard.press("Escape")
+                    page_remove(event, listener)
                 except Exception:
                     pass
-        return discovered
+            return None
+        tracker.listeners = listeners
+        return tracker
+
+    def _stop_branch_network_tracker(
+        self, tracker: _BranchNetworkTracker | None,
+    ) -> None:
+        if tracker is None:
+            return
+        remove = getattr(self.page, "remove_listener", None)
+        if not callable(remove):
+            return
+        for event, listener in tracker.listeners:
+            try:
+                remove(event, listener)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _branch_request_is_trackable(request) -> bool:
+        resource_type = getattr(request, "resource_type", "")
+        try:
+            resource_type = (
+                resource_type() if callable(resource_type) else resource_type
+            )
+        except Exception:
+            return False
+        if not resource_type:
+            return True
+        return str(resource_type).lower() in {"fetch", "xhr"}
+
+    @staticmethod
+    def _branch_options_to_probe(
+        field_key: str,
+        option_labels: Iterable[str],
+        *,
+        source_driver_codes: set[str],
+    ) -> list[str]:
+        """Never truncate options for a source-confirmed linkage driver."""
+        labels = list(option_labels)
+        if field_key in source_driver_codes:
+            return labels
+        max_options = max(
+            1,
+            int(os.getenv("EI_COMMON_FIELD_BRANCH_MAX_OPTIONS", "8")),
+        )
+        if len(labels) <= max_options:
+            return labels
+        print(
+            "COMMON_FIELD_BRANCH_DISCOVERY_SKIPPED "
+            f"field={field_key} reason=unconfirmed_driver_too_many_options "
+            f"count={len(labels)} max={max_options}",
+            flush=True,
+        )
+        return []
+
+    @staticmethod
+    def _same_branch_field_state(
+        baseline: DiscoveredCommonField,
+        branch: DiscoveredCommonField,
+    ) -> bool:
+        return (
+            baseline.kind,
+            baseline.readonly,
+            baseline.constraints.required,
+        ) == (
+            branch.kind,
+            branch.readonly,
+            branch.constraints.required,
+        )
 
     def _branch_option_labels(
         self, field: DiscoveredCommonField, scope,
@@ -548,8 +843,6 @@ class CommonFieldExecutor:
         field: DiscoveredCommonField,
         scope,
         option_label: str,
-        *,
-        option_index: int | None = None,
     ) -> None:
         locator = self._choice_locator_for_branch_driver(field, scope)
         if locator is None or not locator.count() or not locator.is_visible():
@@ -566,8 +859,6 @@ class CommonFieldExecutor:
         options = self._owned_select_options(locator)
         labels = self._visible_texts(options)
         target_index = self._matching_option_index(labels, option_label)
-        if target_index is None and option_index is not None and option_index < options.count():
-            target_index = option_index
         if target_index is None:
             raise AssertionError(
                 f"联动分支字段 {field.field_key} 没有选项：{option_label}"
@@ -641,9 +932,6 @@ class CommonFieldExecutor:
         for index, label in enumerate(normalized):
             if label == wanted:
                 return index
-        for index, label in enumerate(normalized):
-            if wanted in label or label in wanted:
-                return index
         return None
 
     def _run_in_form_session(self, operation):
@@ -700,6 +988,22 @@ class CommonFieldExecutor:
     ) -> bool:
         return self._apply_branch_conditions(case.branch_conditions, scope)
 
+    def _fill_case_baseline(
+        self,
+        case: BoundCommonCase,
+        scope,
+        *,
+        upload_attachments: bool = True,
+    ) -> dict[str, Any]:
+        """Build a baseline without allowing data defaults to replace its branch."""
+        conditions = branch_condition_key(case.branch_conditions)
+        kwargs: dict[str, Any] = {}
+        if not upload_attachments:
+            kwargs["upload_attachments"] = False
+        if conditions:
+            kwargs["branch_conditions"] = conditions
+        return self._fill_valid_baseline(scope, **kwargs)
+
     def _apply_branch_conditions(
         self,
         branch_conditions: Iterable[tuple[Any, Any]] | None,
@@ -722,6 +1026,26 @@ class CommonFieldExecutor:
             flush=True,
         )
         return True
+
+    def _assert_branch_conditions_retained(
+        self,
+        branch_conditions: Iterable[tuple[Any, Any]] | None,
+        scope,
+    ) -> None:
+        conditions = branch_condition_key(branch_conditions)
+        for field_key, option_label in conditions:
+            driver = self._branch_driver_field(field_key, scope)
+            locator = self._choice_locator_for_branch_driver(driver, scope)
+            if (
+                locator is None
+                or not locator.count()
+                or not locator.is_visible()
+                or not self._branch_option_already_selected(locator, option_label)
+            ):
+                raise AssertionError(
+                    "分支基线未完成：联动字段 "
+                    f"{field_key} 未保持目标值 {option_label!r}"
+                )
 
     def _branch_driver_field(
         self, field_key: str, scope,
@@ -793,7 +1117,7 @@ class CommonFieldExecutor:
                 # Fill a valid baseline first so Save exercises the target case rather
                 # than unrelated required-field validation.
                 self._apply_case_branch_conditions(case, scope)
-                submitted = self._fill_valid_baseline(scope)
+                submitted = self._fill_case_baseline(case, scope)
                 current = self._wait_for_current_field(case, scope)
                 scope = self._active_form_scope() or scope
                 locator = self._locator(current)
@@ -826,7 +1150,9 @@ class CommonFieldExecutor:
             raise AssertionError(f"附件用例未绑定到文件控件：{field.field_key}/{field.kind}")
         # A normal baseline deliberately preserves populated attachments. EDIT-004
         # adds one uniquely named fixture to only its target attachment control.
-        submitted = self._fill_valid_baseline(scope, upload_attachments=False)
+        submitted = self._fill_case_baseline(
+            case, scope, upload_attachments=False
+        )
         before = self._attachment_names(field, scope)
         tracker = self.driver._start_attachment_lifecycle_tracking()
         try:
@@ -1010,7 +1336,9 @@ class CommonFieldExecutor:
 
         def operation(scope):
             self._apply_case_branch_conditions(transaction.cases[0], scope)
-            submitted = self._fill_valid_baseline(scope, upload_attachments=False)
+            submitted = self._fill_case_baseline(
+                transaction.cases[0], scope, upload_attachments=False
+            )
             prepared = []
             for case in transaction.cases:
                 current = self._current_field(case, scope)
@@ -1083,7 +1411,9 @@ class CommonFieldExecutor:
 
         def operation(scope):
             self._apply_case_branch_conditions(transaction.cases[0], scope)
-            submitted = self._fill_valid_baseline(scope, upload_attachments=False)
+            submitted = self._fill_case_baseline(
+                transaction.cases[0], scope, upload_attachments=False
+            )
             tracker = self.driver._start_attachment_lifecycle_tracking()
             prepared = []
             try:
@@ -1151,8 +1481,8 @@ class CommonFieldExecutor:
 
         def operation(scope):
             self._apply_case_branch_conditions(transaction.cases[0], scope)
-            submitted = self._fill_valid_baseline(
-                scope, upload_attachments=False
+            submitted = self._fill_case_baseline(
+                transaction.cases[0], scope, upload_attachments=False
             )
             prepared = []
             representatives: dict[str, tuple[int, BoundCommonCase, Any, Any]] = {}
@@ -1370,7 +1700,9 @@ class CommonFieldExecutor:
 
         def operation(scope):
             self._apply_case_branch_conditions(transaction.cases[0], scope)
-            submitted = self._fill_valid_baseline(scope, upload_attachments=False)
+            submitted = self._fill_case_baseline(
+                transaction.cases[0], scope, upload_attachments=False
+            )
             prepared = []
             for case in transaction.cases:
                 current = self._current_field(case, scope)
@@ -3457,16 +3789,45 @@ class CommonFieldExecutor:
             self.page.wait_for_timeout(100)
 
     def _fill_valid_baseline(
-        self, scope, *, upload_attachments: bool = True
+        self,
+        scope,
+        *,
+        upload_attachments: bool = True,
+        branch_conditions: Iterable[tuple[Any, Any]] | None = None,
+        protected_codes: set[str] | None = None,
     ) -> dict[str, Any]:
+        conditions = branch_condition_key(branch_conditions)
+        protected_codes = {
+            str(code).lower() for code in (protected_codes or set())
+        } | {
+            field_key.lower() for field_key, _option_label in conditions
+        }
         submitted: dict[str, Any] = {}
         attempts = max(1, int(os.getenv("EI_FIELD_FILL_ATTEMPTS", "3")))
         retry_codes = None
         report = None
         for attempt in range(1, attempts + 1):
             try:
-                submitted.update(self.driver._fill_dialog(only_codes=retry_codes))
+                if conditions:
+                    self._apply_branch_conditions(conditions, scope)
+                    scope = self._active_form_scope() or scope
+                fill_kwargs: dict[str, Any] = {"only_codes": retry_codes}
+                if protected_codes:
+                    fill_kwargs["protected_codes"] = protected_codes
+                submitted.update(self.driver._fill_dialog(**fill_kwargs))
                 fill_failures = list(self.driver._fill_failures)
+                if conditions:
+                    self._wait_for_fields_stable(
+                        scope,
+                        timeout_ms=int(os.getenv(
+                            "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                        )),
+                        stable_ms=int(os.getenv(
+                            "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+                        )),
+                    )
+                    scope = self._active_form_scope() or scope
+                    self._assert_branch_conditions_retained(conditions, scope)
                 if upload_attachments:
                     self.driver._upload_default_attachments(scope)
                 else:
@@ -3476,6 +3837,20 @@ class CommonFieldExecutor:
                     lambda _scope: {},
                 )(scope)
                 submitted.update(nested_baseline)
+                if conditions:
+                    self._wait_for_fields_stable(
+                        scope,
+                        timeout_ms=int(os.getenv(
+                            "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                        )),
+                        stable_ms=int(os.getenv(
+                            "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+                        )),
+                    )
+                    scope = self._active_form_scope() or scope
+                    self._assert_branch_conditions_retained(conditions, scope)
+                    for field_key, option_label in conditions:
+                        submitted[field_key] = option_label
             except DynamicFieldContractError as exc:
                 raise SharedFormPreconditionError(
                     f"通用用例共享动态字段前置契约失败：{exc}"
@@ -3494,13 +3869,22 @@ class CommonFieldExecutor:
                     report, scope
                 )
             if self.driver._field_report_ok(report):
-                self._ensure_unique_record_identity(scope, submitted)
+                self._ensure_unique_record_identity(
+                    scope, submitted, protected_codes=protected_codes
+                )
                 return submitted
-            retry_codes = self.driver._retry_field_codes(submitted)
+            retry_codes = self.driver._retry_field_codes(submitted) - protected_codes
             if not retry_codes or attempt == attempts:
                 break
             self.page.wait_for_timeout(500)
         detail = report.message() if report is not None else "未生成字段完成度报告"
+        if conditions:
+            rendered_conditions = ", ".join(
+                f"{field_key}={option_label}" for field_key, option_label in conditions
+            )
+            raise AssertionError(
+                f"分支基线未完成：{rendered_conditions}；{detail}"
+            )
         raise AssertionError(f"通用用例合法基线填充失败：{detail}")
 
     @staticmethod
@@ -3565,16 +3949,27 @@ class CommonFieldExecutor:
             )
         ]
 
-    def _ensure_unique_record_identity(self, scope, submitted: dict[str, Any]) -> None:
+    def _ensure_unique_record_identity(
+        self,
+        scope,
+        submitted: dict[str, Any],
+        *,
+        protected_codes: set[str] | None = None,
+    ) -> None:
         """Make every physical save traceable to one unique automation-owned record."""
         if not submitted:
             return
+        protected = {
+            str(code).lower() for code in (protected_codes or set())
+        }
         try:
             fields = self._scan_fields(scope)
         except Exception:
             return
         token = self._record_identity_token(scope)
         for field in self._record_identity_candidate_fields(fields, submitted):
+            if str(field.field_code or "").lower() in protected:
+                continue
             try:
                 definition = FieldDefinition(
                     field_code=field.field_code,
@@ -3775,6 +4170,65 @@ class CommonFieldExecutor:
         if poppers.count():
             raise AssertionError("字段稳定等待期间重新出现了选择浮层")
 
+    def _preflight_branch_baseline(
+        self,
+        case: BoundCommonCase,
+        scope,
+        submitted: dict[str, Any],
+        *,
+        exempt_codes: set[str],
+    ):
+        """Prove the active branch is complete before issuing a business write."""
+        conditions = branch_condition_key(case.branch_conditions)
+        if not conditions or case.field_type == "required":
+            return scope
+        self._wait_for_fields_stable(
+            scope,
+            timeout_ms=int(os.getenv(
+                "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+            )),
+            stable_ms=int(os.getenv(
+                "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+            )),
+        )
+        scope = self._active_form_scope() or scope
+        self._assert_branch_conditions_retained(conditions, scope)
+        missing_codes = self._missing_required_dom_codes(
+            scope,
+            submitted,
+            exclude_codes=exempt_codes,
+            trust_submitted_choices=False,
+        )
+        fields = self._scan_fields(scope)
+        missing_fields = [
+            self.driver._field_display(field.field_code, field.label)
+            for field in fields
+            if str(field.field_code or "").lower() in missing_codes
+        ]
+        collection_error = ""
+        validate_collections = getattr(
+            self.driver, "_assert_configured_dynamic_collection_controls", None
+        )
+        if callable(validate_collections):
+            try:
+                validate_collections(scope)
+            except DynamicFieldContractError as exc:
+                collection_error = str(exc)
+        problems = [*dict.fromkeys(missing_fields)]
+        if collection_error:
+            problems.append(collection_error)
+        if problems:
+            rendered_conditions = ", ".join(
+                f"{field_key}={option_label}"
+                for field_key, option_label in conditions
+            )
+            raise AssertionError(
+                "分支基线未完成："
+                f"{rendered_conditions}；缺失或不合法字段："
+                + "; ".join(problems)
+            )
+        return scope
+
     def _submit_case(
         self,
         case,
@@ -3792,6 +4246,19 @@ class CommonFieldExecutor:
     ) -> CommonFieldExecutionResult:
         if required_codes is None and not case.field_type.endswith("_command"):
             required_codes = {case.field_key}
+        branch_protected_codes = {
+            field_key
+            for field_key, _option_label in branch_condition_key(
+                case.branch_conditions
+            )
+        }
+        target_protected_codes = required_codes or {case.field_key}
+        scope = self._preflight_branch_baseline(
+            case,
+            scope,
+            submitted,
+            exempt_codes=target_protected_codes,
+        )
         if rendered_text_expectations is None and self._requires_rendered_whitespace_check(
             case, actual
         ):
@@ -3803,7 +4270,11 @@ class CommonFieldExecutor:
             raise AssertionError("新增表单没有可用的保存按钮")
         responses = []
         if any(value not in (None, "", []) for value in submitted.values()):
-            self._ensure_unique_record_identity(scope, submitted)
+            self._ensure_unique_record_identity(
+                scope,
+                submitted,
+                protected_codes=target_protected_codes | branch_protected_codes,
+            )
         form_action = os.getenv("EI_COMMON_FORM_ACTION", "").strip()
         is_create = (
             not form_action or form_action.startswith(COMMON_ADD_ACTION_PREFIXES)
@@ -3815,8 +4286,8 @@ class CommonFieldExecutor:
                 exclude_codes=(
                     set()
                     if case.field_type.endswith("_command")
-                    else (required_codes or {case.field_key})
-                ),
+                    else target_protected_codes
+                ) | branch_protected_codes,
             ))
         record_markers = self.driver._collect_record_identity_markers(
             submitted, scope=scope
@@ -3904,7 +4375,9 @@ class CommonFieldExecutor:
                     scope_handle,
                     expected_type=case.expected_type,
                     business_request_started=lambda: bool(observed_requests),
-                    protected_codes=(required_codes or {case.field_key}),
+                    protected_codes=(
+                        target_protected_codes | branch_protected_codes
+                    ),
                     retryable_unique_codes=(
                         {case.field_key}
                         if is_create and not case.field_type.endswith("_command")
@@ -4757,25 +5230,45 @@ class CommonFieldExecutor:
         compatible = [
             field for field in candidates if self._field_matches_case_type(case, field)
         ]
-        if compatible:
-            # Radio/checkbox groups legitimately expose multiple native controls for
-            # one business field. The group identity is the stable field key, not
-            # its count.
+        if len(compatible) == 1:
             return compatible[0]
+        if len(compatible) > 1:
+            choice_group = (
+                self._runtime_choice_field(case, scope)
+                if case.field_type in {"radio", "checkbox"}
+                else None
+            )
+            if choice_group is not None:
+                return choice_group
+            raise AssertionError(
+                f"当前表单字段身份不唯一：{case.field_key} ({case.field_label}) "
+                f"匹配到 {len(compatible)} 个可执行控件；"
+                "禁止取第一个控件或按 DOM 顺序执行"
+            )
         label_candidates = [
             field
             for field in fields
             if field.label.strip() == case.field_label.strip()
             and self._field_matches_case_type(case, field)
         ]
-        if label_candidates:
+        if len(label_candidates) == 1:
             return label_candidates[0]
+        if len(label_candidates) > 1:
+            choice_group = (
+                self._runtime_choice_field(case, scope)
+                if case.field_type in {"radio", "checkbox"}
+                else None
+            )
+            if choice_group is not None:
+                return choice_group
+            raise AssertionError(
+                f"当前表单标签身份不唯一：{case.field_label} "
+                f"匹配到 {len(label_candidates)} 个可执行控件；"
+                "必须提供稳定 fieldCode 或分区路径"
+            )
         runtime_choice = self._runtime_choice_field(case, scope)
         if runtime_choice is not None:
             return runtime_choice
-        rebound_generated = self._rebind_generated_id_field(case, scope)
-        if rebound_generated is not None:
-            return rebound_generated
         if candidates:
             observed = ", ".join(
                 f"{field.label or field.field_key}/{field.field_type}/{field.kind}"
@@ -4789,7 +5282,11 @@ class CommonFieldExecutor:
         if not label_candidates:
             # Choice groups often expose one native control per option. Their stable
             # selector from discovery is a stronger identity than positional remapping.
-            if case.field_type in {"select", "radio"} and case.selector:
+            if (
+                case.field_type in {"select", "radio"}
+                and case.selector
+                and "el-id-" not in case.selector.lower()
+            ):
                 return DiscoveredCommonField(
                     case.field_key,
                     case.field_label,
@@ -4802,36 +5299,6 @@ class CommonFieldExecutor:
                 f"当前表单无法定位字段：{case.field_key} ({case.field_label})；"
                 f"实际字段={self._runtime_field_inventory(fields)}"
             )
-
-    def _rebind_generated_id_field(self, case: BoundCommonCase, scope):
-        """Rebind a manifest-only Element Plus ID when its stable suffix is unique."""
-        selector = str(case.selector or "").strip()
-        match = re.fullmatch(r"#(el-id-[A-Za-z0-9_-]*?-(\d+))", selector)
-        if match is None:
-            return None
-        suffix = match.group(2)
-        try:
-            candidates = scope.locator(f'input[id$="-{suffix}"]')
-            if candidates.count() != 1 or not candidates.first.is_visible():
-                return None
-            current_id = candidates.first.get_attribute("id") or ""
-        except Exception:
-            return None
-        if not re.fullmatch(rf"el-id-[A-Za-z0-9_-]*-{re.escape(suffix)}", current_id):
-            return None
-        print(
-            "COMMON_FIELD_REBOUND "
-            f"field={case.field_key} generated_id_suffix=-{suffix}",
-            flush=True,
-        )
-        return DiscoveredCommonField(
-            case.field_key,
-            case.field_label,
-            case.field_type,
-            case.field_type,
-            f"#{current_id}",
-            FieldConstraints(),
-        )
 
     def _runtime_field_inventory(self, fields: Iterable[DiscoveredCommonField]) -> str:
         """Keep locator failures actionable without exposing form values."""
@@ -5126,7 +5593,7 @@ class CommonFieldExecutor:
         if form_scope is None:
             form_scope = self.page.locator(DIALOG).last
         self._apply_case_branch_conditions(case, form_scope)
-        submitted = self._fill_valid_baseline(form_scope)
+        submitted = self._fill_case_baseline(case, form_scope)
         if callable(getattr(form_scope, "evaluate", None)):
             form_scope = self._active_form_scope() or form_scope
             field = self._wait_for_current_field(case, form_scope)
@@ -5134,6 +5601,9 @@ class CommonFieldExecutor:
             readonly_result = self._runtime_readonly_choice_result(case, field)
             if readonly_result is not None:
                 return readonly_result
+        active_codes_before_mutation = self._active_branch_submission_codes(
+            form_scope
+        )
         locator = self._choice_locator_for_current_field(case, field, form_scope)
         item = locator.locator(
             "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),' el-form-item ')][1]"
@@ -5234,7 +5704,11 @@ class CommonFieldExecutor:
             actual = "; ".join(selected_after)
             submitted[case.field_key] = actual
             self._refill_required_baseline_after_target_mutation(
-                form_scope, submitted, exclude_codes={case.field_key},
+                form_scope,
+                submitted,
+                exclude_codes={case.field_key},
+                branch_conditions=case.branch_conditions,
+                previously_active_codes=active_codes_before_mutation,
             )
             return self._submit_case(
                 case, form_scope, field, submitted, actual, actual,
@@ -5312,7 +5786,11 @@ class CommonFieldExecutor:
         actual = "; ".join(selected)
         submitted[case.field_key] = actual
         self._refill_required_baseline_after_target_mutation(
-            form_scope, submitted, exclude_codes={case.field_key},
+            form_scope,
+            submitted,
+            exclude_codes={case.field_key},
+            branch_conditions=case.branch_conditions,
+            previously_active_codes=active_codes_before_mutation,
         )
         return self._submit_case(
             case, form_scope, field, submitted, actual, actual, ""
@@ -5443,31 +5921,113 @@ class CommonFieldExecutor:
         submitted: dict[str, Any],
         *,
         exclude_codes: set[str] | None = None,
+        branch_conditions: Iterable[tuple[Any, Any]] | None = None,
+        previously_active_codes: set[str] | None = None,
     ) -> None:
-        """Refill required controls that a target choice mutation cleared."""
+        """Discard the old branch snapshot and complete the newly rendered branch."""
         excluded = {str(code).lower() for code in (exclude_codes or set())}
+        conditions = branch_condition_key(branch_conditions)
+        protected = excluded | {
+            field_key.lower() for field_key, _option_label in conditions
+        }
         attempts = max(1, int(os.getenv("EI_FIELD_FILL_ATTEMPTS", "3")))
         missing: set[str] = set()
         for attempt in range(1, attempts + 1):
+            self._wait_for_fields_stable(
+                scope,
+                timeout_ms=int(os.getenv(
+                    "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                )),
+                stable_ms=int(os.getenv(
+                    "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+                )),
+            )
+            scope = self._active_form_scope() or scope
+            if conditions:
+                self._assert_branch_conditions_retained(conditions, scope)
+            if attempt == 1 and previously_active_codes is not None:
+                current_codes = self._active_branch_submission_codes(scope)
+                stale_codes = {
+                    code.lower() for code in previously_active_codes
+                    if code.lower() not in {item.lower() for item in current_codes}
+                }
+                for submitted_code in list(submitted):
+                    if (
+                        str(submitted_code).lower() in stale_codes
+                        and str(submitted_code).lower() not in protected
+                    ):
+                        submitted.pop(submitted_code, None)
+                fill_kwargs: dict[str, Any] = {}
+                if protected:
+                    fill_kwargs["protected_codes"] = protected
+                submitted.update(self.driver._fill_dialog(**fill_kwargs))
+                self.driver._upload_default_attachments(scope)
+                submitted.update(getattr(
+                    self.driver,
+                    "_prepare_implicit_required_nested_baselines",
+                    lambda _scope: {},
+                )(scope))
             missing = self._missing_required_dom_codes(
-                scope, submitted, exclude_codes=excluded,
+                scope,
+                submitted,
+                exclude_codes=excluded,
+                trust_submitted_choices=False,
             )
             if not missing:
                 return
-            submitted.update(self.driver._fill_dialog(only_codes=missing))
+            fill_kwargs: dict[str, Any] = {"only_codes": missing}
+            if protected:
+                fill_kwargs["protected_codes"] = protected
+            submitted.update(self.driver._fill_dialog(**fill_kwargs))
             self.driver._upload_default_attachments(scope)
             nested_baseline = getattr(
                 self.driver, "_prepare_implicit_required_nested_baselines",
                 lambda _scope: {},
             )(scope)
             submitted.update(nested_baseline)
+            if conditions:
+                self._assert_branch_conditions_retained(conditions, scope)
             if attempt < attempts:
                 self.page.wait_for_timeout(500)
         if missing:
+            prefix = "分支基线未完成：" if conditions else ""
             raise AssertionError(
-                "目标选择控件操作后仍有其他必填字段为空："
+                prefix
+                + "目标选择控件操作后仍有其他必填字段为空："
                 + ", ".join(sorted(missing))
             )
+
+    def _active_branch_submission_codes(self, scope) -> set[str]:
+        """Return only stable business identities rendered in the active branch."""
+
+        try:
+            fields = self._scan_fields(scope)
+        except Exception:
+            return set()
+        codes: set[str] = set()
+        runtime_identity = getattr(
+            self.driver, "_runtime_identity_for_dom", None
+        )
+        for index, field in enumerate(fields, 1):
+            code = str(field.field_code or "")
+            if callable(runtime_identity):
+                try:
+                    identity = runtime_identity(field, index)
+                    if identity[-1]:
+                        code = str(identity[3] or identity[0] or code)
+                except Exception:
+                    pass
+            generated = getattr(
+                self.driver, "_is_generated_identifier", None
+            )
+            is_generated = (
+                generated(code)
+                if callable(generated)
+                else not code or code.lower().startswith("el-id-")
+            )
+            if code and not is_generated:
+                codes.add(code)
+        return codes
 
     def _ensure_command_required_baseline(
         self, scope, submitted: dict[str, Any]
@@ -5689,7 +6249,7 @@ class CommonFieldExecutor:
             if active is not None:
                 scope = active.scope
         fields = scan_dom_fields(self.page, scope)
-        if not fields and scope is not None:
+        if scope is not None:
             recovered_scope = self._recover_replaced_active_form_scope(scope)
             if recovered_scope is not None:
                 fields = scan_dom_fields(self.page, recovered_scope)
@@ -5702,27 +6262,37 @@ class CommonFieldExecutor:
         return mapped
 
     def _recover_replaced_active_form_scope(self, scope):
-        """Rebind only when a live form uniquely replaces an empty pinned scope."""
+        """Rebind when exactly one live form replaces the pinned DOM instance."""
         session = getattr(self, "_form_session", None)
         active = getattr(session, "active", None)
         if active is None or active.scope is not scope:
             return None
+        active_marker = self._form_session_marker(scope)
         candidates = []
+        editable_dialog_seen = False
         try:
-            for selector in (DIALOG,):
-                containers = self.page.locator(selector)
-                for index in range(containers.count()):
-                    candidate = containers.nth(index)
-                    controls = candidate.locator(EDITABLE_FORM_CONTROL)
-                    if (
-                        candidate.is_visible()
-                        and controls.count()
-                        and controls.first.is_visible()
-                    ):
-                        candidates.append(candidate)
+            containers = self.page.locator(DIALOG)
+            for index in range(containers.count()):
+                candidate = containers.nth(index)
+                controls = candidate.locator(EDITABLE_FORM_CONTROL)
+                if not (
+                    candidate.is_visible()
+                    and controls.count()
+                    and controls.first.is_visible()
+                ):
+                    continue
+                editable_dialog_seen = True
+                candidate_marker = self._form_session_marker(candidate)
+                if (
+                    active_marker
+                    and candidate_marker
+                    and candidate_marker == active_marker
+                ):
+                    continue
+                candidates.append(candidate)
         except Exception:
             return None
-        if not candidates:
+        if not candidates and not editable_dialog_seen:
             try:
                 containers = self.page.locator(".el-form:visible,form:visible")
                 for index in range(containers.count()):
@@ -5763,6 +6333,16 @@ class CommonFieldExecutor:
         print("COMMON_FORM_SESSION context_rebound=framework_rerender", flush=True)
         return rebound
 
+    @staticmethod
+    def _form_session_marker(scope) -> str:
+        getter = getattr(scope, "get_attribute", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter("data-ei-common-form-session") or "")
+        except Exception:
+            return ""
+
     def _source_identity_safe_for_dom(
         self, dom, source_code: str, source_label: str
     ) -> bool:
@@ -5776,8 +6356,9 @@ class CommonFieldExecutor:
         *,
         timeout_ms: int | None = None,
         stable_ms: int | None = None,
+        network_tracker: _BranchNetworkTracker | None = None,
     ):
-        """Wait for late-rendered dynamic controls before freezing a field snapshot."""
+        """Wait for fields, loading state, and tracked linkage requests to settle."""
         timeout_ms = timeout_ms or int(
             os.getenv("EI_COMMON_FIELD_STABLE_TIMEOUT_MS", "10000")
         )
@@ -5789,6 +6370,9 @@ class CommonFieldExecutor:
         last_signature = None
         latest = []
         while time.monotonic() < deadline:
+            active_scope = self._active_form_scope()
+            if active_scope is not None and active_scope is not scope:
+                scope = active_scope
             current = self._scan_fields(scope)
             signature = tuple(
                 sorted(
@@ -5803,7 +6387,10 @@ class CommonFieldExecutor:
                 )
             )
             now = time.monotonic()
-            if current and signature == last_signature:
+            render_busy = self._branch_render_busy(network_tracker, now)
+            if render_busy:
+                stable_since = None
+            elif current and signature == last_signature:
                 if stable_since is not None and now - stable_since >= stable_ms / 1000:
                     return current
             else:
@@ -5814,5 +6401,37 @@ class CommonFieldExecutor:
         observed = len(latest)
         raise AssertionError(
             f"新增表单字段集合在 {timeout_ms / 1000:g} 秒内未稳定；"
-            f"最后发现 {observed} 个控件"
+            f"最后发现 {observed} 个控件；"
+            f"pendingRequests={len(network_tracker.pending) if network_tracker else 0};"
+            f"loading={self._visible_branch_loading()}"
         )
+
+    def _branch_render_busy(
+        self,
+        tracker: _BranchNetworkTracker | None,
+        now: float,
+    ) -> bool:
+        if self._visible_branch_loading():
+            return True
+        if tracker is None:
+            return False
+        if tracker.pending:
+            return True
+        idle_ms = max(
+            0,
+            int(os.getenv("EI_COMMON_FIELD_BRANCH_NETWORK_IDLE_MS", "250")),
+        )
+        return now - tracker.last_activity < idle_ms / 1000
+
+    def _visible_branch_loading(self) -> bool:
+        try:
+            loading = self.page.locator(
+                ".el-loading-mask:visible,.ant-spin-spinning:visible,"
+                "[aria-busy='true']:visible,[data-loading='true']:visible"
+            )
+            for index in range(loading.count()):
+                if loading.nth(index).is_visible():
+                    return True
+        except Exception:
+            return False
+        return False

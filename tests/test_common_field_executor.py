@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 import ei_ui_smoke.common_field_executor as executor_module
@@ -22,6 +24,7 @@ from ei_ui_smoke.dom import DOM_FIELD_SCRIPT
 from ei_ui_smoke.interactions import FieldInteractor
 from ei_ui_smoke.models import DomField, FieldDefinition, ResolvedField
 from ei_ui_smoke.module_driver import FieldCompletionReport, ModuleSmokeResult
+from ei_ui_smoke.source_form import SourceBranchCandidate, SourceDetailEndpoint
 from tests.test_build_project_add_personalized import _field_label, _runtime_field
 from tests.test_common_field_validation import _skip_runtime_not_applicable
 
@@ -54,6 +57,301 @@ def test_common_field_executor_passes_automation_registry_to_driver(tmp_path):
     )
 
     assert executor.driver.automation_record_registry == registry
+
+
+def test_common_field_executor_passes_source_detail_endpoints_to_driver():
+    endpoint = SourceDetailEndpoint(
+        method="GET",
+        path_template="/ei-service/project/detail",
+        id_location="query",
+        id_query_key="id",
+        api_base_path="/ezgo",
+    )
+
+    executor = CommonFieldExecutor(
+        _Page(), _Strategy(), source_detail_endpoints=(endpoint,)
+    )
+
+    assert executor.driver.source_detail_endpoints == (endpoint,)
+
+
+def test_source_confirmed_branch_without_runtime_options_fails_without_probing_others():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "progressType", "eq", "APPROVED", "approvalDate", "visible"
+        ),
+    )
+    visited = []
+    executor._branch_option_labels = lambda field, _scope: (
+        visited.append(field.field_key) or []
+    )
+    fields = [
+        DiscoveredCommonField(
+            "progressType", "项目进度", "select", "select", "#progress",
+            FieldConstraints(),
+        ),
+        DiscoveredCommonField(
+            "unrelatedStatus", "普通状态", "select", "select", "#status",
+            FieldConstraints(),
+        ),
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match="源码确认的联动字段分支发现失败.*progressType",
+    ):
+        executor._discover_baseline_branch_fields(object(), fields, ())
+    assert visited == ["progressType"]
+
+
+def test_source_confirmed_branch_discovery_failure_is_not_silently_skipped():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "progressType", "eq", "APPROVED", "approvalDate", "visible"
+        ),
+    )
+    executor.page = _Page()
+    executor.page.keyboard = type(
+        "Keyboard", (), {"press": lambda _self, _key: None}
+    )()
+    executor._branch_option_labels = lambda _field, _scope: ["已取得批复"]
+    executor._select_branch_option = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("option panel detached")
+    )
+    field = DiscoveredCommonField(
+        "progressType", "项目进度", "select", "select", "#progress",
+        FieldConstraints(),
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="源码确认的联动字段分支发现失败.*option panel detached",
+    ):
+        executor._discover_baseline_branch_fields(object(), [field], ())
+
+
+def test_source_candidates_do_not_exclude_other_runtime_branch_drivers():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "progressType", "eq", "APPROVED", "approvalDate", "visible"
+        ),
+    )
+    executor.page = _Page()
+    executor.page.keyboard = type(
+        "Keyboard", (), {"press": lambda _self, _key: None}
+    )()
+    selections = {}
+    visited = []
+
+    def option_labels(field, _scope):
+        visited.append(field.field_key)
+        return {
+            "progressType": ["已取得批复"],
+            "runtimeStatus": ["普通", "需补充"],
+        }[field.field_key]
+
+    def select_option(field, _scope, option_label):
+        selections.clear()
+        selections[field.field_key] = option_label
+
+    def branch_fields(_scope, **_kwargs):
+        fields = [
+            DomField(
+                "progressType", "项目进度", "select", "#progress",
+            ),
+            DomField(
+                "runtimeStatus", "运行时状态", "select", "#runtime",
+            ),
+        ]
+        if selections.get("progressType") == "已取得批复":
+            fields.append(DomField("approvalDate", "批复日期", "date", "#date"))
+        if selections.get("runtimeStatus") == "需补充":
+            fields.append(DomField("runtimeNote", "补充说明", "text", "#note"))
+        return fields
+
+    executor._branch_option_labels = option_labels
+    executor._select_branch_option = select_option
+    executor._wait_for_fields_stable = branch_fields
+
+    fields = executor._discover_baseline_branch_fields(
+        object(),
+        [
+            DiscoveredCommonField(
+                "progressType", "项目进度", "select", "select", "#progress",
+                FieldConstraints(),
+            ),
+            DiscoveredCommonField(
+                "runtimeStatus", "运行时状态", "select", "select", "#runtime",
+                FieldConstraints(),
+            ),
+        ],
+        (),
+    )
+
+    assert visited == ["progressType", "runtimeStatus"]
+    assert (
+        "runtimeNote",
+        (("runtimeStatus", "需补充"),),
+    ) in {
+        (field.field_key, field.branch_conditions)
+        for field in fields
+    }
+
+
+def test_branch_discovery_probes_driver_revealed_only_by_parent_branch():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "investType", "eq", "NON_EQUITY", "tradeType", "visible"
+        ),
+        SourceBranchCandidate(
+            "tradeType", "eq", "CROSS_BORDER", "currency", "visible"
+        ),
+    )
+    executor.page = _Page()
+    executor.page.keyboard = type(
+        "Keyboard", (), {"press": lambda _self, _key: None}
+    )()
+    selected = {}
+
+    def apply_conditions(conditions, _scope):
+        selected.clear()
+        selected.update(dict(conditions))
+        return True
+
+    def select_option(field, _scope, option_label):
+        selected[field.field_key] = option_label
+        if field.field_key == "investType":
+            selected.pop("tradeType", None)
+
+    def rendered(_scope, **_kwargs):
+        fields = [DomField("investType", "投资类型", "select", "#invest")]
+        if selected.get("investType") == "非股权":
+            fields.append(DomField("tradeType", "交易类型", "select", "#trade"))
+        if selected.get("tradeType") == "跨境":
+            fields.append(DomField("currency", "币种", "select", "#currency"))
+        return fields
+
+    executor._apply_branch_conditions = apply_conditions
+    executor._active_form_scope = lambda: None
+    executor._branch_option_labels = lambda field, _scope: {
+        "investType": ["股权", "非股权"],
+        "tradeType": ["境内", "跨境"],
+    }[field.field_key]
+    executor._select_branch_option = select_option
+    executor._wait_for_fields_stable = rendered
+
+    fields = executor._discover_baseline_branch_fields(
+        object(),
+        [DiscoveredCommonField(
+            "investType", "投资类型", "select", "select", "#invest",
+            FieldConstraints(),
+        )],
+        (),
+    )
+
+    currency = next(field for field in fields if field.field_key == "currency")
+    assert currency.branch_conditions == (
+        ("investType", "非股权"),
+        ("tradeType", "跨境"),
+    )
+
+
+def test_missing_source_branch_driver_fails_instead_of_silent_omission():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "missingDriver", "runtime", "", "conditionalNote", "visible"
+        ),
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="源码确认的联动字段未在当前可编辑表单中找到.*missingDriver",
+    ):
+        executor._discover_baseline_branch_fields(object(), [], ())
+
+
+def test_unobserved_source_affected_field_fails_instead_of_silent_omission():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.source_branch_candidates = (
+        SourceBranchCandidate(
+            "progressType", "runtime", "", "approvalDate", "visible"
+        ),
+    )
+    executor.page = _Page()
+    executor.page.keyboard = type(
+        "Keyboard", (), {"press": lambda _self, _key: None}
+    )()
+    executor._branch_option_labels = lambda _field, _scope: ["未触发"]
+    executor._select_branch_option = lambda *_args: None
+    executor._wait_for_fields_stable = lambda _scope, **_kwargs: [
+        DomField("progressType", "项目进度", "select", "#progress")
+    ]
+    driver = DiscoveredCommonField(
+        "progressType", "项目进度", "select", "select", "#progress",
+        FieldConstraints(),
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="源码确认的联动字段未能覆盖声明的受影响控件.*approvalDate",
+    ):
+        executor._discover_baseline_branch_fields(object(), [driver], ())
+
+
+def test_branch_state_change_is_not_treated_as_unchanged_field():
+    baseline = DiscoveredCommonField(
+        "approvalDate", "批复日期", "date", "date", "#approval-date",
+        FieldConstraints(required=False),
+    )
+    required_branch = replace(
+        baseline, constraints=FieldConstraints(required=True)
+    )
+
+    assert CommonFieldExecutor._same_branch_field_state(baseline, baseline)
+    assert not CommonFieldExecutor._same_branch_field_state(
+        baseline, required_branch
+    )
+
+
+def test_branch_option_matching_is_exact_after_normalization():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    assert executor._matching_option_index(
+        ["股权类投资", "非股权类投资"], "非股权类投资"
+    ) == 1
+    assert executor._matching_option_index(
+        ["非股权类投资"], "股权类投资"
+    ) is None
+
+
+def test_source_confirmed_branch_driver_is_not_truncated_by_option_cap(
+    monkeypatch,
+):
+    monkeypatch.setenv("EI_COMMON_FIELD_BRANCH_MAX_OPTIONS", "2")
+    labels = [f"分支{i}" for i in range(10)]
+
+    assert CommonFieldExecutor._branch_options_to_probe(
+        "investType",
+        labels,
+        source_driver_codes={"investType"},
+    ) == labels
+
+
+def test_unconfirmed_large_select_is_not_misclassified_as_branch_driver(
+    monkeypatch, capsys,
+):
+    monkeypatch.setenv("EI_COMMON_FIELD_BRANCH_MAX_OPTIONS", "2")
+
+    assert CommonFieldExecutor._branch_options_to_probe(
+        "companyId",
+        ["企业一", "企业二", "企业三"],
+        source_driver_codes=set(),
+    ) == []
+    assert "reason=unconfirmed_driver_too_many_options" in capsys.readouterr().out
 
 
 def test_attachment_transaction_uploads_each_field_with_one_save(monkeypatch):
@@ -978,6 +1276,56 @@ def test_record_identity_candidates_prefer_real_identity_field():
     }) == [fields[0]]
 
 
+def test_unique_record_identity_never_rewrites_a_protected_target_field():
+    values = {
+        "matterName": "requested target value",
+        "title": "AUTO_support",
+    }
+    filled = []
+
+    class Locator:
+        def __init__(self, code):
+            self.code = code
+
+        def input_value(self):
+            return values[self.code]
+
+        def fill(self, value):
+            values[self.code] = value
+            filled.append(self.code)
+
+        def press(self, _key):
+            return None
+
+    class Interactor:
+        @staticmethod
+        def locate(resolved, root=None):
+            assert root is scope
+            return Locator(resolved.definition.field_code)
+
+    scope = object()
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.driver = type("Driver", (), {
+        "interactor": Interactor(),
+        "_is_record_identity_field": staticmethod(lambda _field: True),
+    })()
+    executor._scan_fields = lambda _scope: [
+        DomField("matterName", "事项名称", "text", "#matter"),
+        DomField("title", "标题", "text", "#title"),
+    ]
+    executor._record_identity_token = lambda _scope: "S001"
+
+    executor._ensure_unique_record_identity(
+        scope,
+        values,
+        protected_codes={"matterName"},
+    )
+
+    assert values["matterName"] == "requested target value"
+    assert values["title"] == "AUTO_support_S001"
+    assert filled == ["title"]
+
+
 def test_edit_value_rule_replaces_only_the_last_character_with_nine():
     case = BoundCommonCase(
         case_id="EDIT-002",
@@ -1687,6 +2035,7 @@ def test_choice_target_mutation_refills_other_required_dom_empty_fields():
     class Driver:
         def __init__(self):
             self.project_type_has_value = False
+            self.decision_has_value = False
             self.fill_calls = []
             self.upload_calls = []
 
@@ -1694,15 +2043,18 @@ def test_choice_target_mutation_refills_other_required_dom_empty_fields():
             if field.field_code == "projClassify":
                 return self.project_type_has_value
             if field.field_code == "isGmoDecision":
-                return False
+                return self.decision_has_value
             if field.field_code == "inveId":
                 return False
             return True
 
-        def _fill_dialog(self, only_codes=None):
-            self.fill_calls.append(set(only_codes or set()))
+        def _fill_dialog(self, only_codes=None, *, protected_codes=None):
+            self.fill_calls.append((
+                set(only_codes or set()), set(protected_codes or set())
+            ))
             self.project_type_has_value = True
-            return {"projClassify": "新建"}
+            self.decision_has_value = True
+            return {"projClassify": "新建", "isGmoDecision": "是"}
 
         def _upload_default_attachments(self, scope):
             self.upload_calls.append(scope)
@@ -1716,6 +2068,7 @@ def test_choice_target_mutation_refills_other_required_dom_empty_fields():
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = _Page()
     executor.driver = driver
+    executor._wait_for_fields_stable = lambda _scope, **_kwargs: []
     executor._scan_fields = lambda _scope: [
         DomField("projClassify", "项目类型", "select", "#project-type", required=True),
         DomField("isGmoDecision", "是否需总经办决策", "radio", "#decision", required=True),
@@ -1727,10 +2080,64 @@ def test_choice_target_mutation_refills_other_required_dom_empty_fields():
         scope, submitted, exclude_codes={"inveId"},
     )
 
-    assert driver.fill_calls == [{"projclassify"}]
+    assert driver.fill_calls == [
+        ({"projclassify", "isgmodecision"}, {"inveid"})
+    ]
     assert driver.upload_calls == [scope]
     assert submitted["projClassify"] == "新建"
     assert submitted["inveId"] == ""
+
+
+def test_choice_rerender_removes_hidden_old_branch_values_and_fills_new_branch():
+    class Driver:
+        _is_generated_identifier = staticmethod(
+            lambda code: not code or code.startswith("el-id-")
+        )
+
+        def __init__(self):
+            self.fill_calls = []
+
+        def _fill_dialog(self, only_codes=None, *, protected_codes=None):
+            self.fill_calls.append((only_codes, set(protected_codes or set())))
+            return {"newBranchRequired": "new value"}
+
+        @staticmethod
+        def _upload_default_attachments(_scope):
+            return 0
+
+        @staticmethod
+        def _prepare_implicit_required_nested_baselines(_scope):
+            return {}
+
+    driver = Driver()
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor.driver = driver
+    executor._wait_for_fields_stable = lambda _scope, **_kwargs: []
+    executor._scan_fields = lambda _scope: [
+        DomField("investType", "投资类型", "select", "#type", required=True),
+        DomField(
+            "newBranchRequired", "新分支必填", "text", "#new", required=True
+        ),
+    ]
+    executor._missing_required_dom_codes = lambda *_args, **_kwargs: set()
+    submitted = {
+        "investType": "non-equity",
+        "oldBranchAmount": "100",
+    }
+
+    executor._refill_required_baseline_after_target_mutation(
+        object(),
+        submitted,
+        exclude_codes={"investType"},
+        previously_active_codes={"investType", "oldBranchAmount"},
+    )
+
+    assert submitted == {
+        "investType": "non-equity",
+        "newBranchRequired": "new value",
+    }
+    assert driver.fill_calls == [(None, {"investtype"})]
 
 
 def test_command_required_baseline_refills_radio_when_submitted_value_is_stale():
@@ -2406,6 +2813,152 @@ def test_scan_fields_rebinds_only_to_a_unique_live_form_after_rerender(monkeypat
     assert executor.bound_scope is rebound
 
 
+def test_scan_fields_rebinds_when_old_scope_retains_partial_controls(monkeypatch):
+    class Controls:
+        def __init__(self, count):
+            self._count = count
+
+        def count(self):
+            return self._count
+
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Candidate:
+        def __init__(self, marker, control_count):
+            self.marker = marker
+            self.control_count = control_count
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def locator(self, _selector):
+            return Controls(self.control_count)
+
+        def get_attribute(self, name):
+            assert name == "data-ei-common-form-session"
+            return self.marker
+
+    stale = Candidate("old-session", 1)
+    replacement = Candidate("", 3)
+    rebound = object()
+
+    class Dialogs:
+        items = [stale, replacement]
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, index):
+            return self.items[index]
+
+    class Page:
+        url = "https://example.test/form"
+
+        @staticmethod
+        def locator(_selector):
+            return Dialogs()
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor.driver = type("Driver", (), {
+        "_runtime_identity_for_dom": staticmethod(
+            lambda dom, _index: (dom.field_code, dom.label, False)
+        ),
+    })()
+    executor._form_session = CommonFieldFormSession(executor)
+    executor._form_session.active = executor_module._ActiveCommonFieldForm(
+        stale, None, Page.url
+    )
+    executor._set_driver_form_scope = lambda scope: setattr(
+        executor, "bound_scope", scope
+    )
+    executor._pin_form_scope = lambda candidate: (
+        rebound if candidate is replacement else candidate
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "scan_dom_fields",
+        lambda _page, scope: (
+            [DomField("legacy", "旧残留", "text", "#legacy")]
+            if scope is stale
+            else [
+                DomField("assetYear", "年度", "year", "#year"),
+                DomField("assetName", "名称", "text", "#name"),
+            ]
+        ),
+    )
+
+    fields = executor._scan_fields(stale)
+
+    assert [field.field_code for field in fields] == ["assetYear", "assetName"]
+    assert executor._form_session.active.scope is rebound
+    assert executor.bound_scope is rebound
+
+
+def test_branch_stability_waits_for_loading_and_tracked_request_idle(
+    monkeypatch,
+):
+    clock = [0.0]
+    request = type("Request", (), {"resource_type": "xhr"})()
+
+    class Loading:
+        def count(self):
+            return int(clock[0] < 0.3)
+
+        def nth(self, _index):
+            return self
+
+        @staticmethod
+        def is_visible():
+            return True
+
+    class Page:
+        def __init__(self):
+            self.listeners = {}
+
+        @staticmethod
+        def locator(_selector):
+            return Loading()
+
+        def on(self, event, listener):
+            self.listeners[event] = listener
+
+        def remove_listener(self, event, listener):
+            assert self.listeners.pop(event) is listener
+
+        def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
+            if clock[0] >= 0.4 and id(request) in tracker.pending:
+                self.listeners["requestfinished"](request)
+
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = Page()
+    executor._scan_fields = lambda _scope: [
+        DomField("progressType", "项目进度", "select", "#progress")
+    ]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("EI_COMMON_FIELD_BRANCH_NETWORK_IDLE_MS", "200")
+    tracker = executor._start_branch_network_tracker()
+    assert tracker is not None
+    executor.page.listeners["request"](request)
+
+    fields = executor._wait_for_fields_stable(
+        object(), timeout_ms=2_000, stable_ms=200, network_tracker=tracker,
+    )
+    executor._stop_branch_network_tracker(tracker)
+
+    assert [field.field_code for field in fields] == ["progressType"]
+    assert clock[0] >= 0.8
+    assert executor.page.listeners == {}
+
+
 def test_hidden_pinned_form_cleanup_does_not_close_another_dialog():
     class HiddenScope:
         def count(self):
@@ -2850,25 +3403,10 @@ def test_current_field_uses_stable_prop_radio_group_when_scan_identity_mismatche
     assert field.kind == "radio"
 
 
-def test_current_field_rebinds_a_uniquely_matching_generated_id_suffix():
-    class Candidate:
-        def count(self):
-            return 1
-
-        @property
-        def first(self):
-            return self
-
-        def is_visible(self):
-            return True
-
-        def get_attribute(self, name):
-            return "el-id-9021-46" if name == "id" else None
-
+def test_current_field_rejects_generated_id_suffix_rebinding():
     class Scope:
         def locator(self, selector):
-            assert selector == 'input[id$="-46"]'
-            return Candidate()
+            raise AssertionError(f"generated suffix lookup is forbidden: {selector}")
 
     executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
     executor.page = _Page()
@@ -2880,11 +3418,40 @@ def test_current_field_rebinds_a_uniquely_matching_generated_id_suffix():
         "选择年份", "", "accepted", "", "P1",
     )
 
-    field = executor._current_field(case, Scope())
+    with pytest.raises(AssertionError, match="当前表单无法定位字段"):
+        executor._current_field(case, Scope())
 
-    assert field.field_key == "assetYear"
-    assert field.selector == "#el-id-9021-46"
-    assert field.kind == "year"
+
+def test_current_choice_field_rejects_generated_manifest_selector():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._scan_fields = lambda _scope=None: []
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._runtime_choice_field = lambda *_args: None
+    case = BoundCommonCase(
+        "ADD-053", "isDecision", "是否决策", "radio",
+        '[name="el-id-2915-53"]', "互斥选择", "", "accepted", "", "P1",
+    )
+
+    with pytest.raises(AssertionError, match="当前表单无法定位字段"):
+        executor._current_field(case, object())
+
+
+def test_current_field_rejects_duplicate_label_without_stable_business_code():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._scan_fields = lambda _scope=None: [
+        DomField("primaryName", "名称", "text", "#primary"),
+        DomField("secondaryName", "名称", "text", "#secondary"),
+    ]
+    case = BoundCommonCase(
+        "ADD-001", "name", "名称", "text", "#old-name",
+        "合法值", "AUTO_name", "accepted", "保存成功", "P0",
+    )
+
+    with pytest.raises(AssertionError, match="标签身份不唯一"):
+        executor._current_field(case, object())
 
 
 def test_wait_for_current_file_field_allows_late_edit_form_hydration():
@@ -3083,7 +3650,7 @@ def test_valid_baseline_includes_implicit_required_nested_rows():
             return report.ok
 
     executor.driver = Driver()
-    executor._ensure_unique_record_identity = lambda _scope, _submitted: None
+    executor._ensure_unique_record_identity = lambda _scope, _submitted, **_kwargs: None
 
     submitted = executor._fill_valid_baseline(object())
 
@@ -3093,6 +3660,125 @@ def test_valid_baseline_includes_implicit_required_nested_rows():
     }
     assert captured["submitted"] == submitted
     assert captured["fill_failed"] == []
+
+
+def test_branch_baseline_protects_driver_and_fills_late_required_field():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    apply_calls = []
+    retained_calls = []
+
+    class Driver:
+        _fill_failures = []
+
+        def __init__(self):
+            self.fill_calls = []
+
+        def _fill_dialog(self, only_codes=None, *, protected_codes=None):
+            self.fill_calls.append((
+                None if only_codes is None else set(only_codes),
+                set(protected_codes or set()),
+            ))
+            if only_codes is None:
+                return {"projObjectName": "AUTO_资源池企业"}
+            return {"nonEquityRequired": "合法值"}
+
+        @staticmethod
+        def _upload_default_attachments(_scope):
+            return 0
+
+        @staticmethod
+        def _prepare_implicit_required_nested_baselines(_scope):
+            return {}
+
+        def check_field_completion(self, _submitted, _fill_failed):
+            if len(self.fill_calls) == 1:
+                return FieldCompletionReport([], ["非股权必填项"], [])
+            return FieldCompletionReport([], [], [])
+
+        @staticmethod
+        def _field_report_ok(report):
+            return report.ok
+
+        @staticmethod
+        def _retry_field_codes(_submitted):
+            return {"nonequityrequired"}
+
+    driver = Driver()
+    executor.driver = driver
+    executor._apply_branch_conditions = lambda conditions, _scope: (
+        apply_calls.append(tuple(conditions)) or True
+    )
+    executor._wait_for_fields_stable = lambda _scope, **_kwargs: []
+    executor._assert_branch_conditions_retained = lambda conditions, _scope: (
+        retained_calls.append(tuple(conditions))
+    )
+    executor._ensure_unique_record_identity = lambda _scope, _submitted, **_kwargs: None
+
+    submitted = executor._fill_valid_baseline(
+        object(),
+        branch_conditions=(("inveProjType", "非股权类投资"),),
+    )
+
+    assert driver.fill_calls == [
+        (None, {"inveprojtype"}),
+        ({"nonequityrequired"}, {"inveprojtype"}),
+    ]
+    assert submitted == {
+        "projObjectName": "AUTO_资源池企业",
+        "nonEquityRequired": "合法值",
+        "inveProjType": "非股权类投资",
+    }
+    assert apply_calls == [
+        (("inveProjType", "非股权类投资"),),
+        (("inveProjType", "非股权类投资"),),
+    ]
+    assert len(retained_calls) == 4
+
+
+def test_branch_preflight_reports_missing_field_before_save_click():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = _Page()
+    executor.driver = type("Driver", (), {
+        "_field_display": staticmethod(
+            lambda code, label: f"{label} ({code})"
+        ),
+        "_assert_configured_dynamic_collection_controls": staticmethod(
+            lambda _scope: None
+        ),
+    })()
+    executor._wait_for_fields_stable = lambda _scope, **_kwargs: []
+    executor._assert_branch_conditions_retained = lambda *_args: None
+    executor._missing_required_dom_codes = lambda *_args, **_kwargs: {
+        "nonequityrequired"
+    }
+    executor._scan_fields = lambda _scope: [
+        DomField(
+            "nonEquityRequired", "非股权必填项", "text", "#required",
+            required=True,
+        )
+    ]
+    case = BoundCommonCase(
+        "ADD-013", "summary", "摘要", "text", "#summary",
+        "中英文及常用标点", "合法值", "accepted", "保存成功", "P0",
+        branch_conditions=(("inveProjType", "非股权类投资"),),
+    )
+
+    with pytest.raises(AssertionError, match=(
+        r"分支基线未完成.*非股权必填项 \(nonEquityRequired\)"
+    )):
+        executor._submit_case(
+            case,
+            object(),
+            DiscoveredCommonField(
+                "summary", "摘要", "text", "text", "#summary",
+                FieldConstraints(),
+            ),
+            {"summary": "合法值"},
+            "合法值",
+            "合法值",
+            "",
+        )
 
 
 def test_valid_baseline_without_optional_upload_still_uploads_required_files():
@@ -3148,7 +3834,7 @@ def test_valid_baseline_without_optional_upload_still_uploads_required_files():
     executor._upload_required_attachment = lambda _scope, field: uploaded.append(
         field.field_key
     )
-    executor._ensure_unique_record_identity = lambda _scope, _submitted: None
+    executor._ensure_unique_record_identity = lambda _scope, _submitted, **_kwargs: None
 
     submitted = executor._fill_valid_baseline(
         object(), upload_attachments=False
@@ -4431,6 +5117,7 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
         def __init__(self, page):
             self.save = SaveButton(page)
             self.repair_messages = []
+            self.repair_protected_codes = []
 
         def _save_button(self, _scope):
             return self.save
@@ -4461,6 +5148,7 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
             assert allow_unique_repair is True
             assert retryable_unique_codes == {"buildPeriodMonth"}
             self.repair_messages.append((message, submitted["matterName"], attempt))
+            self.repair_protected_codes.append(set(protected_codes or set()))
             submitted["matterName"] = "AUTO_项目决策_S002"
             return {"matterName": "AUTO_项目决策_S002"}
 
@@ -4470,6 +5158,9 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
     executor.page = page
     executor.driver = driver
     executor._visible_error_text = lambda _scope, _field: ""
+    executor._preflight_branch_baseline = (
+        lambda _case, scope, _submitted, **_kwargs: scope
+    )
     verify_calls = []
     executor._verify_saved_record = lambda *args, **kwargs: verify_calls.append(
         (args, kwargs)
@@ -4488,8 +5179,13 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
         expected_type="accepted",
         expected_value="保存成功",
         priority="P1",
+        branch_conditions=(("inveProjType", "非股权类投资"),),
     )
-    submitted = {"matterName": "AUTO_项目决策_S001", "buildPeriodMonth": "123"}
+    submitted = {
+        "matterName": "AUTO_项目决策_S001",
+        "buildPeriodMonth": "123",
+        "inveProjType": "非股权类投资",
+    }
     monkeypatch.setenv("EI_COMMON_FORM_CLOSE_TIMEOUT_MS", "0")
 
     result = executor._submit_case(
@@ -4507,6 +5203,9 @@ def test_submit_case_repairs_business_duplicate_and_retries(monkeypatch):
     assert submitted["matterName"] == "AUTO_项目决策_S002"
     assert driver.repair_messages == [
         ("事项名称已存在，请修改后再保存", "AUTO_项目决策_S001", 1)
+    ]
+    assert driver.repair_protected_codes == [
+        {"buildPeriodMonth", "inveProjType"}
     ]
     assert len(verify_calls) == 1
 

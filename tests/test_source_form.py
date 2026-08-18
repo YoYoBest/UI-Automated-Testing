@@ -1,4 +1,11 @@
-from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.source_form import (
+    SourceBranchCandidate,
+    SourceDetailEndpoint,
+    discover_custom_form_fields,
+    discover_form_branch_candidates,
+    discover_form_contract,
+    discover_form_detail_endpoint,
+)
 
 
 def test_follows_dialog_component_and_extracts_interactive_fields(tmp_path):
@@ -282,3 +289,326 @@ def test_does_not_guess_between_multiple_field_bearing_dialog_components(tmp_pat
         ''', encoding="utf-8")
 
     assert discover_custom_form_fields(tmp_path, "ambiguous/index") == []
+
+
+def test_discovers_direct_visible_and_required_branch_conditions(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "investment"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="tradeType"
+        v-if="formData.investType === 'NON_EQUITY'" label="交易类型">
+        <el-form-item prop="tradeType"><el-select /></el-form-item>
+      </PurvarCol>
+      <PurvarCol field-code="currency"
+        v-show='"FOREIGN" !== model.investScope' label="币种">
+        <el-form-item prop="currency"
+          :required="dialogForm.tradeType == 'CROSS_BORDER'">
+          <el-select />
+        </el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+
+    assert discover_form_branch_candidates(tmp_path, "investment/index") == [
+        SourceBranchCandidate(
+            driver_field="investType",
+            operator="eq",
+            value="NON_EQUITY",
+            affected_field="tradeType",
+            effect="visible",
+        ),
+        SourceBranchCandidate(
+            driver_field="investScope",
+            operator="neq",
+            value="FOREIGN",
+            affected_field="currency",
+            effect="visible",
+        ),
+        SourceBranchCandidate(
+            driver_field="tradeType",
+            operator="eq",
+            value="CROSS_BORDER",
+            affected_field="currency",
+            effect="required",
+        ),
+    ]
+
+
+def test_branch_discovery_retains_runtime_hints_for_complex_conditions(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "investment"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="combined"
+        v-if="formData.kind === 'A' && formData.region === 'CN'" label="组合条件">
+        <el-form-item prop="combined"><el-input /></el-form-item>
+      </PurvarCol>
+      <PurvarCol field-code="computed" v-show="showComputed(formData.kind)" label="计算条件">
+        <el-form-item prop="computed" :required="requiredFlag"><el-input /></el-form-item>
+      </PurvarCol>
+      <PurvarCol field-code="dynamic" v-if="formData.kind === option.value" label="动态值">
+        <el-form-item prop="dynamic"><el-input /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+
+    assert discover_form_branch_candidates(tmp_path, "investment/index") == [
+        SourceBranchCandidate("kind", "runtime", "", "combined", "visible"),
+        SourceBranchCandidate("region", "runtime", "", "combined", "visible"),
+        SourceBranchCandidate("kind", "runtime", "", "computed", "visible"),
+        SourceBranchCandidate("kind", "runtime", "", "dynamic", "visible"),
+    ]
+
+
+def test_branch_candidates_are_deduplicated_in_source_order(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "investment"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="first" v-if="form.kind === 'A'" label="第一字段">
+        <el-form-item prop="first" v-show="form.kind === 'A'"><el-input /></el-form-item>
+      </PurvarCol>
+      <el-form-item prop="second" label="第二字段" v-if="form.kind !== 'B'">
+        <el-input v-model="form.second" />
+      </el-form-item>
+    ''', encoding="utf-8")
+
+    assert discover_form_branch_candidates(tmp_path, "investment/index") == [
+        SourceBranchCandidate("kind", "eq", "A", "first", "visible"),
+        SourceBranchCandidate("kind", "neq", "B", "second", "visible"),
+    ]
+
+
+def test_branch_discovery_rejects_dynamic_identity_and_uses_primary_v_model(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "investment"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol :field-code="field.fieldCode"
+        v-if="form.kind === 'DYNAMIC'" label="动态字段">
+        <el-form-item :prop="field.fieldCode">
+          <el-input v-model:ent-id="form.companyId" />
+        </el-form-item>
+      </PurvarCol>
+      <el-form-item label="备注" v-if="form.kind === 'NOTE'">
+        <el-input v-model:ent-id="form.companyId" v-model="form.note" />
+      </el-form-item>
+    ''', encoding="utf-8")
+
+    assert discover_form_branch_candidates(tmp_path, "investment/index") == [
+        SourceBranchCandidate("kind", "eq", "NOTE", "note", "visible"),
+    ]
+
+
+def test_branch_discovery_uses_the_explicit_add_dialog_and_preserves_legacy_fields(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "resource"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <script setup>
+      const openAddDialog = () => {
+        dialogProps.value = { componentPath: "resource/AddForm" };
+      };
+      const openEditDialog = () => {
+        dialogProps.value = { componentPath: "resource/EditForm" };
+      };
+      </script>
+    ''', encoding="utf-8")
+    (views / "AddForm.vue").write_text('''
+      <PurvarCol field-code="companyName"
+        v-if="formData.investType === 'EQUITY'" label="公司全称">
+        <el-form-item prop="companyName"><QccSelect /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+    (views / "EditForm.vue").write_text('''
+      <PurvarCol field-code="wrongField"
+        v-if="formData.investType === 'OTHER'" label="错误字段">
+        <el-form-item prop="wrongField"><el-input /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+
+    assert discover_custom_form_fields(tmp_path, "resource/index") == [
+        ("companyName", "公司全称", True),
+    ]
+    assert discover_form_branch_candidates(tmp_path, "resource/index") == [
+        SourceBranchCandidate(
+            "investType", "eq", "EQUITY", "companyName", "visible",
+        ),
+    ]
+
+
+def test_discovers_imported_resource_pool_query_detail_endpoint(tmp_path):
+    view_root = tmp_path / "ei-view" / "src"
+    views = view_root / "views" / "projectResourcePool"
+    api = view_root / "api"
+    views.mkdir(parents=True)
+    api.mkdir(parents=True)
+    (tmp_path / "ei-view" / ".env").write_text(
+        "VITE_APP_BASE_API=/ezgo\n", encoding="utf-8",
+    )
+    (views / "index.vue").write_text('''
+      <script setup>
+      const openAddDialog = () => {
+        dialogProps.value = { localComponent: "Modify" };
+      };
+      const openStoreDialog = () => {
+        dialogProps.value = { localComponent: "putStore" };
+      };
+      </script>
+    ''', encoding="utf-8")
+    (views / "Modify.vue").write_text('''
+      <template>
+        <PurvarCol field-code="projObjectName" label="企业全称">
+          <el-form-item prop="projObjectName"><el-input /></el-form-item>
+        </PurvarCol>
+      </template>
+      <script setup lang="ts">
+      import ProjectAPI from "@/api/project";
+      const loadRecord = (id: string) => ProjectAPI.projStorageDetail(id);
+      const saveRecord = (data: object) => ProjectAPI.projStorageAdd(data);
+      </script>
+    ''', encoding="utf-8")
+    (views / "putStore.vue").write_text('''
+      <PurvarCol field-code="storeReason" label="入库原因">
+        <el-form-item prop="storeReason"><el-input /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+    (api / "project.ts").write_text('''
+      const ProjectAPI = {
+        projStorageAdd: (data: object) => request({
+          url: "/ei-service/projStorage/add",
+          method: "post",
+          data,
+        }),
+        projStorageDetail: (id: string, projId?: string) => request({
+          url: "/ei-service/projStorage/detail",
+          method: "get",
+          params: { id, ...(projId ? { projId } : {}) },
+        }),
+      };
+      export default ProjectAPI;
+    ''', encoding="utf-8")
+
+    endpoint = SourceDetailEndpoint(
+        method="GET",
+        path_template="/ei-service/projStorage/detail",
+        id_location="query",
+        id_query_key="id",
+        api_base_path="/ezgo",
+    )
+    contract = discover_form_contract(tmp_path, "projectResourcePool/index")
+
+    assert contract.fields == (("projObjectName", "企业全称", False),)
+    assert contract.branch_candidates == ()
+    assert contract.detail_endpoints == (endpoint,)
+    assert discover_form_detail_endpoint(
+        tmp_path, "projectResourcePool/index",
+    ) == endpoint
+
+
+def test_discovers_local_static_query_detail_endpoint(tmp_path):
+    views = tmp_path / "fi-view" / "src" / "views" / "risk"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <template>
+        <PurvarCol field-code="riskName" label="风险名称">
+          <el-form-item prop="riskName"><el-input /></el-form-item>
+        </PurvarCol>
+      </template>
+      <script setup>
+      const createRisk = (data) => request({
+        url: "/fi-service/risk/add", method: "post", data,
+      });
+      const readRisk = (recordId) => request({
+        url: "/fi-service/risk/detail",
+        method: "get",
+        params: { id: recordId },
+      });
+      const save = (data) => createRisk(data);
+      const load = (id) => readRisk(id);
+      </script>
+    ''', encoding="utf-8")
+
+    assert discover_form_detail_endpoint(tmp_path, "risk/index") == SourceDetailEndpoint(
+        method="GET",
+        path_template="/fi-service/risk/detail",
+        id_location="query",
+        id_query_key="id",
+    )
+
+
+def test_discovers_static_path_id_detail_endpoint(tmp_path):
+    views = tmp_path / "fi-view" / "src" / "views" / "decision"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="matterName" label="事项名称">
+        <el-form-item prop="matterName"><el-input /></el-form-item>
+      </PurvarCol>
+      <script setup>
+      const createDecision = (data) => request({
+        url: "/fi-service/decision/create", method: "post", data,
+      });
+      const readDecision = (decisionId) => request({
+        url: `/fi-service/decision/detail/${decisionId}`,
+        method: "get",
+      });
+      createDecision(formData);
+      readDecision(props.id);
+      </script>
+    ''', encoding="utf-8")
+
+    assert discover_form_detail_endpoint(
+        tmp_path, "decision/index",
+    ) == SourceDetailEndpoint(
+        method="GET",
+        path_template="/fi-service/decision/detail/{business_id}",
+        id_location="path",
+    )
+
+
+def test_detail_endpoint_discovery_rejects_ambiguous_detail_contracts(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "ambiguousApi"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="recordName" label="名称">
+        <el-form-item prop="recordName"><el-input /></el-form-item>
+      </PurvarCol>
+      <script setup>
+      const createRecord = (data) => request({
+        url: "/ei-service/record/add", method: "post", data,
+      });
+      const readDetail = (id) => request({
+        url: "/ei-service/record/detail", method: "get", params: { id },
+      });
+      const readById = (businessId) => request({
+        url: "/ei-service/record/getById",
+        method: "get",
+        params: { businessId },
+      });
+      createRecord(formData);
+      readDetail(props.id);
+      readById(props.id);
+      </script>
+    ''', encoding="utf-8")
+
+    assert discover_form_detail_endpoint(tmp_path, "ambiguousApi/index") is None
+
+
+def test_detail_endpoint_discovery_rejects_dynamic_or_unrelated_endpoints(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "unsafeApi"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <PurvarCol field-code="recordName" label="名称">
+        <el-form-item prop="recordName"><el-input /></el-form-item>
+      </PurvarCol>
+      <script setup>
+      const createRecord = (data) => request({
+        url: "/ei-service/record/add", method: "post", data,
+      });
+      const dynamicDetail = (id) => request({
+        url: detailBase + "/detail", method: "get", params: { id },
+      });
+      const unrelatedDetail = (id) => request({
+        url: "/ei-service/other/detail", method: "get", params: { id },
+      });
+      createRecord(formData);
+      dynamicDetail(props.id);
+      unrelatedDetail(props.id);
+      </script>
+    ''', encoding="utf-8")
+
+    assert discover_form_detail_endpoint(tmp_path, "unsafeApi/index") is None
