@@ -341,6 +341,79 @@ def test_runtime_menu_does_not_guess_an_ambiguous_route_alias(tmp_path):
     assert not [item for item in items if item.operation]
 
 
+def test_runtime_menu_appends_father_id_detail_tree_to_unique_source_owner(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "projectManage"
+    (views / "before" / "baseInfo" / "base").mkdir(parents=True)
+    (views / "index.vue").write_text("", encoding="utf-8")
+    (views / "before" / "baseInfo" / "base" / "index.vue").write_text(
+        'const FORM_CODE = "PROJECT_BASE"', encoding="utf-8"
+    )
+    payload = {
+        "data": {"funcPerm": [{
+            "funcCode": "PROJECT_MANAGE",
+            "path": "/projectManage",
+            "component": "projectManage/index",
+            "meta": {"title": "对外投资项目"},
+            "children": [],
+        }]},
+        "_detailFatherTrees": [{
+            "fatherId": "30021",
+            "sourceComponent": "projectManage/before/detail",
+            "nodes": [{
+                "funcCode": "BEFORE",
+                "meta": {"title": "投前管理"},
+                "children": [{
+                    "funcCode": "BASE",
+                    "component": "projectManage/before/baseInfo/base/index",
+                    "meta": {"title": "基本信息"},
+                    "children": [],
+                }],
+            }],
+        }],
+    }
+
+    items = modules_from_menu(payload, tmp_path)
+    parent = next(item for item in items if item.id == "detail:father:30021:BEFORE")
+    detail = next(item for item in items if item.id == "detail:father:30021:BASE")
+
+    assert parent.path == ("对外投资项目", "详情", "投前管理")
+    assert detail.path == ("对外投资项目", "详情", "投前管理", "基本信息")
+    assert detail.route == "/projectManage/detail"
+    assert detail.form_code == "PROJECT_BASE"
+    assert parent.requires_business_id and detail.requires_business_id
+
+
+def test_runtime_menu_does_not_attach_father_tree_when_owner_is_ambiguous(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "projectManage"
+    views.mkdir(parents=True)
+    (views / "index.vue").write_text("", encoding="utf-8")
+    payload = {
+        "data": {"funcPerm": [{
+            "funcCode": "PROJECT_A",
+            "path": "/project-a",
+            "component": "projectManage/index",
+            "meta": {"title": "项目 A"},
+            "children": [],
+        }, {
+            "funcCode": "PROJECT_B",
+            "path": "/project-b",
+            "component": "projectManage/index",
+            "meta": {"title": "项目 B"},
+            "children": [],
+        }]},
+        "_detailFatherTrees": [{
+            "fatherId": "30021",
+            "sourceComponent": "projectManage/before/detail",
+            "nodes": [{"funcCode": "BASE", "meta": {"title": "基本信息"}}],
+        }],
+    }
+
+    assert not [
+        item for item in modules_from_menu(payload, tmp_path)
+        if item.id.startswith("detail:father:30021:")
+    ]
+
+
 def test_runtime_menu_appends_nested_detail_modules(tmp_path):
     (tmp_path / "ei-view" / "src" / "views").mkdir(parents=True)
     payload = {

@@ -48,7 +48,7 @@ probe 模式不读取页面专属业务值，但仍必须遵守公共合法规�
 ## 生成规则
 
 - 根据字段语义生成手机号、统一社会信用代码、金额、企业名称等值，而不是对所有文本框使用同一种字符串。
-- 自由文本和企业名称生成值必须遵守字段 `maxlength`；超长时保留确定性头部与唯一尾部。手机号、邮箱、统一社会信用代码、日期和业务标识等结构化字符串不得直接切片，以免长度合规却破坏格式语义。
+- 自由文本和企业名称生成值必须遵守字段 `maxlength`；超长时保留确定性头部与唯一尾部。`probe` 只验证可保存闭环，不执行长度边界测试：把完整批次/动作运行标识压缩为“时间片 + 确定性摘要”，并将普通文本、文本域和企业名称限制在不超过 40 字符的保守生成范围，同时保持不同动作值唯一。`standard` 保留原始运行标识和显式边界用例输入。手机号、邮箱、统一社会信用代码、日期和业务标识等结构化字符串不得直接切片，以免长度合规却破坏格式语义。
 - 手机号使用合法号段；信用代码生成校验位；金额限制在配置区间。
 - 同一 `run_id` 和字段输入应产生可复现结果，便于定位失败。
 - 唯一名称附带运行标识，避免与历史记录冲突并便于列表回查。
@@ -91,6 +91,7 @@ probe 模式不读取页面专属业务值，但仍必须遵守公共合法规�
 
 ## Independent Action Data Scope
 
+- Every concrete data strategy exposes its canonical `data_mode` (`probe`, `stable`, or `standard`) so downstream diagnostics can describe the active contract without inferring it from class inheritance. A persistence-length failure is reported as a probe save-precheck for smoke runs and as the current standard-automation case failure for standard runs; neither path truncates or repairs an explicit over-limit test input.
 - A launcher target sequence distinguishes subprocesses but not parametrized actions executed inside one pytest process. The module-action runner must provide a stable, non-secret per-action scope derived from its logical module/action path, and `create_data_strategy()` must append it to the generated run ID after `EI_AUTOMATION_RUN_ID` and `EI_AUTOMATION_TARGET_SEQUENCE`.
 - Generated fallback text and enterprise names must therefore differ for independently scheduled outer-form lifecycles in one action batch, while the same logical action remains reproducible across retries.
 - `POOL_RESOURCE` supports `probe` and `standard`. Do not reject the entire form in `create_data_strategy()` based on mode: the declared `projObjectName` unique constraint is applied only by the physical outer Add lifecycle, where it captures the authenticated resource-pool list, preallocates an unused value, and retries only that field after the declared duplicate response. Its list payload uses `enterpriseOrProjectName` for this field, so retain it alongside `projObjectName` and `name` in the declared aliases. `stable` cannot validate a complete resource-pool Add; the launcher must warn before scheduling any target that requires an outer Add lifecycle.

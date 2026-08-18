@@ -228,6 +228,9 @@ class ModuleSmokeDriver:
         "/add", "/save", "/create", "/insert", "/submit", "/commit",
         "/update", "/edit", "/modify",
     )
+    DETAIL_READ_URL_TOKENS = (
+        "/detail", "detail/", "getdetail", "getbyid", "querybyid", "/info",
+    )
     OPTIONAL_RELATIONSHIP_FIELDS = {"parentid", "relationid"}
     RECORD_IDENTITY_CODES = {
         "regname", "fundname", "name", "title", "projname", "projectname",
@@ -272,6 +275,7 @@ class ModuleSmokeDriver:
         self._unique_list_listener = None
         self._unique_occupied_snapshot: dict[tuple[Any, ...], list[Any]] = {}
         self._pending_unique_reservations: list[tuple[Any, tuple[Any, ...], str]] = []
+        self._form_open_response_capture: dict[str, Any] | None = None
         self.automation_record_registry = automation_record_registry
 
     def prepare_unique_constraint_evidence(self) -> None:
@@ -339,6 +343,7 @@ class ModuleSmokeDriver:
         old_page = getattr(self, "page", None)
         if page is old_page:
             return
+        self._stop_form_open_response_capture()
         self.release_pending_unique_reservations()
         self._stop_unique_list_capture(page=old_page)
         self._unique_list_responses = []
@@ -839,7 +844,7 @@ class ModuleSmokeDriver:
             return False
         if edit is None:
             return False
-        edit.click()
+        self._click_edit_form_entry(edit)
         wait_for_timeout = getattr(self.page, "wait_for_timeout", None)
         if callable(wait_for_timeout):
             wait_for_timeout(1_500)
@@ -1086,7 +1091,7 @@ class ModuleSmokeDriver:
         if direct_edit_opened:
             pass
         elif detail_edit is not None:
-            detail_edit.click()
+            self._click_edit_form_entry(detail_edit)
             self.page.wait_for_timeout(1_500)
         elif verified_detail_row_marker:
             self._return_to_record_list(list_url)
@@ -3569,6 +3574,164 @@ class ModuleSmokeDriver:
             name_candidates = full_name_candidates
         return name_candidates if len(name_candidates) == 1 else []
 
+    def _click_edit_form_entry(self, action) -> None:
+        """Capture edit-form hydration traffic before the UI command can emit it."""
+        self._start_form_open_response_capture()
+        try:
+            action.click()
+        except Exception:
+            self._stop_form_open_response_capture()
+            raise
+
+    def _start_form_open_response_capture(self) -> None:
+        self._stop_form_open_response_capture()
+        page = getattr(self, "page", None)
+        register = getattr(page, "on", None)
+        if not callable(register):
+            return
+        responses: list[Any] = []
+
+        def response_received(response) -> None:
+            responses.append(response)
+
+        try:
+            register("response", response_received)
+        except Exception:
+            return
+        self._form_open_response_capture = {
+            "page": page,
+            "listener": response_received,
+            "responses": responses,
+            "inspected": 0,
+        }
+
+    def _stop_form_open_response_capture(self) -> None:
+        capture = getattr(self, "_form_open_response_capture", None)
+        self._form_open_response_capture = None
+        if not capture:
+            return
+        remove_listener = getattr(capture.get("page"), "remove_listener", None)
+        if callable(remove_listener):
+            try:
+                remove_listener("response", capture.get("listener"))
+            except Exception:
+                pass
+
+    def _raise_captured_detail_open_failure(self) -> None:
+        capture = getattr(self, "_form_open_response_capture", None)
+        if not capture:
+            return
+        responses = capture.get("responses", [])
+        start = int(capture.get("inspected", 0))
+        capture["inspected"] = len(responses)
+        for response in responses[start:]:
+            diagnostic = self._detail_open_failure_diagnostic(response)
+            if not diagnostic:
+                continue
+            self._stop_form_open_response_capture()
+            raise AssertionError(
+                "打开编辑表单时详情接口失败：" + diagnostic
+            )
+
+    @classmethod
+    def _detail_open_failure_diagnostic(cls, response) -> str:
+        request = getattr(response, "request", None)
+        resource_type = str(
+            getattr(request, "resource_type", "xhr") or "xhr"
+        ).lower()
+        if resource_type not in {"xhr", "fetch"}:
+            return ""
+        path = urlsplit(str(getattr(response, "url", "") or "")).path or "/"
+        normalized_path = path.lower()
+        if not any(token in normalized_path for token in cls.DETAIL_READ_URL_TOKENS):
+            return ""
+
+        status = int(getattr(response, "status", 0) or 0)
+        http_failed = getattr(response, "ok", None) is False or status >= 400
+        payload = None
+        try:
+            payload = response.json()
+        except Exception:
+            pass
+        business_failed = cls._business_payload_failed(payload)
+        if not http_failed and not business_failed:
+            return ""
+
+        method = str(getattr(request, "method", "GET") or "GET").upper()
+        summary = cls._safe_failure_response_summary(response, payload=payload)
+        return (
+            f"method={method}; path={path}; status={status or 'unknown'}; "
+            f"response={summary}"
+        )
+
+    @staticmethod
+    def _business_payload_failed(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        code = payload.get("code", payload.get("status"))
+        success = payload.get("success")
+        errors = payload.get("errors")
+        has_errors = isinstance(errors, (list, dict)) and bool(errors)
+        return bool(
+            success is False
+            or has_errors
+            or (
+                code is not None
+                and str(code).lower() not in {"0", "1", "200", "success", "true"}
+            )
+        )
+
+    @classmethod
+    def _safe_failure_response_summary(
+        cls, response, *, payload: Any = None, maximum: int = 500,
+    ) -> str:
+        """Return only bounded error-envelope scalars, never response data records."""
+        if payload is None:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            content_type = str(
+                getattr(response, "headers", {}).get("content-type", "unknown")
+            ).split(";", 1)[0]
+            return f"<non-json body omitted; content-type={content_type}>"
+
+        summary: dict[str, Any] = {}
+        for key in (
+            "code", "status", "success", "message", "msg", "error",
+            "errorMessage", "error_message", "errors",
+        ):
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, (dict, list)):
+                summary[key] = f"{type(value).__name__}[{len(value)}]"
+            elif value is None or isinstance(value, (str, int, float, bool)):
+                summary[key] = cls._sanitize_diagnostic_scalar(value)
+        if not summary:
+            return "<error envelope fields unavailable>"
+        return json.dumps(
+            summary, ensure_ascii=False, separators=(",", ":")
+        )[:maximum]
+
+    @staticmethod
+    def _sanitize_diagnostic_scalar(value: Any, maximum: int = 300) -> str:
+        text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+        text = re.sub(
+            r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+",
+            r"\1 <redacted>",
+            text,
+        )
+        text = re.sub(
+            r"(?i)\b(authorization|cookie|set-cookie|password|passwd|"
+            r"access[_-]?token|refresh[_-]?token|token|secret|credential)\b"
+            r"\s*[:=]\s*[^\s,;]+",
+            r"\1=<redacted>",
+            text,
+        )
+        return re.sub(r"\s+", " ", text).strip()[:maximum]
+
     def _wait_for_form_scope(self, timeout: int = 15_000):
         """Return only the new form instance that exposes editable controls."""
         deadline = time.monotonic() + timeout / 1000
@@ -3614,7 +3777,9 @@ class ModuleSmokeDriver:
             except Exception:
                 pass
 
+            self._raise_captured_detail_open_failure()
             if time.monotonic() >= deadline or not hasattr(self.page, "wait_for_timeout"):
+                self._stop_form_open_response_capture()
                 if saw_dialog:
                     raise AssertionError(
                         f"新增弹窗已出现，但在 {timeout // 1000} 秒内未出现可编辑控件"
@@ -3641,6 +3806,7 @@ class ModuleSmokeDriver:
                         pinned_controls = pinned.locator(EDITABLE_FORM_CONTROL)
                         if pinned_controls.count() and pinned_controls.first.is_visible():
                             return pinned
+                self._raise_captured_detail_open_failure()
                 if time.monotonic() >= deadline or not hasattr(self.page, "wait_for_timeout"):
                     return initial
                 self.page.wait_for_timeout(200)
@@ -3679,7 +3845,9 @@ class ModuleSmokeDriver:
         return add
 
     def _wait_for_form_ready(self, scope, timeout: int = 15_000) -> None:
+        self._raise_captured_detail_open_failure()
         if hasattr(scope, "is_visible") and not scope.is_visible():
+            self._stop_form_open_response_capture()
             raise AssertionError("新增表单在出现可编辑控件前已关闭或被替换")
         loading = scope.locator(
             ".el-loading-mask:visible,.ant-spin-spinning:visible,"
@@ -3691,11 +3859,14 @@ class ModuleSmokeDriver:
             controls = scope.locator(EDITABLE_FORM_CONTROL).first
             controls.wait_for(state="visible", timeout=timeout)
         except Exception as exc:
+            self._raise_captured_detail_open_failure()
+            self._stop_form_open_response_capture()
             if hasattr(scope, "is_visible") and not scope.is_visible():
                 raise AssertionError("新增表单在出现可编辑控件前已关闭或被替换") from exc
             raise AssertionError(
                 f"新增表单已打开，但表单控件在 {timeout // 1000} 秒内未加载完成"
             ) from exc
+        self._stop_form_open_response_capture()
 
     def _save_button(self, scope, operation: str = ""):
         if operation:
@@ -6054,7 +6225,10 @@ class ModuleSmokeDriver:
             for role in ("button", "link"):
                 action = container.get_by_role(role, name=action_name, exact=True).first
                 if action.count() and action.is_visible() and action.is_enabled():
-                    action.click()
+                    if any(token in action_name for token in ("编辑", "修改")):
+                        self._click_edit_form_entry(action)
+                    else:
+                        action.click()
                     self.page.wait_for_timeout(1_500)
                     return
 
@@ -8059,6 +8233,12 @@ class ModuleSmokeDriver:
         self, submitted: dict[str, Any],
     ) -> list[str]:
         """Reject dynamic child values that exceed a confirmed persistence limit."""
+        strategy = getattr(self, "data_strategy", None)
+        mode = str(getattr(strategy, "data_mode", "generic")).lower()
+        context = {
+            "probe": "快速探测保存前自检",
+            "standard": "标准自动化用例",
+        }.get(mode, "保存前字段检查")
         failures: list[str] = []
         for spec in getattr(self, "dynamic_collections", ()):
             for child in spec.children:
@@ -8069,12 +8249,14 @@ class ModuleSmokeDriver:
                     r"\{index\}", r"\d+"
                 )
                 for field_code, value in submitted.items():
-                    if not isinstance(value, str) or not re.fullmatch(pattern, field_code):
+                    if not isinstance(value, str) or not re.search(
+                        rf"(?:^|\.){pattern}$", field_code,
+                    ):
                         continue
                     if len(value) <= maximum:
                         continue
                     failures.append(
-                        f"{self._field_display(field_code, child.label or field_code)}: "
+                        f"{context} - {self._field_display(field_code, child.label or field_code)}: "
                         f"长度 {len(value)} 超过已确认持久化上限 {maximum}"
                     )
         return self._deduplicate(failures)
@@ -8841,9 +9023,17 @@ class ModuleSmokeDriver:
                     popper_visible = bool(
                         popper.count() and popper.is_visible()
                     )
-                else:
+                if not popper_visible:
+                    # Element Plus may retain aria-controls on a rerendered
+                    # wrapper after replacing the actual dropdown.  Fall back
+                    # only to a visible popper that contains real select-like
+                    # options, never to a generic tooltip or message overlay.
                     popper = self.page.locator(
-                        ".el-popper:visible,.el-popover:visible"
+                        ".el-select__popper:visible,.el-cascader__dropdown:visible,"
+                        ".el-popper:visible:has(.el-select-dropdown__item:not(.is-disabled)),"
+                        ".el-popover:visible:has(.el-select-dropdown__item:not(.is-disabled)),"
+                        ".el-popper:visible:has(.el-cascader-node:not(.is-disabled)),"
+                        ".el-popover:visible:has(.el-cascader-node:not(.is-disabled))"
                     ).last
                     popper_visible = bool(
                         popper.count() and popper.is_visible()

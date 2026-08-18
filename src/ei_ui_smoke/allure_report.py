@@ -94,7 +94,7 @@ def apply_allure_report_layout_overrides(report_dir: Path) -> None:
     styles = report_dir / "styles.css"
     if not styles.exists():
         return
-    marker = "/* UI-Smoke-Testing: preserve test title line breaks */"
+    marker = "/* UI-Test-Automation: preserve test title line breaks */"
     text = styles.read_text(encoding="utf-8")
     if marker in text:
         return

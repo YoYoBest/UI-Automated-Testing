@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import ei_ui_smoke.launcher as launcher_module
 
@@ -12,6 +13,7 @@ from ei_ui_smoke.launcher import (
     build_pytest_command,
     command_log_name,
     command_failure_names,
+    command_preflight_commands,
     common_cases_dialog_defaults,
     common_case_sheet_family,
     common_case_sheet_matches_target,
@@ -26,6 +28,7 @@ from ei_ui_smoke.launcher import (
     console_python_executable,
     format_failure_message,
     format_environment_block_message,
+    filter_environment_preflight_commands,
     append_environment_preflight_summary,
     group_action_commands,
     is_detail_page_target,
@@ -35,6 +38,7 @@ from ei_ui_smoke.launcher import (
     default_submit_zentao,
     exclude_delete_targets,
     environment_flag,
+    environment_block_outcome,
     execution_progress_percent,
     execution_stage_label,
     generate_report_before_maintenance_gate,
@@ -88,6 +92,27 @@ def test_environment_block_message_is_not_presented_as_a_product_failure():
 
     assert "不计产品缺陷" in message
     assert "HTTP 404" in message
+
+
+def test_capability_block_message_is_not_mislabeled_as_a_version_mismatch():
+    block = SimpleNamespace(
+        target_name="资源池 / 对外投资 / 新增",
+        probe_id="resource-pool-enterprise-sections",
+        url="https://env/ei-service/project/projStorage/detail/1",
+        status=500,
+        classification="environment-capability-unavailable",
+        capability_name="资源池企业子表能力",
+    )
+
+    message = format_environment_block_message([block], [])
+
+    assert "部署能力不可用" in message
+    assert "资源池企业子表能力不可用" in message
+    assert "未生成对应测试结果" in message
+    assert "环境版本不匹配" not in message
+    assert environment_block_outcome([block]) == (
+        "部署能力不可用", "因部署能力不可用被阻塞",
+    )
 
 
 def test_environment_preflight_summary_appends_to_a_path_log(tmp_path):
@@ -1242,6 +1267,134 @@ def test_all_actions_are_grouped_into_one_browser_command():
     assert pool_actions[1]["action_path"] == ["新增", "股权结构", "新增"]
     assert pool_actions[1]["require_add"] == "true"
     assert pool_actions[2]["component"] == "other/index"
+
+
+def test_environment_preflight_filters_only_dependent_grouped_actions(monkeypatch):
+    paths = [
+        (),
+        ("新增", "股权结构", "新增"),
+        ("新增", "股权结构", "删除"),
+        ("新增", "对外投资", "新增"),
+        ("新增", "对外投资", "删除"),
+    ]
+    commands = []
+    for index, action_path in enumerate(paths, 2):
+        operation = action_path[-1] if action_path else "新增"
+        section = action_path[-2] if action_path else ""
+        path = tuple(part for part in ("资源池", section, operation) if part)
+        target = ModuleItem(
+            id=f"POOL::action::{index}", name=operation, path=path,
+            component="projectResourcePool/index", route="/projectPool",
+            form_code="POOL_RESOURCE", operation=operation,
+            operation_path=action_path,
+        )
+        commands.append((
+            target,
+            {
+                "EI_ACTION": operation,
+                "EI_FORM_URL": "https://env/ei-view/#/projectPool",
+                "EI_COMPONENT": target.component,
+                "EI_FORM_CODE": target.form_code,
+            },
+            "tests/test_module_action.py",
+        ))
+    grouped = group_action_commands(commands)
+    blocked_paths = {
+        ("新增", "股权结构", "删除"),
+        ("新增", "对外投资", "新增"),
+    }
+
+    def block_logical_action(logical_commands, _results):
+        target, environment, _test_file = logical_commands[0]
+        action_path = tuple(json.loads(environment.get("EI_ACTION_PATH", "[]")))
+        if action_path not in blocked_paths:
+            return logical_commands, []
+        return [], [EnvironmentBlock(
+            " / ".join(target.path), "resource-pool-enterprise-sections",
+            "https://env/ei-service/project/projStorage/detail/1", 500,
+        )]
+
+    monkeypatch.setattr(
+        launcher_module, "block_unavailable_commands", block_logical_action,
+    )
+
+    runnable, blocked = filter_environment_preflight_commands(grouped, [object()])
+
+    assert len(runnable) == 1
+    retained = json.loads(runnable[0][1]["EI_ACTIONS_JSON"])
+    assert [tuple(action["action_path"]) for action in retained] == [
+        (),
+        ("新增", "股权结构", "新增"),
+        ("新增", "对外投资", "删除"),
+    ]
+    assert command_target_names(runnable) == [
+        "资源池/新增", "资源池/股权结构/新增", "资源池/对外投资/删除",
+    ]
+    assert [block.target_name for block in blocked] == [
+        "资源池 / 股权结构 / 删除", "资源池 / 对外投资 / 新增",
+    ]
+
+
+def test_environment_preflight_drops_a_group_only_when_every_action_is_blocked(
+    monkeypatch,
+):
+    first = ModuleItem(
+        id="POOL::action::4", name="删除", path=("资源池", "股权结构", "删除"),
+        component="projectResourcePool/index", form_code="POOL_RESOURCE",
+        operation="删除", operation_path=("新增", "股权结构", "删除"),
+    )
+    second = ModuleItem(
+        id="POOL::action::5", name="新增", path=("资源池", "对外投资", "新增"),
+        component="projectResourcePool/index", form_code="POOL_RESOURCE",
+        operation="新增", operation_path=("新增", "对外投资", "新增"),
+    )
+    grouped = group_action_commands([
+        (first, {"EI_ACTION": "删除"}, "tests/test_module_action.py"),
+        (second, {"EI_ACTION": "新增"}, "tests/test_module_action.py"),
+    ])
+
+    def block_every_action(logical_commands, _results):
+        target = logical_commands[0][0]
+        return [], [EnvironmentBlock(
+            " / ".join(target.path), "resource-pool-enterprise-sections",
+            "https://env/detail", 500,
+        )]
+
+    monkeypatch.setattr(
+        launcher_module, "block_unavailable_commands", block_every_action,
+    )
+
+    runnable, blocked = filter_environment_preflight_commands(grouped, [object()])
+
+    assert runnable == []
+    assert len(blocked) == 2
+
+
+def test_grouped_actions_are_expanded_for_probe_selection():
+    outer = ModuleItem(
+        id="POOL::action::2", name="新增", path=("资源池", "新增"),
+        component="projectResourcePool/index", form_code="POOL_RESOURCE",
+        operation="新增",
+    )
+    nested = ModuleItem(
+        id="POOL::action::5", name="新增", path=("资源池", "对外投资", "新增"),
+        component="projectResourcePool/index", form_code="POOL_RESOURCE",
+        operation="新增", operation_path=("新增", "对外投资", "新增"),
+    )
+    grouped = group_action_commands([
+        (outer, {"EI_ACTION": "新增"}, "tests/test_module_action.py"),
+        (nested, {"EI_ACTION": "新增"}, "tests/test_module_action.py"),
+    ])[0]
+
+    logical = command_preflight_commands(grouped)
+
+    assert [command[0].id for command in logical] == [
+        "POOL::action::2", "POOL::action::5",
+    ]
+    assert "EI_ACTION_PATH" not in logical[0][1]
+    assert json.loads(logical[1][1]["EI_ACTION_PATH"]) == [
+        "新增", "对外投资", "新增",
+    ]
 
 
 def test_delete_excel_case_command_stays_outside_action_batch():

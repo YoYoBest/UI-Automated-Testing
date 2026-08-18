@@ -58,7 +58,7 @@ from .zentao import ZentaoRunResult, process_allure_failures
 
 
 DEFAULT_SOURCE = r"D:\Auto_Testing\Project_Purvar\SHZY\ei-parent"
-DEFAULT_COMMON_CASES_DIR = Path(r"D:\Auto_Testing\UI-Smoke-Testing\tests\Common_Test_Cases")
+DEFAULT_COMMON_CASES_DIR = Path(r"D:\Auto_Testing\UI-Test-Automation\tests\Common_Test_Cases")
 DEFAULT_COMMON_CASES_FILENAME = "公共用例_UI自动化.xlsx"
 DEFAULT_MODULE_CASES_FILENAME = "建设项目_个性化用例.xlsx"
 URL_HISTORY_LIMIT = 10
@@ -1187,6 +1187,106 @@ def command_target_names(commands) -> list[str]:
     return names
 
 
+def command_preflight_commands(command):
+    """Expand an action batch into the logical commands seen by API preflight."""
+    target, command_env, test_file = command
+    raw_actions = command_env.get("EI_ACTIONS_JSON", "")
+    if not raw_actions:
+        return [command]
+    try:
+        actions = json.loads(raw_actions)
+    except (TypeError, json.JSONDecodeError):
+        return [command]
+    if not isinstance(actions, list) or not actions:
+        return [command]
+
+    logical_commands = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        module_name = str(
+            action.get("module_name") or action.get("action") or target.name
+        ).strip()
+        path = tuple(part.strip() for part in module_name.split("/") if part.strip())
+        action_path = tuple(
+            str(part).strip()
+            for part in (action.get("action_path") or [])
+            if str(part).strip()
+        )
+        logical_target = replace(
+            target,
+            id=str(action.get("module_id") or target.id),
+            name=path[-1] if path else module_name,
+            path=path or target.path,
+            component=str(action.get("component") or ""),
+            form_code=str(action.get("form_code") or ""),
+            requires_business_id=bool(action.get("requires_business_id")),
+            operation=str(action.get("action") or ""),
+            operation_path=action_path,
+        )
+        logical_env = command_env.copy()
+        logical_env.pop("EI_ACTIONS_JSON", None)
+        logical_env.update({
+            "EI_MODULE_ID": logical_target.id,
+            "EI_MODULE_NAME": module_name,
+            "EI_ACTION": logical_target.operation,
+            "EI_FORM_URL": str(action.get("form_url") or ""),
+            "EI_COMPONENT": logical_target.component,
+            "EI_FORM_CODE": logical_target.form_code,
+            "EI_REQUIRES_BUSINESS_ID": str(
+                logical_target.requires_business_id
+            ).lower(),
+        })
+        if action_path:
+            logical_env["EI_ACTION_PATH"] = json.dumps(
+                action_path, ensure_ascii=False,
+            )
+        else:
+            logical_env.pop("EI_ACTION_PATH", None)
+        if require_add := str(action.get("require_add") or "").strip():
+            logical_env["EI_REQUIRE_ADD"] = require_add
+        else:
+            logical_env.pop("EI_REQUIRE_ADD", None)
+        logical_commands.append((logical_target, logical_env, test_file))
+    return logical_commands or [command]
+
+
+def filter_environment_preflight_commands(commands, probe_results):
+    """Remove only blocked logical actions while retaining their runnable batch."""
+    runnable_commands = []
+    environment_blocks = []
+    for command in commands:
+        _target, command_env, _test_file = command
+        raw_actions = command_env.get("EI_ACTIONS_JSON", "")
+        logical_commands = command_preflight_commands(command)
+        if not raw_actions or logical_commands == [command]:
+            runnable, blocked = block_unavailable_commands([command], probe_results)
+            runnable_commands.extend(runnable)
+            environment_blocks.extend(blocked)
+            continue
+
+        try:
+            actions = json.loads(raw_actions)
+        except (TypeError, json.JSONDecodeError):
+            runnable_commands.append(command)
+            continue
+        kept_actions = []
+        for action, logical_command in zip(actions, logical_commands):
+            logical_runnable, blocked = block_unavailable_commands(
+                [logical_command], probe_results,
+            )
+            if logical_runnable:
+                kept_actions.append(action)
+            environment_blocks.extend(blocked)
+        if kept_actions:
+            filtered_env = command_env.copy()
+            filtered_env["EI_ACTIONS_JSON"] = json.dumps(
+                kept_actions, ensure_ascii=False,
+            )
+            runnable_commands.append((command[0], filtered_env, command[2]))
+    return runnable_commands, environment_blocks
+
+
 def command_failure_names(target, command_env, test_file: str, output: str = "") -> list[str]:
     """Map a failed pytest command back to the user-visible operations or stage."""
     base_name = " / ".join(target.path) or target.name
@@ -1282,19 +1382,65 @@ def format_failure_message(
 
 
 def format_environment_block_message(blocks, warnings) -> str:
-    blocked_lines = [
+    version_blocks = [
+        block for block in blocks
+        if getattr(block, "classification", "environment-version-mismatch")
+        == "environment-version-mismatch"
+    ]
+    capability_blocks = [
+        block for block in blocks
+        if getattr(block, "classification", "")
+        == "environment-capability-unavailable"
+    ]
+    other_blocks = [
+        block for block in blocks
+        if block not in version_blocks and block not in capability_blocks
+    ]
+    version_lines = [
         f"- {block.target_name}: {block.probe_id} 返回 HTTP {block.status}（{block.url}）"
-        for block in blocks
+        for block in version_blocks
+    ]
+    capability_lines = [
+        f"- {block.target_name}: "
+        f"{getattr(block, 'capability_name', '') or block.probe_id}不可用，"
+        f"HTTP {block.status}（{block.url}）"
+        for block in capability_blocks
+    ]
+    other_lines = [
+        f"- {block.target_name}: {block.probe_id} 返回 HTTP {block.status}（{block.url}）"
+        for block in other_blocks
     ]
     warning_lines = [f"- {warning}" for warning in warnings]
     sections = []
-    if blocked_lines:
+    if version_lines:
         sections.append(
-            "环境版本不匹配，以下目标未执行且不计产品缺陷：\n" + "\n".join(blocked_lines)
+            "环境版本不匹配，以下目标未执行且不计产品缺陷：\n"
+            + "\n".join(version_lines)
+        )
+    if capability_lines:
+        sections.append(
+            "部署能力不可用，以下目标已在启动 pytest 前阻断，"
+            "未生成对应测试结果：\n" + "\n".join(capability_lines)
+        )
+    if other_lines:
+        sections.append(
+            "环境接口预检阻断，以下目标未执行：\n" + "\n".join(other_lines)
         )
     if warning_lines:
         sections.append("部署版本预警：\n" + "\n".join(warning_lines))
     return "\n\n" + "\n\n".join(sections) if sections else ""
+
+
+def environment_block_outcome(blocks) -> tuple[str, str]:
+    classifications = {
+        getattr(block, "classification", "environment-version-mismatch")
+        for block in blocks
+    }
+    if classifications == {"environment-version-mismatch"}:
+        return "环境版本不匹配", "因环境版本不匹配被阻塞"
+    if classifications == {"environment-capability-unavailable"}:
+        return "部署能力不可用", "因部署能力不可用被阻塞"
+    return "环境预检阻断", "因环境预检被阻塞"
 
 
 def append_environment_preflight_summary(
@@ -2328,7 +2474,9 @@ class Launcher(tk.Tk):
                 )
                 required_probes = {
                     probe.id: probe
-                    for _target, command_env, _test_file in commands
+                    for command in commands
+                    for _target, command_env, _test_file
+                    in command_preflight_commands(command)
                     for probe in matching_probes(configured_probes, command_env)
                 }
                 storage_state = str(commands[0][1].get("EI_STORAGE_STATE", ""))
@@ -2337,7 +2485,7 @@ class Launcher(tk.Tk):
                     required_probes.values(), base_url=base_url,
                     storage_state=storage_state,
                 )
-                commands, environment_blocks = block_unavailable_commands(
+                commands, environment_blocks = filter_environment_preflight_commands(
                     commands, probe_results,
                 )
                 environment_warnings = update_version_mismatch_state(
@@ -2702,11 +2850,13 @@ class Launcher(tk.Tk):
             )
         elif environment_blocks:
             passed_names = command_target_names(commands)
+            block_title, block_reason = environment_block_outcome(environment_blocks)
             self.status.set(
-                f"执行完成：{len(passed_names)} 个通过，{len(environment_blocks)} 个因环境版本不匹配被阻塞。"
+                f"执行完成：{len(passed_names)} 个通过，"
+                f"{len(environment_blocks)} 个{block_reason}。"
             )
             messagebox.showwarning(
-                "环境版本不匹配",
+                block_title,
                 format_environment_block_message(environment_blocks, environment_warnings)
                 + f"\n\nAllure：{report_dir or results_dir}{report_error}",
             )

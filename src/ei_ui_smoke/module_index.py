@@ -157,6 +157,26 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
             detail_route = f"/{prefix.strip('_')}/detail"
         owner_path = owner.path if owner else (owner_name,)
         _append_detail_modules(result, nodes, owner_path + ("详情",), detail_route, prefix, by_component)
+    detail_father_trees = payload.get("_detailFatherTrees", []) if isinstance(payload, dict) else []
+    for tree in detail_father_trees if isinstance(detail_father_trees, list) else []:
+        if not isinstance(tree, dict):
+            continue
+        nodes = tree.get("nodes")
+        source_component = str(tree.get("sourceComponent") or "")
+        father_id = str(tree.get("fatherId") or "")
+        if not isinstance(nodes, list) or not source_component or not father_id:
+            continue
+        owner = _detail_father_tree_owner(result, source_component)
+        if owner is None or not owner.route:
+            continue
+        _append_detail_modules(
+            result,
+            nodes,
+            owner.path + ("详情",),
+            owner.route.rstrip("/") + "/detail",
+            f"father:{father_id}",
+            by_component,
+        )
     page_items = list(result)
     page_bindings: list[tuple[ModuleItem, ModuleItem | None, ModuleItem | None]] = []
     for item in page_items:
@@ -263,6 +283,31 @@ def _append_detail_modules(
         ))
         children = raw.get("children") if isinstance(raw.get("children"), list) else []
         _append_detail_modules(result, children, item_path, detail_route, prefix, by_component)
+
+
+def _detail_father_tree_owner(
+    items: list[ModuleItem], source_component: str,
+) -> ModuleItem | None:
+    """Resolve a father-ID tree owner from the source component, never from its title."""
+    target = _normalize_component(source_component)
+    if not target:
+        return None
+    candidates = [
+        item for item in items
+        if item.id != "ALL"
+        and not item.operation
+        and not _is_container_component(item.component)
+        and (component := _normalize_component(item.component))
+        and target.startswith(component + "/")
+    ]
+    if not candidates:
+        return None
+    best_depth = max(len(_normalize_component(item.component)) for item in candidates)
+    best = [
+        item for item in candidates
+        if len(_normalize_component(item.component)) == best_depth
+    ]
+    return best[0] if len(best) == 1 else None
 
 
 def _normalize_component(value: str) -> str:

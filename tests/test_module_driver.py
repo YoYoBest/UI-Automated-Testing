@@ -678,6 +678,141 @@ def test_form_readiness_timeout_has_precise_failure_message():
         raise AssertionError("unready form was accepted")
 
 
+def test_edit_form_hydration_reports_failed_detail_response_before_generic_timeout():
+    class EmptyCandidates:
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def nth(_index):
+            raise IndexError
+
+    class Page:
+        def __init__(self):
+            self.listeners = []
+
+        def on(self, event, listener):
+            assert event == "response"
+            self.listeners.append(listener)
+
+        def remove_listener(self, event, listener):
+            assert event == "response"
+            self.listeners.remove(listener)
+
+        @staticmethod
+        def locator(_selector):
+            return EmptyCandidates()
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+        def emit(self, response):
+            for listener in list(self.listeners):
+                listener(response)
+
+    class DetailRequest:
+        method = "GET"
+        resource_type = "xhr"
+        post_data_json = {"projObjectName": "不得进入诊断的企业名称"}
+
+    class FailedDetailResponse:
+        ok = False
+        status = 500
+        url = (
+            "https://host/project/projStorage/detail?recordId=secret-id"
+            "&access_token=query-secret"
+        )
+        request = DetailRequest()
+        headers = {"content-type": "application/json;charset=UTF-8"}
+
+        @staticmethod
+        def json():
+            return {
+                "code": 500,
+                "message": (
+                    "SYSTEM_ERROR token=body-secret password=body-password"
+                ),
+                "data": {"projObjectName": "也不得进入诊断的企业名称"},
+            }
+
+    page = Page()
+    failed = FailedDetailResponse()
+
+    class EditAction:
+        @staticmethod
+        def click():
+            page.emit(failed)
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    driver._current_detail_edit_button = lambda _markers: EditAction()
+
+    assert driver._open_current_detail_edit_for_readback([])
+    with pytest.raises(AssertionError) as error:
+        driver._wait_for_form_scope(timeout=0)
+
+    message = str(error.value)
+    assert message.startswith("打开编辑表单时详情接口失败：")
+    assert "method=GET" in message
+    assert "path=/project/projStorage/detail" in message
+    assert "status=500" in message
+    assert "SYSTEM_ERROR" in message
+    assert "表单控件" not in message
+    assert "secret-id" not in message
+    assert "query-secret" not in message
+    assert "body-secret" not in message
+    assert "body-password" not in message
+    assert "不得进入诊断的企业名称" not in message
+    assert page.listeners == []
+
+
+def test_edit_form_hydration_detects_http_200_business_failure():
+    class DetailRequest:
+        method = "POST"
+        resource_type = "fetch"
+
+    response = JsonResponse(
+        "https://host/api/company/getById?companyId=private-id",
+        {"status": "500", "msg": "部署详情能力不可用"},
+    )
+    response.status = 200
+    response.request = DetailRequest()
+
+    diagnostic = ModuleSmokeDriver._detail_open_failure_diagnostic(response)
+
+    assert "method=POST" in diagnostic
+    assert "path=/api/company/getById" in diagnostic
+    assert "status=200" in diagnostic
+    assert "部署详情能力不可用" in diagnostic
+    assert "private-id" not in diagnostic
+
+
+def test_successful_edit_form_hydration_removes_response_listener():
+    class Page:
+        def __init__(self):
+            self.listeners = []
+
+        def on(self, _event, listener):
+            self.listeners.append(listener)
+
+        def remove_listener(self, _event, listener):
+            self.listeners.remove(listener)
+
+    page = Page()
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = page
+    driver._start_form_open_response_capture()
+
+    driver._wait_for_form_ready(
+        ReadyScope(ReadyLocator(count=0), ReadyLocator())
+    )
+
+    assert page.listeners == []
+    assert driver._form_open_response_capture is None
+
+
 def test_detail_values_are_compared_with_submitted_values():
     ModuleSmokeDriver._assert_detail_values(
         {"code": 200, "data": {"name": "本次新增", "amount": 10}},
@@ -4571,6 +4706,115 @@ def test_select_business_value_uses_exact_declared_text_or_code():
 
     assert selected == "2"
     assert unregistered.clicked and not registered.clicked
+
+
+def test_select_business_value_recovers_from_stale_aria_controls_popper():
+    class EmptyLocator:
+        @staticmethod
+        def count():
+            return 0
+
+    class Option:
+        clicked = False
+
+        @staticmethod
+        def inner_text():
+            return "自有资金"
+
+        @staticmethod
+        def evaluate(_script):
+            return True
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def locator(_selector):
+            return EmptyLocator()
+
+        def click(self, **_kwargs):
+            self.clicked = True
+
+    option = Option()
+
+    class Options:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return option
+
+    class StalePopper:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    class VisibleSelectPopper:
+        selector = ""
+
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        def locator(self, selector):
+            self.selector = selector
+            return Options()
+
+    visible = VisibleSelectPopper()
+    fallback_selector = (
+        ".el-select__popper:visible,.el-cascader__dropdown:visible,"
+        ".el-popper:visible:has(.el-select-dropdown__item:not(.is-disabled)),"
+        ".el-popover:visible:has(.el-select-dropdown__item:not(.is-disabled)),"
+        ".el-popper:visible:has(.el-cascader-node:not(.is-disabled)),"
+        ".el-popover:visible:has(.el-cascader-node:not(.is-disabled))"
+    )
+
+    class Page:
+        selectors = []
+
+        @classmethod
+        def locator(cls, selector):
+            cls.selectors.append(selector)
+            if selector == "#stale-owned-popper":
+                return StalePopper()
+            assert selector == fallback_selector
+            return visible
+
+        @staticmethod
+        def wait_for_timeout(_milliseconds):
+            return None
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = Page()
+    driver._select_controls_id = lambda *_controls: "stale-owned-popper"
+
+    selected = driver._select_business_value(
+        resolve_select_control=lambda: (None, None),
+        field_code="financeSources.*.sourceFrom",
+        lookup_label="资金来源",
+        option_index=0,
+        is_company_remote=False,
+    )
+
+    assert selected == "自有资金"
+    assert option.clicked
+    assert fallback_selector in Page.selectors
+    assert ".el-select-dropdown__item:not(.is-disabled)" in visible.selector
 
 
 def test_entity_already_exists_prefers_only_remote_company_field():
@@ -8824,9 +9068,21 @@ def test_field_completion_report_uses_actual_visible_control_values(monkeypatch)
     assert "字段未成功输入" in report.message()
 
 
-def test_field_completion_blocks_dynamic_value_over_persistence_length(monkeypatch):
+@pytest.mark.parametrize(("data_mode", "context", "field_code"), [
+    ("probe", "快速探测保存前自检", "entInvestList.0.name"),
+    (
+        "probe",
+        "快速探测保存前自检",
+        "对外投资.entInvestList.0.name",
+    ),
+    ("standard", "标准自动化用例", "entInvestList.0.name"),
+])
+def test_field_completion_blocks_dynamic_value_over_persistence_length(
+    monkeypatch, data_mode, context, field_code,
+):
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = []
+    driver.data_strategy = type("Strategy", (), {"data_mode": data_mode})()
     driver.dynamic_collections = [
         DynamicCollectionSpec(
             field_code="entInvestList",
@@ -8849,18 +9105,20 @@ def test_field_completion_blocks_dynamic_value_over_persistence_length(monkeypat
     monkeypatch.setattr("ei_ui_smoke.module_driver.scan_dom_fields", lambda page: [])
 
     report = driver.check_field_completion({
-        "entInvestList.0.name": "UI自动化_20260817201810771600_8ae58af3_1_e1ccf050f9ce_1",
+        field_code: "UI自动化_20260817201810771600_8ae58af3_1_e1ccf050f9ce_1",
     })
 
     assert not report.ok
     assert report.fill_failed == [
-        "被投资企业名称 (entInvestList.0.name): 长度 52 超过已确认持久化上限 50"
+        f"{context} - 被投资企业名称 ({field_code}): "
+        "长度 52 超过已确认持久化上限 50"
     ]
 
 
 def test_field_completion_accepts_dynamic_value_at_persistence_length(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = []
+    driver.data_strategy = type("Strategy", (), {"data_mode": "probe"})()
     driver.dynamic_collections = [
         DynamicCollectionSpec(
             field_code="entInvestList",

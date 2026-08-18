@@ -96,6 +96,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 - 把“扫描”结果视为源码页面索引，不把它当成真实业务菜单。真实中文菜单、用户权限和页面路由必须以“连接并获取菜单”取得的运行时接口数据为准。
 - 同时支持 `ei-parent/ei-view` 和 `fi-parent/fi-view` 项目布局；不要把项目名或视图目录名写死成其中一种。
+- 源码布局还可声明详情权限树请求：仅识别静态 `getUserFuncPermTree({ fatherId: "..." })` 的 `fatherId`，并记录调用 Vue 相对 `src/views` 的组件路径。变量形式的 `fatherId` 不猜测；运行时菜单获取阶段再以该证据请求只读树并按唯一组件前缀归属挂载。
 - 菜单采集和测试执行必须先用 `resolve_view_root(source_root).name` 取得所选源码的实际 `*-view`，再统一对齐部署地址。登录页 URL 只替换 `redirect` 目标内最后一个 `*-view` 路径段，直接业务 URL 只替换自身 path 中最后一个该路径段，并保留认证入口、query 和 hash；地址已经对齐时原样返回，避免无变化情况下重编码登录参数。菜单抓取、`EI_BASE_URL` 与 `EI_FORM_URL` 必须使用同一个对齐结果，禁止把一个应用的运行时菜单路由拼到另一个应用基址。
 - 把 `index.vue`、`list.vue` 识别为候选入口，排除 `components/component` 内部组件。
 - 同一目录同时存在 `index.vue` 和 `list.vue` 时只输出一个页面：优先选择能解析出 `formCode` 的入口；能力相同时优先 `list.vue`。

@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
-from .project_layout import discover_detail_prefixes, read_app_id
+from .project_layout import (
+    discover_detail_father_tree_requests,
+    discover_detail_prefixes,
+    read_app_base_api,
+    read_app_id,
+)
 
 
 MENU_API_MARKER = "/funcPerm/getUserFuncPerm"
@@ -31,6 +36,43 @@ def _menu_leaves(nodes: list[object], parent_route: str = ""):
             yield from _menu_leaves(children, route)
         elif route:
             yield str(raw.get("funcCode") or raw.get("id") or route or f"menu-{position}"), route
+
+
+def _detail_nodes(response: Any) -> list[Any]:
+    if not response.ok:
+        return []
+    payload = response.json()
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return payload["data"]
+    return payload if isinstance(payload, list) else []
+
+
+def _capture_detail_father_trees(
+    context: Any,
+    *,
+    origin: str,
+    app_id: str,
+    auth_headers: dict[str, str],
+    source_root: Path,
+    timeout_ms: int,
+) -> list[dict[str, Any]]:
+    """Fetch each statically declared father-ID detail tree without opening a page."""
+    base_api = read_app_base_api(source_root, "/ezgo").rstrip("/")
+    endpoint = f"{origin}{base_api}/ei-service/funcPerm/getUserFuncPermTree"
+    trees: list[dict[str, Any]] = []
+    for request in discover_detail_father_tree_requests(source_root):
+        response = context.request.get(
+            endpoint,
+            params={"appId": app_id, "fatherId": request.father_id},
+            headers=auth_headers,
+            timeout=timeout_ms,
+        )
+        trees.append({
+            "fatherId": request.father_id,
+            "sourceComponent": request.source_component,
+            "nodes": _detail_nodes(response),
+        })
+    return trees
 
 
 def capture_menu(
@@ -84,17 +126,19 @@ def capture_menu(
                     headers=auth_headers,
                     timeout=timeout_ms,
                 )
-                if not detail_response.ok:
-                    detail_trees[prefix] = []
-                    continue
-                detail_payload = detail_response.json()
-                if isinstance(detail_payload, dict) and isinstance(detail_payload.get("data"), list):
-                    detail_trees[prefix] = detail_payload["data"]
-                elif isinstance(detail_payload, list):
-                    detail_trees[prefix] = detail_payload
-                else:
-                    detail_trees[prefix] = []
+                detail_trees[prefix] = _detail_nodes(detail_response)
             payload["_detailTrees"] = detail_trees
+            payload["_detailFatherTrees"] = (
+                _capture_detail_father_trees(
+                    context,
+                    origin=origin,
+                    app_id=app_id,
+                    auth_headers=auth_headers,
+                    source_root=source_root,
+                    timeout_ms=timeout_ms,
+                )
+                if source_root else []
+            )
             button_response = context.request.get(
                 f"{origin}/ezgo/ei-service/proj/getUserButtonPermissions",
                 params={"appId": app_id}, headers=auth_headers, timeout=timeout_ms,

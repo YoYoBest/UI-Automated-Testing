@@ -99,6 +99,91 @@ def test_probe_is_reproducible_with_same_run_id():
     assert first == second
 
 
+@pytest.mark.parametrize("field_type", ["ElInput-TEXT", "PurvarTextarea-TEXTAREA"])
+def test_probe_uses_short_conservative_text_while_standard_keeps_boundary_inputs(
+    field_type,
+):
+    definition = normalize_field(
+        {
+            "fieldCode": "companyName",
+            "fieldName": "企业名称",
+            "fieldType": field_type,
+            "propsJson": json.dumps({"maxlength": 100}),
+        },
+        "test",
+    )
+    run_id = "20260818085545174700_9350fd6a_1_e1ccf050f9ce"
+
+    probe = ProbeDataStrategy(pool(), run_id).value_for(definition, 1)
+    standard = StandardDataStrategy(pool(), run_id).value_for(definition, 1)
+
+    assert len(probe) <= ProbeDataStrategy.PROBE_TEXT_MAX_LENGTH
+    assert run_id not in probe
+    assert run_id in standard
+    assert len(standard) > ProbeDataStrategy.PROBE_TEXT_MAX_LENGTH
+
+
+def test_probe_conservative_text_honors_a_smaller_declared_maxlength():
+    definition = normalize_field(
+        {
+            "fieldCode": "summary",
+            "fieldName": "summary",
+            "fieldType": "PurvarTextarea-TEXTAREA",
+            "propsJson": json.dumps({"maxlength": 12}),
+        },
+        "test",
+    )
+
+    value = ProbeDataStrategy(
+        pool(), "20260818085545174700_9350fd6a_1_e1ccf050f9ce"
+    ).value_for(definition, 1)
+
+    assert len(value) == 12
+
+
+@pytest.mark.parametrize(
+    ("field_code", "field_type", "expected_pattern"),
+    [
+        ("phone", "ElInput-TEXT", r"139\d{8}"),
+        ("email", "ElInput-TEXT", r"[^@]+@[^@]+"),
+        ("creditCode", "ElInput-TEXT", r"[0-9A-Z]{18}"),
+        ("itemId", "ElInput-TEXT", r"\d{16}"),
+        ("eventDate", "ElDatePicker-DATE", r"\d{4}-\d{2}-\d{2}"),
+    ],
+)
+def test_probe_does_not_truncate_structured_strings_to_text_ceiling(
+    field_code, field_type, expected_pattern,
+):
+    data_pool = pool()
+    data_pool.common["fieldMappings"]["email"] = ["email"]
+    definition = normalize_field(
+        {
+            "fieldCode": field_code,
+            "fieldName": field_code,
+            "fieldType": field_type,
+            "propsJson": json.dumps({"maxlength": 5}),
+        },
+        "test",
+    )
+
+    value = ProbeDataStrategy(
+        data_pool, "20260818085545174700_9350fd6a_1_e1ccf050f9ce"
+    ).value_for(definition, 1)
+
+    assert len(value) > 5
+    assert re.fullmatch(expected_pattern, value)
+
+
+def test_probe_compact_identity_remains_distinct_per_action_scope():
+    prefix = "20260818085545174700_9350fd6a_1_"
+    first = ProbeDataStrategy(pool(), prefix + "outer-add")
+    second = ProbeDataStrategy(pool(), prefix + "nested-invest-add")
+
+    assert first.generator.run_id != second.generator.run_id
+    assert len(first.value_for(field("name", "名称"), 1)) <= 40
+    assert len(second.value_for(field("name", "名称"), 1)) <= 40
+
+
 def test_generated_enterprise_name_respects_maxlength_and_remains_deterministic():
     definition = normalize_field(
         {

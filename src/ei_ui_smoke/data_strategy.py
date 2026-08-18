@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+from dataclasses import replace
 from typing import Any
 from threading import Lock
 
+from .contracts import field_kind
 from .data_pool import ConstrainedGenerator, GlobalDataPool
 from .models import FieldDefinition
 from .validation_repair import generate_repair_value, parse_validation_message
 
 
 class DataStrategy:
+    data_mode = "generic"
     pool: GlobalDataPool
     form_code: str
     _unique_reservation_lock = Lock()
@@ -208,19 +213,67 @@ class DataStrategy:
 
 
 class ProbeDataStrategy(DataStrategy):
+    data_mode = "probe"
+    conservative_probe_values = True
+    PROBE_TEXT_MAX_LENGTH = 40
+
     def __init__(
         self, pool: GlobalDataPool, run_id: str = "", *, form_code: str = "",
     ):
         self.pool = pool
         self.form_code = form_code
-        self.generator = ConstrainedGenerator(pool.common, run_id)
+        generator_run_id = (
+            self._compact_probe_run_id(run_id)
+            if self.conservative_probe_values
+            else run_id
+        )
+        self.generator = ConstrainedGenerator(pool.common, generator_run_id)
+
+    @staticmethod
+    def _compact_probe_run_id(run_id: str) -> str:
+        raw = str(run_id or "").strip()
+        if not raw:
+            return ""
+        digits = re.sub(r"\D", "", raw)
+        time_part = digits[:14] or "probe"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+        return f"{time_part}_{digest}"
+
+    def _probe_generation_field(
+        self, field: FieldDefinition, semantic: str,
+    ) -> FieldDefinition:
+        if not self.conservative_probe_values:
+            return field
+        if semantic not in {"", "enterpriseName"}:
+            return field
+        if field_kind(field.field_type) not in {"text", "textarea"}:
+            return field
+        props = dict(field.props)
+        raw_maximum = props.get("maxlength", props.get("maxLength"))
+        try:
+            declared_maximum = int(raw_maximum)
+        except (TypeError, ValueError):
+            declared_maximum = self.PROBE_TEXT_MAX_LENGTH
+        if declared_maximum < 1:
+            declared_maximum = self.PROBE_TEXT_MAX_LENGTH
+        props["maxlength"] = min(
+            declared_maximum, self.PROBE_TEXT_MAX_LENGTH
+        )
+        return replace(field, props=props)
 
     def value_for(self, field: FieldDefinition, index: int) -> Any:
         semantic = self.pool.semantic_for(field)
-        return self.generator.generate(semantic, field, index) if semantic else self.generator.by_kind(field, index)
+        generation_field = self._probe_generation_field(field, semantic)
+        return (
+            self.generator.generate(semantic, generation_field, index)
+            if semantic
+            else self.generator.by_kind(generation_field, index)
+        )
 
 
 class StableDataStrategy(DataStrategy):
+    data_mode = "stable"
+
     def __init__(self, pool: GlobalDataPool, form_code: str, run_id: str = ""):
         self.pool = pool
         self.form_code = form_code
@@ -252,6 +305,8 @@ class StableDataStrategy(DataStrategy):
 class StandardDataStrategy(ProbeDataStrategy):
     """Generate fresh values while requiring every editable field to be exercised."""
 
+    data_mode = "standard"
+    conservative_probe_values = False
     strict_field_validation = True
 
     def value_for(self, field: FieldDefinition, index: int) -> Any:

@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True, slots=True)
+class DetailFatherTreeRequest:
+    """A source-declared, read-only detail tree request."""
+
+    father_id: str
+    source_component: str
 
 
 def resolve_view_root(source_root: Path) -> Path:
@@ -53,3 +62,28 @@ def discover_detail_prefixes(source_root: Path) -> tuple[str, ...]:
             continue
         prefixes.extend(pattern.findall(text))
     return tuple(dict.fromkeys(prefixes))
+
+
+def discover_detail_father_tree_requests(source_root: Path) -> tuple[DetailFatherTreeRequest, ...]:
+    """Find static ``getUserFuncPermTree({ fatherId: ... })`` calls in detail views."""
+    view_root = resolve_view_root(source_root)
+    views_root = view_root / "src" / "views"
+    request_pattern = re.compile(
+        r"getUserFuncPermTree\s*\(\s*\{(?P<params>.*?)\}\s*\)", re.S
+    )
+    father_id_pattern = re.compile(r"\bfatherId\s*:\s*['\"]([^'\"]+)['\"]")
+    requests: list[DetailFatherTreeRequest] = []
+    for path in sorted(views_root.rglob("*.vue")):
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        for match in request_pattern.finditer(text):
+            father_id = father_id_pattern.search(match.group("params"))
+            if father_id is None:
+                continue
+            source_component = path.relative_to(views_root).with_suffix("").as_posix()
+            requests.append(DetailFatherTreeRequest(
+                father_id=father_id.group(1), source_component=source_component,
+            ))
+    return tuple(dict.fromkeys(requests))

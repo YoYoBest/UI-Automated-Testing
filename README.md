@@ -1,4 +1,4 @@
-# EI UI Smoke Testing
+# EI UI-Test-Automation
 
 独立的 Python + Playwright 测试工程，参照 `ei-parent` 的动态表单、动态列表和运行时数据契约实现。源项目只作为只读配置和契约来源，测试方法全部位于本工程。
 
@@ -20,7 +20,7 @@ ei-parent 本地 JSON + 运行时配置接口
 ## 安装
 
 ```powershell
-cd D:\Auto_Testing\UI-Smoke-Testing
+cd D:\Auto_Testing\UI-Test-Automation
 python -m pip install -e .
 python -m playwright install chromium
 ```

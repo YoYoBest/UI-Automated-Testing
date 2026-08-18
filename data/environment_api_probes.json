@@ -11,6 +11,38 @@
       "body": {"currPage": 1, "pageSize": 1},
       "versionHeader": "X-Source-Revision",
       "versionMismatchAlertHours": 24
+    },
+    {
+      "id": "resource-pool-enterprise-sections",
+      "formCodes": ["POOL_RESOURCE"],
+      "components": ["projectResourcePool/index"],
+      "actionPaths": [
+        ["新增", "股权结构", "删除"],
+        ["新增", "对外投资", "新增"]
+      ],
+      "capabilityName": "资源池企业子表能力",
+      "capabilityFailureStatuses": [500],
+      "steps": [
+        {
+          "id": "existing-resource-pool-record",
+          "method": "POST",
+          "readOnly": true,
+          "path": "/ezgo/ei-service/project/projStorage/list",
+          "body": {
+            "currPage": 1,
+            "pageSize": 1,
+            "formCode": "POOL_RESOURCE"
+          },
+          "extract": {
+            "resourcePoolId": "data.0.id"
+          }
+        },
+        {
+          "id": "resource-pool-enterprise-detail",
+          "method": "GET",
+          "path": "/ezgo/ei-service/project/projStorage/detail?id={resourcePoolId}"
+        }
+      ]
     }
   ]
 }
