@@ -352,7 +352,7 @@ def test_runtime_menu_appends_father_id_detail_tree_to_unique_source_owner(tmp_p
         "data": {"funcPerm": [{
             "funcCode": "PROJECT_MANAGE",
             "path": "/projectManage",
-            "component": "projectManage/index",
+            "component": "/srcEi/views/projectManage/index",
             "meta": {"title": "对外投资项目"},
             "children": [],
         }]},
@@ -381,6 +381,103 @@ def test_runtime_menu_appends_father_id_detail_tree_to_unique_source_owner(tmp_p
     assert detail.route == "/projectManage/detail"
     assert detail.form_code == "PROJECT_BASE"
     assert parent.requires_business_id and detail.requires_business_id
+
+
+def test_runtime_menu_appends_static_page_tabs_with_proven_imports(tmp_path):
+    src_views = tmp_path / "ei-view" / "src" / "views"
+    src_views.mkdir(parents=True)
+    views = tmp_path / "ei-view" / "srcEi" / "views" / "projectManage"
+    (views / "before").mkdir(parents=True)
+    (views / "after").mkdir(parents=True)
+    (views / "index.vue").write_text(
+        """
+        <template>
+          <el-tabs v-model="activeTab">
+            <el-tab-pane label="项目投前管理" name="before" />
+            <el-tab-pane label="项目投后管理" name="after" />
+            <el-tab-pane label="动态展示" name="dynamic" />
+          </el-tabs>
+          <BeforeList v-if="activeTab === 'before'" />
+          <AfterList v-else />
+        </template>
+        <script setup>
+        import BeforeList from "./before/beforeList.vue";
+        import AfterList from "./after/afterList.vue";
+        </script>
+        """,
+        encoding="utf-8",
+    )
+    (views / "before" / "beforeList.vue").write_text("<template />", encoding="utf-8")
+    (views / "after" / "afterList.vue").write_text("<template />", encoding="utf-8")
+    payload = {"data": {"funcPerm": [{
+        "funcCode": "PROJECT_MANAGE",
+        "path": "/projectManage",
+        "component": "/srcEi/views/projectManage/index",
+        "meta": {"title": "对外投资项目"},
+        "children": [],
+    }]}, "_detailFatherTrees": [{
+        "fatherId": "30021",
+        "sourceComponent": "projectManage/before/detail",
+        "nodes": [{
+            "funcCode": "BEFORE_BASE",
+            "meta": {"title": "基本信息"},
+            "children": [],
+        }],
+    }]}
+
+    tabs = [
+        item for item in modules_from_menu(payload, tmp_path)
+        if item.id.startswith("PROJECT_MANAGE::tab::")
+    ]
+
+    assert [(item.path, item.tab_label, item.component) for item in tabs] == [
+        (("对外投资项目", "项目投前管理"), "项目投前管理", "projectManage/before/beforeList"),
+        (("对外投资项目", "项目投后管理"), "项目投后管理", "projectManage/after/afterList"),
+    ]
+    assert all(item.runnable and item.route == "/projectManage" for item in tabs)
+    detail = next(item for item in modules_from_menu(payload, tmp_path)
+                  if item.id == "detail:father:30021:BEFORE_BASE")
+    assert detail.path == ("对外投资项目", "项目投前管理", "详情", "基本信息")
+
+
+def test_runtime_menu_attaches_after_detail_tree_to_matching_static_tab(tmp_path):
+    (tmp_path / "ei-view" / "src" / "views").mkdir(parents=True)
+    views = tmp_path / "ei-view" / "srcEi" / "views" / "projectManage"
+    (views / "after").mkdir(parents=True)
+    (views / "index.vue").write_text(
+        '''<template>
+        <el-tabs v-model="activeTab"><el-tab-pane label="After" name="after" /></el-tabs>
+        <AfterList v-if="activeTab === 'after'" />
+        </template>
+        <script setup>import AfterList from "./after/afterList.vue";</script>''',
+        encoding="utf-8",
+    )
+    (views / "after" / "afterList.vue").write_text("<template />", encoding="utf-8")
+    payload = {
+        "data": {"funcPerm": [{
+            "funcCode": "PROJECT_MANAGE",
+            "path": "/projectManage",
+            "component": "/srcEi/views/projectManage/index",
+            "meta": {"title": "External investment"},
+            "children": [],
+        }]},
+        "_detailFatherTrees": [{
+            "fatherId": "30022",
+            "sourceComponent": "projectManage/after/afterManage",
+            "nodes": [{
+                "funcCode": "AFTER_BASE",
+                "meta": {"title": "After detail"},
+                "children": [],
+            }],
+        }],
+    }
+
+    items = modules_from_menu(payload, tmp_path)
+    detail = next(item for item in items if item.id == "detail:father:30022:AFTER_BASE")
+
+    assert detail.path == ("External investment", "After", "详情", "After detail")
+    assert detail.route == "/projectManage/detail"
+    assert detail.requires_business_id
 
 
 def test_runtime_menu_does_not_attach_father_tree_when_owner_is_ambiguous(tmp_path):
@@ -462,6 +559,47 @@ def test_runtime_menu_attaches_actions_to_detail_nodes(tmp_path):
     ]
     assert all(item.requires_business_id for item in actions)
     assert all(not item.runnable for item in actions)
+
+
+def test_runtime_menu_attaches_permissions_filtered_actions_to_father_detail_nodes(tmp_path):
+    root = tmp_path / "ei-view" / "src" / "views" / "projectManage"
+    (root / "after" / "agreement").mkdir(parents=True)
+    (root / "index.vue").write_text("<template />", encoding="utf-8")
+    (root / "after" / "agreement" / "index.vue").write_text(
+        '''<el-button v-if="$hasButton('detail_edit')">Edit</el-button>
+        <el-button v-if="$hasButton('detail_delete')">Delete</el-button>''',
+        encoding="utf-8",
+    )
+    payload = {
+        "data": {"funcPerm": [{
+            "funcCode": "PROJECT_MANAGE",
+            "path": "/projectManage",
+            "component": "projectManage/index",
+            "meta": {"title": "External investment"},
+            "children": [],
+        }]},
+        "_buttonCodes": ["detail_edit"],
+        "_detailFatherTrees": [{
+            "fatherId": "30022",
+            "sourceComponent": "projectManage/after/afterManage",
+            "nodes": [{
+                "funcCode": "AFTER_AGREEMENT",
+                "component": "projectManage/after/agreement/index",
+                "meta": {"title": "Agreement"},
+                "children": [],
+            }],
+        }],
+    }
+
+    items = modules_from_menu(payload, tmp_path)
+    actions = [
+        item for item in items
+        if item.id.startswith("detail:father:30022:AFTER_AGREEMENT::action::")
+    ]
+
+    assert [item.operation for item in actions] == ["Edit"]
+    assert actions[0].path[-2:] == ("Agreement", "Edit")
+    assert actions[0].requires_business_id and not actions[0].runnable
 
 
 def test_runtime_menu_ignores_legacy_visible_action_snapshot(tmp_path):

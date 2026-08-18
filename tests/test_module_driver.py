@@ -7750,6 +7750,72 @@ def test_configured_collection_row_preserves_existing_values_and_fills_only_empt
     assert filled == [("items.2.missing", "generated", scopes["空值"], 50)]
 
 
+@pytest.mark.parametrize(("mode", "expected", "generated_count"), [
+    ("probe", "1", 0),
+    ("standard", "99", 1),
+])
+def test_configured_collection_probe_value_is_quick_probe_only(
+    mode, expected, generated_count,
+):
+    class Control:
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def input_value():
+            return ""
+
+    class Controls:
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def nth(_index):
+            return Control()
+
+    class ChildScope:
+        @staticmethod
+        def locator(_selector):
+            return Controls()
+
+    child = DynamicCollectionChild(
+        "items.{index}.amount",
+        "input",
+        kind="number",
+        label="金额",
+        probe_value=1,
+    )
+    spec = DynamicCollectionSpec(
+        field_code="items",
+        mode="add-row",
+        root_selector=".items",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(child,),
+    )
+    generated = []
+    driver = object.__new__(ModuleSmokeDriver)
+    driver._configured_collection_child_scope = lambda *_args: ChildScope()
+    driver._dom_field_has_value = lambda *_args, **_kwargs: False
+    driver.data_strategy = type("Strategy", (), {
+        "data_mode": mode,
+        "value_for": lambda self, definition, index: generated.append(
+            (definition.field_code, index)
+        ) or 99,
+    })()
+    driver.interactor = type("Interactor", (), {
+        "fill": lambda self, resolved, value, **_kwargs: str(value),
+    })()
+
+    submitted = driver._fill_configured_collection_row(spec, object(), 0)
+
+    assert submitted == {"items.0.amount": expected}
+    assert len(generated) == generated_count
+
+
 def test_configured_collection_row_adjusts_only_generated_value_for_lte_relation():
     class Control:
         def __init__(self):

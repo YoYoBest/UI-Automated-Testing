@@ -1105,6 +1105,7 @@ def group_action_commands(commands):
             "action": target.operation,
             "action_path": list(target.operation_path),
             "form_url": command_env.get("EI_FORM_URL", ""),
+            "entry_url": command_env.get("EI_ENTRY_URL", ""),
             "component": target.component,
             "form_code": target.form_code,
             "require_add": command_env.get("EI_REQUIRE_ADD", ""),
@@ -1197,13 +1198,15 @@ def command_preflight_commands(command):
         actions = json.loads(raw_actions)
     except (TypeError, json.JSONDecodeError):
         return [command]
-    if not isinstance(actions, list) or not actions:
+    if (
+        not isinstance(actions, list)
+        or not actions
+        or not all(isinstance(action, dict) for action in actions)
+    ):
         return [command]
 
     logical_commands = []
     for action in actions:
-        if not isinstance(action, dict):
-            continue
         module_name = str(
             action.get("module_name") or action.get("action") or target.name
         ).strip()
@@ -1237,6 +1240,10 @@ def command_preflight_commands(command):
                 logical_target.requires_business_id
             ).lower(),
         })
+        if entry_url := str(action.get("entry_url") or "").strip():
+            logical_env["EI_ENTRY_URL"] = entry_url
+        else:
+            logical_env.pop("EI_ENTRY_URL", None)
         if action_path:
             logical_env["EI_ACTION_PATH"] = json.dumps(
                 action_path, ensure_ascii=False,
@@ -1271,19 +1278,24 @@ def filter_environment_preflight_commands(commands, probe_results):
             runnable_commands.append(command)
             continue
         kept_actions = []
+        kept_logical_commands = []
         for action, logical_command in zip(actions, logical_commands):
             logical_runnable, blocked = block_unavailable_commands(
                 [logical_command], probe_results,
             )
             if logical_runnable:
                 kept_actions.append(action)
+                kept_logical_commands.append(logical_command)
             environment_blocks.extend(blocked)
         if kept_actions:
-            filtered_env = command_env.copy()
+            first_target, filtered_env, test_file = kept_logical_commands[0]
+            filtered_env = filtered_env.copy()
+            filtered_env["EI_ACTION"] = "批量操作"
+            filtered_env.pop("EI_ACTION_PATH", None)
             filtered_env["EI_ACTIONS_JSON"] = json.dumps(
                 kept_actions, ensure_ascii=False,
             )
-            runnable_commands.append((command[0], filtered_env, command[2]))
+            runnable_commands.append((first_target, filtered_env, test_file))
     return runnable_commands, environment_blocks
 
 
@@ -2395,6 +2407,10 @@ class Launcher(tk.Tk):
                 "EI_ACTION": target.operation,
                 "EI_REQUIRES_BUSINESS_ID": str(target.requires_business_id).lower(),
             })
+            if target.tab_label:
+                command_env["EI_PAGE_TAB"] = target.tab_label
+            else:
+                command_env.pop("EI_PAGE_TAB", None)
             if target.requires_business_id:
                 command_env["EI_ENTRY_URL"] = detail_parent_url(form_url)
             else:
@@ -2503,6 +2519,14 @@ class Launcher(tk.Tk):
                     environment_blocks,
                     environment_warnings,
                 )
+                if environment_blocks:
+                    runnable_target_count = len(command_target_names(commands))
+                    self.after(
+                        0,
+                        self.status.set,
+                        f"环境预检已阻断 {len(environment_blocks)} 个目标；"
+                        f"{runnable_target_count} 个目标继续执行，正在收集用例...",
+                    )
 
             command_entries = [
                 (str(index), target, command_env, test_file)

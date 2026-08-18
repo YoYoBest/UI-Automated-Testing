@@ -25,6 +25,9 @@ TITLED_ACTION_PATTERN = re.compile(
     r"<PurvarExport\b[^>]*\btitle=['\"]([^'\"]+)['\"][^>]*/?>",
     re.I | re.S,
 )
+TAB_PANE_PATTERN = re.compile(
+    r"<el-tab-pane\b(?P<attrs>[^>]*)/?>", re.I | re.S,
+)
 NON_PAGE_ACTIONS = {"保存", "确定", "取消", "关闭", "提交"}
 DIALOG_ACTION_PREFIXES = (
     "新增", "编辑", "查看", "详情", "配置", "设置", "分配", "选择",
@@ -47,6 +50,9 @@ class ModuleItem:
     operation: str = ""
     operation_path: tuple[str, ...] = ()
     permission_codes: tuple[str, ...] = ()
+    tab_label: str = ""
+    tab_value: str = ""
+    tab_owner_component: str = ""
 
 
 def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
@@ -62,12 +68,16 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
     by_component = {
         _source_identity(item): item
         for item in source_items
-        if item.component and not item.operation
+        if item.component and not item.operation and not item.tab_label
     }
     actions_by_component: dict[str, list[ModuleItem]] = {}
     for item in source_items:
         if item.component and item.operation:
             actions_by_component.setdefault(_source_identity(item), []).append(item)
+    tabs_by_owner: dict[str, list[ModuleItem]] = {}
+    for item in source_items:
+        if item.tab_label and item.tab_owner_component:
+            tabs_by_owner.setdefault(_tab_owner_identity(item), []).append(item)
     granted_button_codes = (
         set(payload.get("_buttonCodes", [])) if isinstance(payload, dict) and "_buttonCodes" in payload
         else None
@@ -157,26 +167,6 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
             detail_route = f"/{prefix.strip('_')}/detail"
         owner_path = owner.path if owner else (owner_name,)
         _append_detail_modules(result, nodes, owner_path + ("详情",), detail_route, prefix, by_component)
-    detail_father_trees = payload.get("_detailFatherTrees", []) if isinstance(payload, dict) else []
-    for tree in detail_father_trees if isinstance(detail_father_trees, list) else []:
-        if not isinstance(tree, dict):
-            continue
-        nodes = tree.get("nodes")
-        source_component = str(tree.get("sourceComponent") or "")
-        father_id = str(tree.get("fatherId") or "")
-        if not isinstance(nodes, list) or not source_component or not father_id:
-            continue
-        owner = _detail_father_tree_owner(result, source_component)
-        if owner is None or not owner.route:
-            continue
-        _append_detail_modules(
-            result,
-            nodes,
-            owner.path + ("详情",),
-            owner.route.rstrip("/") + "/detail",
-            f"father:{father_id}",
-            by_component,
-        )
     page_items = list(result)
     page_bindings: list[tuple[ModuleItem, ModuleItem | None, ModuleItem | None]] = []
     for item in page_items:
@@ -214,14 +204,23 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
         identity = _operation_owner_identity(item, structural_source)
         if owner_indexes.get(identity) != index:
             continue
-        source_actions = actions_by_component.get(_source_identity(structural_source), [])
-        structural_actions = [action for action in source_actions if action.operation_path]
-        action_items = structural_actions if source is None else [
-            action for action in source_actions
-            if granted_button_codes is None
-            or not action.permission_codes
-            or bool(granted_button_codes.intersection(action.permission_codes))
-        ]
+        if not item.requires_business_id:
+            for position, tab in enumerate(tabs_by_owner.get(_source_identity(structural_source), [])):
+                result.append(ModuleItem(
+                    id=f"{item.id}::tab::{tab.tab_value or position}",
+                    name=tab.name,
+                    path=item.path + (tab.name,),
+                    source_file=tab.source_file,
+                    component=tab.component,
+                    route=item.route,
+                    runnable=bool(item.route),
+                    tab_label=tab.tab_label,
+                    tab_value=tab.tab_value,
+                    tab_owner_component=tab.tab_owner_component,
+                ))
+        action_items = _actions_for_source_binding(
+            source, structural_source, actions_by_component, granted_button_codes
+        )
         for position, action in enumerate(action_items):
             operation_tail = (
                 action.path[-(len(action.operation_path) + 1):]
@@ -243,6 +242,29 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
                 operation_path=action.operation_path,
                 permission_codes=action.permission_codes,
             ))
+    detail_father_trees = payload.get("_detailFatherTrees", []) if isinstance(payload, dict) else []
+    for tree in detail_father_trees if isinstance(detail_father_trees, list) else []:
+        if not isinstance(tree, dict):
+            continue
+        nodes = tree.get("nodes")
+        source_component = str(tree.get("sourceComponent") or "")
+        father_id = str(tree.get("fatherId") or "")
+        if not isinstance(nodes, list) or not source_component or not father_id:
+            continue
+        owner = _detail_father_tree_owner(result, source_component)
+        if owner is None or not owner.route:
+            continue
+        _append_detail_modules(
+            result,
+            nodes,
+            owner.path + ("详情",),
+            owner.route.rstrip("/") + "/detail",
+            f"father:{father_id}",
+            by_component,
+        )
+    _append_father_detail_actions(
+        result, by_component, actions_by_component, granted_button_codes
+    )
     return result
 
 
@@ -285,17 +307,90 @@ def _append_detail_modules(
         _append_detail_modules(result, children, item_path, detail_route, prefix, by_component)
 
 
+def _actions_for_source_binding(
+    source: ModuleItem | None,
+    structural_source: ModuleItem,
+    actions_by_component: dict[str, list[ModuleItem]],
+    granted_button_codes: set[str] | None,
+) -> list[ModuleItem]:
+    source_actions = actions_by_component.get(_source_identity(structural_source), [])
+    structural_actions = [action for action in source_actions if action.operation_path]
+    if source is None:
+        return structural_actions
+    return [
+        action for action in source_actions
+        if granted_button_codes is None
+        or not action.permission_codes
+        or bool(granted_button_codes.intersection(action.permission_codes))
+    ]
+
+
+def _append_father_detail_actions(
+    result: list[ModuleItem],
+    by_component: dict[str, ModuleItem],
+    actions_by_component: dict[str, list[ModuleItem]],
+    granted_button_codes: set[str] | None,
+) -> None:
+    """Attach source-confirmed operations to father-ID detail nodes added after page actions."""
+    detail_items = [
+        item for item in result
+        if item.id.startswith("detail:father:") and not item.operation
+    ]
+    for item in detail_items:
+        source = _resolve_source_item(item.component, item.route, item.id, by_component)
+        structural_source = source or _resolve_source_item(
+            item.component, item.route, item.id, by_component, allow_legacy_alias=True
+        )
+        if structural_source is None:
+            continue
+        for position, action in enumerate(_actions_for_source_binding(
+            source, structural_source, actions_by_component, granted_button_codes
+        )):
+            operation_tail = (
+                action.path[-(len(action.operation_path) + 1):]
+                if action.operation_path else (action.operation,)
+            )
+            result.append(ModuleItem(
+                id=f"{item.id}::action::{position}",
+                name=action.operation,
+                path=item.path + operation_tail,
+                source_file=action.source_file or item.source_file,
+                component=action.component or item.component,
+                route=item.route,
+                form_code=action.form_code or item.form_code,
+                runnable=False,
+                requires_business_id=True,
+                operation=action.operation,
+                operation_path=action.operation_path,
+                permission_codes=action.permission_codes,
+            ))
+
+
 def _detail_father_tree_owner(
     items: list[ModuleItem], source_component: str,
 ) -> ModuleItem | None:
-    """Resolve a father-ID tree owner from the source component, never from its title."""
+    """Resolve a father-ID tree owner from source paths, never from a title."""
     target = _normalize_component(source_component)
     if not target:
+        return None
+    tab_candidates = []
+    for item in items:
+        if item.id == "ALL" or item.operation or not item.tab_label:
+            continue
+        tab_directory = _normalize_component(item.component).rsplit("/", 1)[0]
+        if tab_directory and target.startswith(tab_directory + "/"):
+            tab_candidates.append((len(tab_directory), item))
+    if tab_candidates:
+        best_depth = max(depth for depth, _item in tab_candidates)
+        best_tabs = [item for depth, item in tab_candidates if depth == best_depth]
+        if len(best_tabs) == 1:
+            return best_tabs[0]
         return None
     candidates = [
         item for item in items
         if item.id != "ALL"
         and not item.operation
+        and not item.tab_label
         and not _is_container_component(item.component)
         and (component := _normalize_component(item.component))
         and target.startswith(component + "/")
@@ -311,14 +406,16 @@ def _detail_father_tree_owner(
 
 
 def _normalize_component(value: str) -> str:
-    normalized = value.replace("\\", "/").strip().removeprefix("@/").removeprefix("/")
+    normalized = (
+        value.replace("\\", "/").strip().removeprefix("@/").removeprefix("/").lower()
+    )
     normalized = (
         normalized.removeprefix("srcei/views/")
         .removeprefix("src/views/")
         .removeprefix("views/")
     )
     normalized = re.sub(r"\.vue$", "", normalized, flags=re.I)
-    return normalized.removesuffix("/index").lower()
+    return normalized.removesuffix("/index")
 
 
 def _is_container_component(value: str) -> bool:
@@ -334,6 +431,12 @@ def _source_identity(item: ModuleItem) -> str:
     source_file = item.source_file.replace("\\", "/").lower()
     source_root = source_file.split("/", 1)[0] if "/" in source_file else ""
     return f"{source_root}:{_normalize_component(item.component)}"
+
+
+def _tab_owner_identity(item: ModuleItem) -> str:
+    source_file = item.source_file.replace("\\", "/").lower()
+    source_root = source_file.split("/", 1)[0] if "/" in source_file else ""
+    return f"{source_root}:{_normalize_component(item.tab_owner_component)}"
 
 
 def _operation_owner_identity(item: ModuleItem, source: ModuleItem) -> tuple[str, str, str, str]:
@@ -744,6 +847,78 @@ def _dialog_section_actions(
     return actions
 
 
+def _static_page_tabs(
+    view_root: Path,
+    views_root: Path,
+    page: Path,
+    text: str,
+    owner: ModuleItem,
+) -> list[ModuleItem]:
+    """Return statically declared page tabs with a proven local component."""
+    template = re.search(r"<template\b[^>]*>(.*?)</template>", text, re.I | re.S)
+    if not template:
+        return []
+    imports = {
+        match.group(1): match.group(2)
+        for match in re.finditer(
+            r"\bimport\s+([A-Z][\w]*)\s+from\s+['\"]([^'\"]+\.vue)['\"]", text
+        )
+    }
+    tabs: list[ModuleItem] = []
+    body = template.group(1)
+    for tab_group in re.finditer(r"<el-tabs\b(?P<attrs>[^>]*)>(?P<body>.*?)</el-tabs>", body, re.I | re.S):
+        model = re.search(r"\bv-model\s*=\s*['\"]([A-Za-z_$][\w$]*)['\"]", tab_group.group("attrs"))
+        if model is None:
+            continue
+        panes: list[tuple[str, str]] = []
+        for pane in TAB_PANE_PATTERN.finditer(tab_group.group("body")):
+            attrs = pane.group("attrs")
+            label = re.search(r"\blabel\s*=\s*(['\"])([^'\"]+)\1", attrs)
+            value = re.search(r"\bname\s*=\s*(['\"])([^'\"]+)\1", attrs)
+            if label and value:
+                panes.append((html.unescape(label.group(2)).strip(), value.group(2).strip()))
+        if not panes:
+            continue
+
+        bound_components: dict[str, str] = {}
+        fallback_components: list[str] = []
+        for component in re.finditer(r"<([A-Z][\w]*)\b(?P<attrs>[^>]*)/?>", body):
+            component_name, attrs = component.group(1), component.group("attrs")
+            if component_name not in imports:
+                continue
+            conditional = re.search(
+                rf"\bv-if\s*=\s*['\"]\s*{re.escape(model.group(1))}\s*===\s*['\"]([^'\"]+)['\"]\s*['\"]",
+                attrs,
+            )
+            if conditional:
+                bound_components[conditional.group(1)] = component_name
+            elif re.search(r"\bv-else(?:\s|$)", attrs) and "v-else-if" not in attrs:
+                fallback_components.append(component_name)
+
+        remaining_fallbacks = iter(fallback_components)
+        for label, value in panes:
+            component_name = bound_components.get(value)
+            if component_name is None:
+                component_name = next(remaining_fallbacks, "")
+            reference = imports.get(component_name or "", "")
+            component = _resolve_view_component(views_root, page, reference) if reference else None
+            if component is None:
+                continue
+            relative = component.relative_to(views_root).with_suffix("").as_posix()
+            tabs.append(ModuleItem(
+                id=f"{owner.id}::tab-source::{value}",
+                name=label,
+                path=owner.path + (label,),
+                source_file=str(component.relative_to(view_root)),
+                component=relative,
+                runnable=True,
+                tab_label=label,
+                tab_value=value,
+                tab_owner_component=owner.component,
+            ))
+    return tabs
+
+
 def discover_modules(source_root: Path) -> list[ModuleItem]:
     view_root = resolve_view_root(source_root)
     items: list[ModuleItem] = [ModuleItem("ALL", "全部模块", ("ALL",))]
@@ -752,13 +927,7 @@ def discover_modules(source_root: Path) -> list[ModuleItem]:
         if not views_root.is_dir():
             continue
         files = sorted(p for p in views_root.rglob("*.vue") if p.name.lower() in ENTRY_NAMES)
-        candidates: dict[
-            str,
-            tuple[
-                tuple[int, int], ModuleItem, tuple[str, ...], list[tuple[str, str, str, str]],
-                dict[str, tuple[str, ...]],
-            ],
-        ] = {}
+        candidates: dict[str, tuple] = {}
         for page in files:
             relative = page.relative_to(views_root)
             key = f"{views_root.parent.name.lower()}:{relative.as_posix().lower()}"
@@ -788,12 +957,14 @@ def discover_modules(source_root: Path) -> list[ModuleItem]:
                 candidates[directory_key] = (
                     score,
                     item,
+                    _static_page_tabs(view_root, views_root, page, text, item),
                     page_actions,
                     _dialog_section_actions(views_root, page, text, page_actions),
                     action_permissions,
                 )
-        for _score, item, actions, dialog_actions, action_permissions in candidates.values():
+        for _score, item, tabs, actions, dialog_actions, action_permissions in candidates.values():
             items.append(item)
+            items.extend(tabs)
             flat_action_items = [
                 ModuleItem(
                     id=f"{item.id}::action::{position}",

@@ -39,6 +39,13 @@ def test_father_detail_tree_capture_reuses_menu_auth_and_source_proxy_path(tmp_p
     (views / "detail.vue").write_text(
         'CommonAPI.getUserFuncPermTree({ fatherId: "30021" })', encoding="utf-8"
     )
+    after = view / "src" / "views" / "projectManage" / "after" / "afterManage.vue"
+    after.parent.mkdir(parents=True)
+    after.write_text(
+        '''const fatherId = computed(() => String(route.query.fatherId || "30022"));
+        CommonAPI.getUserFuncPermTree({ fatherId: fatherId.value })''',
+        encoding="utf-8",
+    )
     context = _Context()
 
     trees = _capture_detail_father_trees(
@@ -51,11 +58,22 @@ def test_father_detail_tree_capture_reuses_menu_auth_and_source_proxy_path(tmp_p
     )
 
     assert trees == [{
+        "fatherId": "30022",
+        "sourceComponent": "projectManage/after/afterManage",
+        "nodes": [{"funcCode": "OVERVIEW"}],
+    }, {
         "fatherId": "30021",
         "sourceComponent": "projectManage/before/detail",
         "nodes": [{"funcCode": "OVERVIEW"}],
     }]
     assert context.request.calls == [(
+        "https://example.test/ezgo/ei-service/funcPerm/getUserFuncPermTree",
+        {
+            "params": {"appId": "10015", "fatherId": "30022"},
+            "headers": {"authorization": "masked", "x-tenant-id": "tenant"},
+            "timeout": 1234,
+        },
+    ), (
         "https://example.test/ezgo/ei-service/funcPerm/getUserFuncPermTree",
         {
             "params": {"appId": "10015", "fatherId": "30021"},

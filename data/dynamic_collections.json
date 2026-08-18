@@ -100,21 +100,24 @@
           "selector": "input",
           "kind": "text",
           "label": "被投资企业名称",
-          "maxLength": 50
+          "maxLength": 50,
+          "probeValue": "UI探测企业"
         },
         {
           "fieldCodeTemplate": "entInvestList.{index}.fundedRatio",
           "columnHeader": "持股比例(%)",
           "selector": "input",
           "kind": "number",
-          "label": "持股比例(%)"
+          "label": "持股比例(%)",
+          "probeValue": 1
         },
         {
           "fieldCodeTemplate": "entInvestList.{index}.subscribedCapital",
           "columnHeader": "投资额(万元)",
           "selector": ".amount-with-currency__amount input",
           "kind": "number",
-          "label": "投资额(万元)"
+          "label": "投资额(万元)",
+          "probeValue": 1
         },
         {
           "fieldCodeTemplate": "entInvestList.{index}.subscribedCapitalCcy",

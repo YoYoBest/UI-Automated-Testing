@@ -351,10 +351,14 @@ def _coerce_action_path(value: Any) -> tuple[str, ...]:
 def _normalize_component(value: str) -> str:
     component = value.strip().replace("\\", "/").split("?", 1)[0].split("#", 1)[0]
     component = component.lstrip("/")
-    for prefix in ("@/", "src/views/", "srcEi/views/", "views/"):
-        if component.startswith(prefix):
-            component = component[len(prefix):]
-            break
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("@/", "src/views/", "srcEi/views/", "views/"):
+            if component.startswith(prefix):
+                component = component[len(prefix):]
+                changed = True
+                break
     return component.removesuffix(".vue").strip("/")
 
 
@@ -363,7 +367,7 @@ def probe_environment_apis(
     *,
     base_url: str,
     storage_state: str = "",
-    request: Callable[..., tuple[int, Mapping[str, str]]] | None = None,
+    request: Callable[..., tuple[Any, ...]] | None = None,
 ) -> list[ApiProbeResult]:
     requester = request or _http_request
     results = []
@@ -390,7 +394,7 @@ def probe_environment_apis(
                     _header_value(headers, probe.version_header) or deployed_version
                 )
                 step_results.append(ApiProbeStepResult(
-                    step.id, step.method, current_url, terminal_status,
+                    step.id, step.method, _report_url(current_url), terminal_status,
                 ))
                 if not 200 <= terminal_status < 300:
                     break
@@ -404,7 +408,7 @@ def probe_environment_apis(
                                 f"步骤 {step.id} 的成功响应未包含链式变量 {variable}"
                             )
                             step_results[-1] = ApiProbeStepResult(
-                                step.id, step.method, current_url,
+                                step.id, step.method, _report_url(current_url),
                                 step_results[-1].status, terminal_error,
                             )
                             break
@@ -415,11 +419,11 @@ def probe_environment_apis(
                 terminal_status = None
                 terminal_error = str(exc)
                 step_results.append(ApiProbeStepResult(
-                    step.id, step.method, current_url, None, terminal_error,
+                    step.id, step.method, _report_url(current_url), None, terminal_error,
                 ))
                 break
         results.append(ApiProbeResult(
-            probe, current_url, terminal_status, deployed_version,
+            probe, _report_url(current_url), terminal_status, deployed_version,
             terminal_error, tuple(step_results),
         ))
     return results
@@ -479,6 +483,11 @@ def _service_url(base_url: str, path: str) -> str:
         raise EnvironmentProbeConfigError(f"目标环境地址无效：{base_url}")
     relative = urlsplit(path)
     return urlunsplit((parsed.scheme, parsed.netloc, relative.path, relative.query, ""))
+
+
+def _report_url(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _http_request(

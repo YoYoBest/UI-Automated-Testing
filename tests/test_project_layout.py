@@ -45,7 +45,20 @@ def test_discovers_static_detail_father_tree_requests(tmp_path):
     dynamic.write_text(
         "CommonAPI.getUserFuncPermTree({ fatherId: fatherId.value })", encoding="utf-8"
     )
+    after_manage = view / "src" / "views" / "projectManage" / "after" / "afterManage.vue"
+    after_manage.write_text(
+        '''const fatherId = computed(() => String(route.query.fatherId || "30022"));
+        CommonAPI.getUserFuncPermTree({ fatherId: fatherId.value })''',
+        encoding="utf-8",
+    )
+    legacy_detail = view / "srcEi" / "views" / "projectManage" / "legacy" / "detail.vue"
+    legacy_detail.parent.mkdir(parents=True)
+    legacy_detail.write_text(
+        'CommonAPI.getUserFuncPermTree({ fatherId: "30023" })', encoding="utf-8"
+    )
 
     assert discover_detail_father_tree_requests(tmp_path) == (
+        DetailFatherTreeRequest("30022", "projectManage/after/afterManage"),
         DetailFatherTreeRequest("30021", "projectManage/before/detail"),
+        DetailFatherTreeRequest("30023", "projectManage/legacy/detail"),
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +15,7 @@ class DynamicCollectionChild:
     required: bool = True
     column_header: str = ""
     max_length: int | None = None
+    probe_value: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +127,11 @@ def _parse_child(value: object, path: Path) -> DynamicCollectionChild:
         raise ValueError(f"{path} 的集合子字段 maxLength 必须是正整数") from exc
     if max_length is not None and max_length < 1:
         raise ValueError(f"{path} 的集合子字段 maxLength 必须是正整数")
+    probe_value = value.get("probeValue")
+    if probe_value is not None and not isinstance(
+        probe_value, (str, int, float, bool)
+    ):
+        raise ValueError(f"{path} 的集合子字段 probeValue 必须是标量")
     child = DynamicCollectionChild(
         field_code_template=str(value.get("fieldCodeTemplate") or "").strip(),
         selector=str(value.get("selector") or "").strip(),
@@ -133,6 +140,7 @@ def _parse_child(value: object, path: Path) -> DynamicCollectionChild:
         required=bool(value.get("required", True)),
         column_header=str(value.get("columnHeader") or "").strip(),
         max_length=max_length,
+        probe_value=probe_value,
     )
     if "{index}" not in child.field_code_template or not child.selector:
         raise ValueError(f"{path} 的集合子字段缺少数组路径或 selector")

@@ -1,6 +1,6 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
-import json
 
 import ei_ui_smoke.launcher as launcher_module
 
@@ -70,7 +70,7 @@ from ei_ui_smoke.launcher import (
     DEFER_SKILL_GATE_ENV,
     Launcher,
 )
-from ei_ui_smoke.environment_api import EnvironmentBlock
+from ei_ui_smoke.environment_api import ApiProbe, ApiProbeResult, EnvironmentBlock
 from ei_ui_smoke.execution_guard import RuntimeVersion, runtime_version_changed, runtime_version_mismatch_message
 
 
@@ -1269,7 +1269,7 @@ def test_all_actions_are_grouped_into_one_browser_command():
     assert pool_actions[2]["component"] == "other/index"
 
 
-def test_environment_preflight_filters_only_dependent_grouped_actions(monkeypatch):
+def test_environment_preflight_filters_only_dependent_grouped_actions():
     paths = [
         (),
         ("新增", "股权结构", "新增"),
@@ -1299,28 +1299,29 @@ def test_environment_preflight_filters_only_dependent_grouped_actions(monkeypatc
             "tests/test_module_action.py",
         ))
     grouped = group_action_commands(commands)
-    blocked_paths = {
+    blocked_paths = (
         ("新增", "股权结构", "删除"),
         ("新增", "对外投资", "新增"),
-    }
-
-    def block_logical_action(logical_commands, _results):
-        target, environment, _test_file = logical_commands[0]
-        action_path = tuple(json.loads(environment.get("EI_ACTION_PATH", "[]")))
-        if action_path not in blocked_paths:
-            return logical_commands, []
-        return [], [EnvironmentBlock(
-            " / ".join(target.path), "resource-pool-enterprise-sections",
-            "https://env/ei-service/project/projStorage/detail/1", 500,
-        )]
-
-    monkeypatch.setattr(
-        launcher_module, "block_unavailable_commands", block_logical_action,
+    )
+    probe = ApiProbe(
+        id="resource-pool-enterprise-sections",
+        form_codes=("POOL_RESOURCE",),
+        components=("projectResourcePool/index",),
+        method="GET", path="/detail", body=None,
+        action_paths=blocked_paths,
+        capability_name="资源池企业子表能力",
+        capability_failure_statuses=(500,),
     )
 
-    runnable, blocked = filter_environment_preflight_commands(grouped, [object()])
+    runnable, blocked = filter_environment_preflight_commands(grouped, [
+        ApiProbeResult(
+            probe, "https://env/ei-service/project/projStorage/detail/1", 500,
+        )
+    ])
 
     assert len(runnable) == 1
+    assert runnable[0][0].id == "POOL::action::2"
+    assert runnable[0][1]["EI_FORM_URL"] == "https://env/ei-view/#/projectPool"
     retained = json.loads(runnable[0][1]["EI_ACTIONS_JSON"])
     assert [tuple(action["action_path"]) for action in retained] == [
         (),
@@ -1333,11 +1334,14 @@ def test_environment_preflight_filters_only_dependent_grouped_actions(monkeypatc
     assert [block.target_name for block in blocked] == [
         "资源池 / 股权结构 / 删除", "资源池 / 对外投资 / 新增",
     ]
+    assert all(
+        block.classification == "environment-capability-unavailable"
+        and block.capability_name == "资源池企业子表能力"
+        for block in blocked
+    )
 
 
-def test_environment_preflight_drops_a_group_only_when_every_action_is_blocked(
-    monkeypatch,
-):
+def test_environment_preflight_drops_a_group_only_when_every_action_is_blocked():
     first = ModuleItem(
         id="POOL::action::4", name="删除", path=("资源池", "股权结构", "删除"),
         component="projectResourcePool/index", form_code="POOL_RESOURCE",
@@ -1353,18 +1357,19 @@ def test_environment_preflight_drops_a_group_only_when_every_action_is_blocked(
         (second, {"EI_ACTION": "新增"}, "tests/test_module_action.py"),
     ])
 
-    def block_every_action(logical_commands, _results):
-        target = logical_commands[0][0]
-        return [], [EnvironmentBlock(
-            " / ".join(target.path), "resource-pool-enterprise-sections",
-            "https://env/detail", 500,
-        )]
-
-    monkeypatch.setattr(
-        launcher_module, "block_unavailable_commands", block_every_action,
+    probe = ApiProbe(
+        id="resource-pool-enterprise-sections",
+        form_codes=("POOL_RESOURCE",),
+        components=("projectResourcePool/index",),
+        method="GET", path="/detail", body=None,
+        action_paths=(first.operation_path, second.operation_path),
+        capability_name="资源池企业子表能力",
+        capability_failure_statuses=(500,),
     )
 
-    runnable, blocked = filter_environment_preflight_commands(grouped, [object()])
+    runnable, blocked = filter_environment_preflight_commands(
+        grouped, [ApiProbeResult(probe, "https://env/detail", 500)],
+    )
 
     assert runnable == []
     assert len(blocked) == 2

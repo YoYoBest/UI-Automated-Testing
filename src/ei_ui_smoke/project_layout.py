@@ -65,25 +65,53 @@ def discover_detail_prefixes(source_root: Path) -> tuple[str, ...]:
 
 
 def discover_detail_father_tree_requests(source_root: Path) -> tuple[DetailFatherTreeRequest, ...]:
-    """Find static ``getUserFuncPermTree({ fatherId: ... })`` calls in detail views."""
+    """Find source-declared read-only detail-tree requests across both view roots."""
     view_root = resolve_view_root(source_root)
-    views_root = view_root / "src" / "views"
     request_pattern = re.compile(
         r"getUserFuncPermTree\s*\(\s*\{(?P<params>.*?)\}\s*\)", re.S
     )
-    father_id_pattern = re.compile(r"\bfatherId\s*:\s*['\"]([^'\"]+)['\"]")
+    father_id_pattern = re.compile(r"\bfatherId\s*:\s*(?P<value>[^,}\s]+)")
     requests: list[DetailFatherTreeRequest] = []
-    for path in sorted(views_root.rglob("*.vue")):
-        try:
-            text = path.read_text(encoding="utf-8-sig", errors="ignore")
-        except OSError:
+    for views_root in (view_root / "src" / "views", view_root / "srcEi" / "views"):
+        if not views_root.is_dir():
             continue
-        for match in request_pattern.finditer(text):
-            father_id = father_id_pattern.search(match.group("params"))
-            if father_id is None:
+        for path in sorted(views_root.rglob("*.vue")):
+            try:
+                text = path.read_text(encoding="utf-8-sig", errors="ignore")
+            except OSError:
                 continue
-            source_component = path.relative_to(views_root).with_suffix("").as_posix()
-            requests.append(DetailFatherTreeRequest(
-                father_id=father_id.group(1), source_component=source_component,
-            ))
+            for match in request_pattern.finditer(text):
+                father_id = father_id_pattern.search(match.group("params"))
+                if father_id is None:
+                    continue
+                resolved_father_id = _resolve_static_father_id(
+                    text, father_id.group("value")
+                )
+                if not resolved_father_id:
+                    continue
+                source_component = path.relative_to(views_root).with_suffix("").as_posix()
+                requests.append(DetailFatherTreeRequest(
+                    father_id=resolved_father_id, source_component=source_component,
+                ))
     return tuple(dict.fromkeys(requests))
+
+
+def _resolve_static_father_id(source: str, expression: str) -> str:
+    """Resolve a literal or a computed variable with one source-declared fallback."""
+    literal = re.fullmatch(r"['\"]([^'\"]+)['\"]", expression)
+    if literal:
+        return literal.group(1)
+    reference = re.fullmatch(r"(?P<name>[A-Za-z_$][\w$]*)(?:\.value)?", expression)
+    if reference is None:
+        return ""
+    name = re.escape(reference.group("name"))
+    declaration = re.search(
+        rf"\b(?:const|let)\s+{name}\s*=\s*(?P<value>[^;]+);", source, re.S
+    )
+    if declaration is None:
+        return ""
+    fallback = re.search(r"\|\|\s*['\"]([^'\"]+)['\"]", declaration.group("value"))
+    if fallback:
+        return fallback.group(1)
+    literal = re.fullmatch(r"\s*['\"]([^'\"]+)['\"]\s*", declaration.group("value"))
+    return literal.group(1) if literal else ""

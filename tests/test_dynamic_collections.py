@@ -125,6 +125,9 @@ def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_ch
     ]
     assert by_code["entInvestList"].children[0].max_length == 50
     assert [
+        child.probe_value for child in by_code["entInvestList"].children
+    ] == ["UI探测企业", 1, 1, None]
+    assert [
         (
             relation.left_field_template,
             relation.operator,
@@ -186,6 +189,29 @@ def test_dynamic_collection_child_rejects_invalid_max_length(
     )
 
     with pytest.raises(ValueError, match="maxLength 必须是正整数"):
+        load_dynamic_collection_specs(tmp_path, form_code="FORM_A")
+
+
+def test_dynamic_collection_child_rejects_structured_probe_value(tmp_path):
+    (tmp_path / "dynamic_collections.json").write_text(
+        json.dumps({"collections": [{
+            "formCode": "FORM_A",
+            "fieldCode": "items",
+            "mode": "add-row",
+            "rootSelector": ".root",
+            "createSelector": ".add",
+            "itemSelector": ".row",
+            "minRows": 1,
+            "children": [{
+                "fieldCodeTemplate": "items.{index}.name",
+                "selector": "input",
+                "probeValue": {"unsafe": "nested"},
+            }],
+        }]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="probeValue 必须是标量"):
         load_dynamic_collection_specs(tmp_path, form_code="FORM_A")
 
 

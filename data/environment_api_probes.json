@@ -20,7 +20,7 @@
         ["新增", "股权结构", "删除"],
         ["新增", "对外投资", "新增"]
       ],
-      "capabilityName": "资源池企业子表能力",
+      "capabilityName": "资源池企业子表详情读取能力",
       "capabilityFailureStatuses": [500],
       "steps": [
         {
@@ -40,7 +40,10 @@
         {
           "id": "resource-pool-enterprise-detail",
           "method": "GET",
-          "path": "/ezgo/ei-service/project/projStorage/detail?id={resourcePoolId}"
+          "path": "/ezgo/ei-service/project/projStorage/detail?id={resourcePoolId}",
+          "extract": {
+            "enterpriseSections": "data.entInvestList"
+          }
         }
       ]
     }

@@ -47,7 +47,8 @@ description: 在 UI-Smoke-Testing 中选择、扫描或排查 EI/FI 源项目模
 - 不因父节点自身也是一个详情节点而停止递归；例如必须完整保留并展示 `建设项目 / 详情 / 投前管理 / 项目立项|项目决策|重大调整`。
 - 运行时菜单出现连续同名父子节点时保留两层，因为外层可能是分组、内层才是真实页面。即使显示文字相同，也按不同菜单 ID、路由、组件和源码匹配结果建模；外层纯分组不可执行，内层页面与其他同级页面并列，并承载自己的 `formCode`、执行能力和操作节点。禁止为了视觉去重把真实页面合并到父分组。
 - 同一真实页面的平面操作、嵌套操作和详情树必须使用同一个 owner 路径。用“解析后的源码身份 + 规范化运行路由 + 执行域”确定操作 owner；普通菜单中同一身份只挂一组操作，优先源码匹配明确且路径更深的真实页面。连续同名父子场景中，菜单层级全部保留，但操作和详情都挂到具有真实组件和 `source_file` 的内层页面；不得出现“按钮挂内层页面、详情挂外层分组”或反向错挂。同一组件对应不同运行路由时分别保留操作；不同详情权限节点即使复用组件和详情路由，也按各自 `funcCode/id` 执行域分别保留。兄弟页面保持接口给出的同级关系。
-- 父 ID 详情树只按源码调用组件与运行时菜单组件的规范化路径前缀关联，不按中文标题猜测。选择唯一的最长前缀 owner；无候选或同级最长候选并列时不挂载。挂载路径为 `owner / 详情 / API children...`，使用 `owner.route + /detail` 并设置 `requires_business_id=True`；节点 ID 以 `detail:father:<fatherId>:` 隔离。
+- 父 ID 详情树只按源码调用组件与运行时菜单组件的规范化路径前缀关联，不按中文标题猜测。组件标准化必须先统一大小写，再移除 `/srcEi/views/`、`src/views/` 等源码根；页面有已确认页签时，先用详情来源与页签内容组件的共同目录选择唯一、最深的页签 owner，再回退到页面 owner；无候选或同级最深候选并列时不挂载。页签必须先生成、再挂载父 ID 详情树。挂载路径为 `owner / 详情 / API children...`，使用 `owner.route + /detail` 并设置 `requires_business_id=True`；节点 ID 以 `detail:father:<fatherId>:` 隔离。
+- 页面内页签不是权限菜单或详情树节点。只有同一入口源码能同时证明静态 `el-tab-pane` 的 `label`、固定 `name` 和对应的本地导入内容组件时，才生成 `页面 / 页签` 子模块；动态标签、缺少 `name`、未被激活分支引用、无法关联导入组件或仅展示的页签均不生成。页签继承父页面路由，但使用独立 `tab_label` 标记，不能伪造成按钮操作或详情模块。
 - 从每个页面或详情入口自身的 `index.vue`/`list.vue` 提取静态 `el-button`/`button` 文本，去重后作为操作节点挂到对应的运行时中文模块或详情节点下；排除保存、确定、取消、关闭、提交等弹窗内部动作。不要把同目录 `Modify.vue`、弹窗或通用 `components/component` 内部按钮提升成列表页操作。操作节点继承页面路由、组件、`formCode` 和 `requires_business_id`，并通过独立操作测试入口执行。
 - 当 `index.vue`/`list.vue` 的模板仅渲染一个显式 import 的本地 Vue 组件时，将其视为透明页面包装器，沿该唯一组件继续提取页面操作，并按绝对路径去重以防循环 import；模板包含布局、多个组件或其他页面内容时不得跟随，以免把普通子组件、弹窗和通用控件的按钮提升为页面操作。权限条件既可能写在按钮标签上，也可能写在其祖先容器上，必须把祖先 `$hasButton('code')` 关联到后代按钮后再与当前用户权限取交集。
 - 运行时 `component` 与源码入口不能只做字符串严格相等。依次使用标准化组件路径、唯一的 `funcCode/formCode`、运行路由与源码一级目录的唯一别名候选解析；最佳候选并列时保持未匹配，禁止猜测后错挂操作。普通菜单和详情菜单必须共用同一解析器。
@@ -75,6 +76,9 @@ description: 在 UI-Smoke-Testing 中选择、扫描或排查 EI/FI 源项目模
 - 登录后仍拿不到菜单：保留网络日志，核对真正成功的菜单请求、重定向后的业务应用地址和 storage state。
 
 ## 验证
+
+- Discover static father-ID detail trees from both `src/views` and `srcEi/views`, in stable source-root and source-path order. A detail route may pass `fatherId` through a computed route-query variable with a source-declared literal fallback; resolve that fallback only when it is explicit, then request the read-only tree. Attach the result only to the unique deepest page-tab component directory shared with the detail component. That tab must already be proven by its label, fixed name, local import, and active rendering branch in the Vue template. This preserves distinct before/after trees such as `projectManage/before` and `projectManage/after`; never copy one tree to a sibling tab or infer ownership from a title.
+- Father-ID detail nodes are added after primary page actions. Run the same source-component action binding after those nodes are appended: retain only source-confirmed operations and apply the current-user button-permission filter. A node with no unique source-component match must remain operation-free rather than inheriting a sibling's actions.
 
 ## 源码按钮与用户权限
 

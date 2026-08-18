@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +100,25 @@ def test_probe_manifest_loads_a_read_only_chain_and_exact_action_paths(tmp_path)
     assert [step.id for step in probe.steps] == ["list", "detail"]
     assert probe.action_paths == (("新增", "对外投资", "新增"),)
     assert probe.capability_failure_statuses == (500,)
+
+
+def test_repository_resource_pool_probe_is_detail_readback_only():
+    probes = load_environment_api_probes(
+        Path(__file__).resolve().parents[1] / "data" / "environment_api_probes.json"
+    )
+    probe = next(
+        item for item in probes
+        if item.id == "resource-pool-enterprise-sections"
+    )
+
+    assert probe.action_paths == (
+        ("新增", "股权结构", "删除"),
+        ("新增", "对外投资", "新增"),
+    )
+    assert probe.capability_name == "资源池企业子表详情读取能力"
+    assert probe.steps[-1].extracts == ((
+        "enterpriseSections", ("data.entInvestList",),
+    ),)
 
 
 @pytest.mark.parametrize("statuses", [[404], [200], [500, 601]])
@@ -202,12 +222,21 @@ def test_probe_action_matching_is_exact_for_grouped_operation_paths():
     equity_delete = {
         **outer_add, "action": "删除", "action_path": ["新增", "股权结构", "删除"],
     }
+    investment_add = {
+        **outer_add, "action_path": ["新增", "对外投资", "新增"],
+    }
 
     assert not probe_matches_action(probe, outer_add)
     assert not probe_matches_action(probe, equity_add)
     assert probe_matches_action(probe, equity_delete)
+    assert probe_matches_action(probe, investment_add)
     assert matching_probes([probe], {
         "EI_ACTIONS_JSON": json.dumps([outer_add, equity_delete], ensure_ascii=False),
+    }) == [probe]
+    assert matching_probes([probe], {
+        "EI_COMPONENT": "@/src/views/projectResourcePool/index.vue?cache=1",
+        "EI_ACTION": "新增",
+        "EI_ACTION_PATH": json.dumps(["新增", "对外投资", "新增"], ensure_ascii=False),
     }) == [probe]
 
 
@@ -246,7 +275,9 @@ def test_read_only_chain_extracts_an_existing_id_before_calling_detail():
     assert calls[0][1]["body"]["formCode"] == "POOL_RESOURCE"
     assert result.status == 500
     assert result.blocking_classification == "environment-capability-unavailable"
+    assert result.url == "https://env/ezgo/ei-service/project/projStorage/detail"
     assert [(step.id, step.status) for step in result.steps] == [("list", 200), ("detail", 500)]
+    assert all("pool%20id" not in step.url for step in result.steps)
 
 
 def test_chain_without_an_existing_id_is_inconclusive_and_does_not_call_detail():

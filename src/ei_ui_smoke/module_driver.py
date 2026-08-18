@@ -7557,8 +7557,17 @@ class ModuleSmokeDriver:
                 field_label=definition.field_name,
             ):
                 continue
-            value = self.data_strategy.value_for(
-                definition, value_offset + child_index
+            use_probe_value = (
+                str(getattr(self.data_strategy, "data_mode", "")).lower()
+                == "probe"
+                and child.probe_value is not None
+            )
+            value = (
+                child.probe_value
+                if use_probe_value
+                else self.data_strategy.value_for(
+                    definition, value_offset + child_index
+                )
             )
             actual = self.interactor.fill(
                 resolved, value, root=child_scope

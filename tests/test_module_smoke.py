@@ -9,6 +9,7 @@ from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
 from ei_ui_smoke.module_driver import ModuleSmokeDriver
 from ei_ui_smoke.source_form import discover_custom_form_fields
+from ei_ui_smoke.tab_navigation import activate_page_tab
 
 
 @pytest.mark.smoke
@@ -21,6 +22,8 @@ def test_selected_module_auto_add_or_page_access(browser_page, request):
     data_pool = GlobalDataPool.from_directory(project_root / "data")
     strategy = create_data_strategy(mode, data_pool, form_code)
     component = os.getenv("EI_COMPONENT", "")
+    if tab_label := os.getenv("EI_PAGE_TAB", "").strip():
+        activate_page_tab(browser_page, tab_label)
     source_fields = discover_custom_form_fields(settings.source_root, component)
     dynamic_collections = load_dynamic_collection_specs(
         project_root / "data",
