@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ei_ui_smoke.tab_navigation import activate_page_tab
 from ei_ui_smoke.urls import detail_parent_url
 
 
@@ -63,6 +64,14 @@ class ParentRecordIdentityUnavailableError(AssertionError):
 
 class DetailActionUnavailableError(AssertionError):
     """The selected detail module is rendered but has no usable requested action."""
+
+
+class DetailTargetUnavailableError(AssertionError):
+    """One parent record does not render the requested detail navigation path."""
+
+
+class DetailModulePreconditionError(AssertionError):
+    """No accessible parent record can open the requested detail module."""
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1071,7 @@ def enter_detail_record(
     """Enter a detail page through a real list record so route state/ID is present."""
     parent_url = detail_parent_url(detail_url)
     page.goto(parent_url, wait_until="domcontentloaded")
+    activate_detail_parent_tab(page)
     candidates = _wait_for_parent_records_ready(page)
 
     identities = _normalized_record_identity_values(record_identity)
@@ -1097,6 +1107,12 @@ def enter_detail_record(
     return record_identity if identities else selected_identity
 
 
+def activate_detail_parent_tab(page) -> None:
+    """Restore the selected tree branch before a detail-parent list is used."""
+    if page_tab := os.getenv("EI_PAGE_TAB", "").strip():
+        activate_page_tab(page, page_tab)
+
+
 def detail_navigation_labels(module_name: str, action: str) -> list[str]:
     parts = [part.strip() for part in module_name.split("/") if part.strip()]
     try:
@@ -1128,9 +1144,9 @@ def navigate_detail_module(
     try:
         top_tab.wait_for(state="visible", timeout=timeout)
     except Exception as exc:
-        if visible_action(page, action, timeout=1_000) is not None:
-            return
-        raise AssertionError(f"详情页未加载顶层页签：{top_label}") from exc
+        raise DetailTargetUnavailableError(
+            f"详情页未加载顶层页签：{top_label}"
+        ) from exc
     top_tab.click()
 
     for label in labels[1:]:
@@ -1140,9 +1156,7 @@ def navigate_detail_module(
         try:
             menu_item.wait_for(state="visible", timeout=timeout)
         except Exception as exc:
-            if visible_action(page, action, timeout=1_000) is not None:
-                return
-            raise AssertionError(
+            raise DetailTargetUnavailableError(
                 f"详情页未加载目标子菜单：{' / '.join(labels)}"
             ) from exc
         menu_item.click()
@@ -1275,6 +1289,8 @@ def enter_available_detail_module(
         return selected_identity
     identities = _normalized_record_identity_values(record_identity)
     failures = []
+    target_unavailable_failures = []
+    has_non_target_failure = False
     if identities:
         try:
             return _open_provisioned_detail_module(
@@ -1320,20 +1336,13 @@ def enter_available_detail_module(
         except ParentListNotReadyError as exc:
             failures.append(str(exc))
             break
+        except DetailTargetUnavailableError as exc:
+            message = str(exc)
+            failures.append(message)
+            target_unavailable_failures.append(message)
         except AssertionError as exc:
-            if "未进入有效详情页" in str(exc):
-                try:
-                    navigate_detail_module(
-                        page,
-                        module_name,
-                        action,
-                        navigation_labels=navigation_labels,
-                        timeout=2_000,
-                    )
-                    return selected_identity
-                except AssertionError:
-                    pass
             failures.append(str(exc))
+            has_non_target_failure = True
             if "父列表只有" in str(exc):
                 break
     should_provision = _detail_precondition_is_missing(failures)
@@ -1353,6 +1362,13 @@ def enter_available_detail_module(
             provisioned,
             navigation_labels=navigation_labels,
             provision_child_record=provision_child_record,
+        )
+    if target_unavailable_failures and not has_non_target_failure:
+        raise DetailModulePreconditionError(
+            "详情模块前置条件未满足："
+            f"已扫描 {len(target_unavailable_failures)} 条父记录，"
+            f"均无法进入“{' / '.join(navigation_labels)}”；"
+            + "；".join(failures)
         )
     raise AssertionError(
         f"前 {min(max_records, len(failures))} 条业务记录均无法进入目标详情模块；"

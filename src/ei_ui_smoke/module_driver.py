@@ -16,11 +16,12 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from .dom import is_semantic_numeric_field, scan_dom_fields
 from .dynamic_collections import DynamicCollectionSpec
+from .field_contract import FieldContractResolver
 from .failure_evidence import capture_failure_evidence
 from .interactions import FieldInteractor
 from .models import DomField, FieldDefinition, ResolvedField
 from .source_form import SourceBranchCandidate, SourceDetailEndpoint
-from .verification import BUSINESS_ID_KEYS, extract_business_id
+from .verification import BUSINESS_ID_KEYS, extract_business_id, extract_runtime_data
 
 
 ADD_BUTTON = (
@@ -29,7 +30,7 @@ ADD_BUTTON = (
     "button:visible:enabled:not([aria-disabled='true']):not(.is-disabled):has-text('新建'),"
     "button:visible:enabled:not([aria-disabled='true']):not(.is-disabled):has-text('创建')"
 )
-SAVE_BUTTON = "[role=dialog] button:has-text('保存'),[role=dialog] button:has-text('确定'),.el-dialog button:has-text('保存'),.el-dialog button:has-text('确定')"
+ORDINARY_SAVE_COMMAND_PATTERN = re.compile(r"^\s*(?:保存|确定|暂存)\s*$")
 DIALOG = '[role="dialog"]:visible,.el-dialog:visible,.el-drawer:visible'
 INLINE_FORM = (
     ".detail-panel:visible form:visible,.detail-panel:visible .el-form:visible,"
@@ -85,6 +86,26 @@ DETAIL_DISPLAY_ALIASES = {
 }
 
 DETAIL_READBACK_ADAPTER_CLASSIFICATION = "automation_detail_adapter"
+
+
+@dataclass(frozen=True, slots=True)
+class CrudValidationPolicy:
+    """Keep mode-specific validation depth out of shared CRUD mechanics."""
+
+    require_dialog_persistence_readback: bool
+    require_arbitrary_delete_detail_absence: bool
+
+    @classmethod
+    def for_mode(cls, data_mode: str) -> CrudValidationPolicy:
+        if str(data_mode or "").strip().lower() == "probe":
+            return cls(
+                require_dialog_persistence_readback=False,
+                require_arbitrary_delete_detail_absence=False,
+            )
+        return cls(
+            require_dialog_persistence_readback=True,
+            require_arbitrary_delete_detail_absence=True,
+        )
 
 
 @dataclass(slots=True)
@@ -279,6 +300,7 @@ class ModuleSmokeDriver:
         "add_and_detail_verified",
         "add_and_edit_form_verified",
         "add_and_list_verified",
+        "add_and_runtime_verified",
     }
     SEMANTIC_LABEL_CODES = {
         "项目名称": "projName",
@@ -299,11 +321,19 @@ class ModuleSmokeDriver:
         default_upload_file=None,
         dynamic_collections: list[DynamicCollectionSpec] | None = None,
         automation_record_registry: Path | None = None,
+        form_code: str = "",
+        component: str = "",
+        field_contract_manifest: Path | None = None,
     ):
         self.page = page
         self.data_strategy = data_strategy
         self.interactor = FieldInteractor(page)
         self.source_fields = source_fields or []
+        self.form_code = str(form_code or os.getenv("EI_FORM_CODE", "")).strip()
+        self.component = str(component or os.getenv("EI_COMPONENT", "")).strip()
+        self.field_contract_manifest = field_contract_manifest
+        self._field_contract_resolver: FieldContractResolver | None = None
+        self._runtime_field_codes: frozenset[str] = frozenset()
         self.source_branch_candidates = tuple(source_branch_candidates or ())
         self.source_detail_endpoints = tuple(source_detail_endpoints or ())
         self.default_upload_file = default_upload_file
@@ -324,6 +354,89 @@ class ModuleSmokeDriver:
         self._form_open_response_capture: dict[str, Any] | None = None
         self.automation_record_registry = automation_record_registry
         self._current_process_created_record_keys: set[tuple[str, str]] = set()
+
+    def _crud_validation_policy(self) -> CrudValidationPolicy:
+        strategy = getattr(self, "data_strategy", None)
+        return CrudValidationPolicy.for_mode(
+            getattr(strategy, "data_mode", "")
+        )
+
+    def _ensure_field_contract(self) -> None:
+        """Cache stable metadata once per form; never persist an ``el-id-*`` key."""
+        if getattr(self, "_field_contract_resolver", None) is None:
+            self._field_contract_resolver = FieldContractResolver(
+                self.page,
+                form_code=getattr(self, "form_code", ""),
+                component=getattr(self, "component", ""),
+                source_fields=getattr(self, "source_fields", ()),
+                manifest_path=getattr(self, "field_contract_manifest", None),
+            )
+        contract = self._field_contract_resolver.resolve()
+        self._runtime_field_codes = contract.runtime_codes
+        if not hasattr(self, "source_fields"):
+            self.source_fields = []
+        known = {
+            str(code).lower(): index
+            for index, (code, *_rest) in enumerate(self.source_fields)
+        }
+        for code, label, qcc_remote in contract.source_fields:
+            existing = known.get(code.lower())
+            if existing is None:
+                known[code.lower()] = len(self.source_fields)
+                self.source_fields.append((code, label, qcc_remote))
+            elif label:
+                old_code, _old_label, old_qcc = self.source_fields[existing]
+                self.source_fields[existing] = (old_code, label, old_qcc)
+
+    def _verify_runtime_readback(
+        self,
+        business_id: str,
+        submitted: dict[str, Any],
+        required_codes: set[str],
+    ) -> tuple[set[str], Any]:
+        """Verify dynamic persisted values through their exact-ID runtime endpoint."""
+        runtime_codes = set(getattr(self, "_runtime_field_codes", frozenset())).intersection(
+            required_codes, submitted
+        )
+        if not runtime_codes:
+            return set(), None
+        resolver = getattr(self, "_field_contract_resolver", None)
+        if resolver is None:
+            return set(), None
+        try:
+            payload = resolver.runtime_data(business_id)
+        except Exception:
+            # A deployed form may not expose the endpoint. The existing rendered
+            # edit/detail fallback remains available in that case.
+            return set(), None
+        actual = extract_runtime_data(payload)
+        labels = actual.get("dynamicFieldLabels", {}) if isinstance(actual, dict) else {}
+        if isinstance(labels, str):
+            try:
+                labels = json.loads(labels)
+            except ValueError:
+                labels = {}
+        failures = []
+        for code in sorted(runtime_codes):
+            candidates = [actual.get(code)] if isinstance(actual, dict) else []
+            label_value = labels.get(code) if isinstance(labels, dict) else None
+            if isinstance(label_value, list):
+                candidates.extend(
+                    item.get("name", item.get("label", item.get("value", "")))
+                    if isinstance(item, dict) else item
+                    for item in label_value
+                )
+            elif isinstance(label_value, dict):
+                candidates.extend(label_value.get(key, "") for key in ("name", "label", "value"))
+            elif label_value not in (None, ""):
+                candidates.append(label_value)
+            if not self._readback_values_match(submitted[code], candidates, field_code=code):
+                failures.append(
+                    f"{code}: expected={submitted[code]!r}, actual={candidates!r}"
+                )
+        if failures:
+            raise AssertionError("运行时字段回读与本次提交不一致：\n" + "\n".join(failures))
+        return runtime_codes, payload
 
     def prepare_unique_constraint_evidence(self) -> None:
         """Capture a complete, authenticated occupied-key snapshot before Add."""
@@ -396,6 +509,9 @@ class ModuleSmokeDriver:
         self._unique_list_responses = []
         self._unique_occupied_snapshot = {}
         self.page = page
+        resolver = getattr(self, "_field_contract_resolver", None)
+        if resolver is not None:
+            resolver.page = page
         interactor = getattr(self, "interactor", None)
         if interactor is not None:
             interactor.page = page
@@ -475,6 +591,7 @@ class ModuleSmokeDriver:
         add.click()
         scope = self._wait_for_form_scope()
         self._wait_for_form_ready(scope)
+        self._ensure_field_contract()
         submitted: dict[str, Any] = {}
         if branch_selections:
             scope, selected_values = self._apply_branch_selections(
@@ -595,7 +712,6 @@ class ModuleSmokeDriver:
         required_codes = self._stable_readback_required_codes(
             submitted, required_codes
         )
-        filtered_all_requested_codes = bool(requested_codes) and not required_codes
         if not save_response.ok:
             raise AssertionError(
                 f"保存接口失败：HTTP {save_response.status} {save_response.url}; "
@@ -655,6 +771,20 @@ class ModuleSmokeDriver:
                 submitted=submitted,
                 record_markers=record_markers,
                 record_identity_payload=record_identity_payload,
+            )
+        runtime_verified_codes, runtime_payload = self._verify_runtime_readback(
+            business_id, submitted, required_codes
+        )
+        required_codes -= runtime_verified_codes
+        filtered_all_requested_codes = bool(requested_codes) and not required_codes
+        if filtered_all_requested_codes and runtime_verified_codes:
+            return ModuleSmokeResult(
+                mode="add_and_runtime_verified",
+                business_id=business_id,
+                save_url=save_response.url,
+                submitted=submitted,
+                record_markers=record_markers,
+                record_identity_payload=runtime_payload or record_identity_payload,
             )
         if filtered_all_requested_codes and not explicit_empty_readback:
             raise AssertionError(
@@ -1774,7 +1904,7 @@ class ModuleSmokeDriver:
             result.business_id
             and (len(fallback_values) >= 2 or response_payload is not None)
         ):
-            raise AssertionError(
+            raise RecordNotDeletableError(
                 "本次新增记录缺少自动化标识，且没有至少两个可用于唯一定位的保存展示字段，禁止执行删除"
             )
 
@@ -1801,53 +1931,59 @@ class ModuleSmokeDriver:
         # A record created in this process still has a known business ID.  Use
         # the same fresh-JSON-to-rendered-row proof as Edit when possible, but
         # never substitute a newer record with a different ID.
-        if allow_arbitrary_row:
-            rows = self.page.locator(".el-table__row:visible")
-            try:
-                rows.first.wait_for(state="visible", timeout=15_000)
-            except Exception:
-                pass
-            row, marker = self._find_unique_delete_row(
-                "",
-                [],
-                rows=rows,
-                allow_arbitrary_row=True,
-            )
-        else:
-            candidate = self._latest_automation_delete_candidate(
-                allowed_business_ids={self._normalize_record_text(result.business_id)},
-            )
-            if candidate is not None:
-                _business_id, row, marker, candidate_payload = candidate
-                response_payload = candidate_payload
-            else:
+        try:
+            if allow_arbitrary_row:
                 rows = self.page.locator(".el-table__row:visible")
                 try:
                     rows.first.wait_for(state="visible", timeout=15_000)
                 except Exception:
                     pass
                 row, marker = self._find_unique_delete_row(
-                    result.business_id,
-                    markers,
-                    fallback_values=fallback_values,
-                    response_payload=response_payload,
+                    "",
+                    [],
                     rows=rows,
                     allow_arbitrary_row=True,
                 )
+            else:
+                candidate = self._latest_automation_delete_candidate(
+                    allowed_business_ids={
+                        self._normalize_record_text(result.business_id)
+                    },
+                )
+                if candidate is not None:
+                    _business_id, row, marker, candidate_payload = candidate
+                    response_payload = candidate_payload
+                else:
+                    rows = self.page.locator(".el-table__row:visible")
+                    try:
+                        rows.first.wait_for(state="visible", timeout=15_000)
+                    except Exception:
+                        pass
+                    row, marker = self._find_unique_delete_row(
+                        result.business_id,
+                        markers,
+                        fallback_values=fallback_values,
+                        response_payload=response_payload,
+                        rows=rows,
+                    )
 
-        arbitrary_row = marker == ARBITRARY_DELETE_ROW_MARKER
-        if arbitrary_row:
-            markers = [*markers, ARBITRARY_DELETE_ROW_MARKER]
+            arbitrary_row = marker == ARBITRARY_DELETE_ROW_MARKER
+            if arbitrary_row:
+                markers = [*markers, ARBITRARY_DELETE_ROW_MARKER]
 
-        delete = self._pin_delete_row(
-            row,
-            "" if arbitrary_row else result.business_id,
-            allow_missing_id=(
-                arbitrary_row
-                or marker.startswith("响应关联字段=")
-                or marker == "保存字段组合"
-            ),
-        ).get_by_role("button", name="删除", exact=True).first
+            pinned_row = self._pin_delete_row(
+                row,
+                "" if arbitrary_row else result.business_id,
+                allow_missing_id=self._delete_identity_allows_hidden_row_id(
+                    marker,
+                    markers,
+                    arbitrary_row=arbitrary_row,
+                ),
+            )
+        except AssertionError as exc:
+            raise RecordNotDeletableError(str(exc)) from exc
+
+        delete = pinned_row.get_by_role("button", name="删除", exact=True).first
         if not delete.count() or not delete.is_visible() or not delete.is_enabled():
             raise RecordNotDeletableError(
                 f"本次自动化新增记录因当前业务状态没有可用删除按钮：{marker}"
@@ -1907,7 +2043,9 @@ class ModuleSmokeDriver:
             self._pin_delete_row(
                 row,
                 business_id,
-                allow_missing_id=identity.startswith("响应关联字段="),
+                allow_missing_id=self._delete_identity_allows_hidden_row_id(
+                    identity, markers
+                ),
             )
             return ModuleSmokeResult(
                 mode="delete_reusable_record",
@@ -1937,9 +2075,8 @@ class ModuleSmokeDriver:
                     rows=rows,
                 )
                 row_id = self._row_business_id(row)
-                if not row_id and not (
-                    identity.startswith("响应关联字段=")
-                    or identity == "保存字段组合"
+                if not row_id and not self._delete_identity_allows_hidden_row_id(
+                    identity, markers
                 ):
                     row, identity = self._find_unique_delete_row(
                         business_id,
@@ -1951,9 +2088,8 @@ class ModuleSmokeDriver:
                 self._pin_delete_row(
                     row,
                     business_id,
-                    allow_missing_id=(
-                        identity.startswith("响应关联字段=")
-                        or identity == "保存字段组合"
+                    allow_missing_id=self._delete_identity_allows_hidden_row_id(
+                        identity, markers
                     ),
                 )
             except (AssertionError, RecordNotDeletableError):
@@ -2413,6 +2549,7 @@ class ModuleSmokeDriver:
         )
 
     def delete_created_record(self, result: ModuleSmokeResult) -> ModuleSmokeResult:
+        policy = self._crud_validation_policy()
         responses = []
         submitted, markers, fallback_values, confirm = self._open_delete_confirmation(
             result, responses
@@ -2460,16 +2597,17 @@ class ModuleSmokeDriver:
             pass
         self._refresh_list_after_delete()
         if arbitrary_row:
-            if not actual_delete_id:
-                raise AssertionError("删除接口未返回可查询的业务 ID，无法确认删除结果")
-            detail_presence = self._deleted_record_detail_presence(
-                delete_response, actual_delete_id,
-            )
-            if detail_presence is not False:
-                raise AssertionError(
-                    "删除后详情接口未证明记录已删除："
-                    f"business_id={actual_delete_id}"
+            if policy.require_arbitrary_delete_detail_absence:
+                if not actual_delete_id:
+                    raise AssertionError("删除接口未返回可查询的业务 ID，无法确认删除结果")
+                detail_presence = self._deleted_record_detail_presence(
+                    delete_response, actual_delete_id,
                 )
+                if detail_presence is not False:
+                    raise AssertionError(
+                        "删除后详情接口未证明记录已删除："
+                        f"business_id={actual_delete_id}"
+                    )
         else:
             self._wait_for_deleted_record_absent(
                 result.business_id,
@@ -2505,8 +2643,11 @@ class ModuleSmokeDriver:
         established_business_id: str = "",
     ) -> ModuleSmokeResult:
         """Save an existing-record dialog and verify its exact-ID detail data."""
+        policy = self._crud_validation_policy()
         scope = self._wait_for_form_scope()
         self._wait_for_form_ready(scope)
+        if policy.require_dialog_persistence_readback:
+            self._ensure_field_contract()
         submitted = self._fill_dialog()
         self._upload_default_attachments(scope)
         fields = scan_dom_fields(self.page, scope)
@@ -2522,7 +2663,8 @@ class ModuleSmokeDriver:
             raise AssertionError(
                 f"页面操作“{operation}”保存前表单未填写完整：" + "; ".join(details)
             )
-        save = self._save_button(scope, operation)
+        # `operation` identifies the entry that opened this form, not its footer command.
+        save = self._save_button(scope)
         if not save.count() or not save.is_visible() or not save.is_enabled():
             raise AssertionError(f"页面操作“{operation}”弹窗没有可用的保存/确定按钮")
         responses = []
@@ -2542,6 +2684,12 @@ class ModuleSmokeDriver:
         except Exception:
             body = save_response.text()
         self._assert_business_success(body, operation=operation)
+        if not policy.require_dialog_persistence_readback:
+            return ModuleSmokeResult(
+                mode="dialog_action_saved",
+                save_url=save_response.url,
+                submitted=submitted,
+            )
         response_business_id = self._normalize_record_text(extract_business_id(body))
         established_id = self._normalize_record_text(established_business_id)
         business_id = response_business_id or established_id
@@ -2555,6 +2703,18 @@ class ModuleSmokeDriver:
         required_codes = self._stable_readback_required_codes(
             submitted, requested_codes
         )
+        runtime_verified_codes, runtime_payload = self._verify_runtime_readback(
+            business_id, submitted, required_codes
+        )
+        required_codes -= runtime_verified_codes
+        if requested_codes and not required_codes and runtime_verified_codes:
+            return ModuleSmokeResult(
+                mode="dialog_action_runtime_verified",
+                business_id=business_id,
+                save_url=save_response.url,
+                submitted=submitted,
+                record_identity_payload=runtime_payload,
+            )
         if requested_codes and not required_codes:
             raise AssertionError(
                 f"页面操作“{operation}”保存后没有稳定业务字段可回读；"
@@ -4592,10 +4752,14 @@ class ModuleSmokeDriver:
             if command.count() and command.is_visible():
                 return command
             return command
-        scoped = scope.locator("button:has-text('保存'),button:has-text('确定')").last
+        scoped = scope.locator("button:visible").filter(
+            has_text=ORDINARY_SAVE_COMMAND_PATTERN
+        ).last
         if scoped.count() and scoped.is_visible():
             return scoped
-        return self.page.locator(SAVE_BUTTON + ",button:has-text('保存')").last
+        return self.page.locator("button:visible").filter(
+            has_text=ORDINARY_SAVE_COMMAND_PATTERN
+        ).last
 
     def _upload_default_attachments(self, dialog) -> int:
         path = self.default_upload_file
@@ -5140,7 +5304,16 @@ class ModuleSmokeDriver:
         detail_path = "/" + "/".join(
             [*resource_segments, "detail", quote(normalized_id, safe="")]
         )
-        return urlunsplit((parts.scheme, parts.netloc, detail_path, "", ""))
+        retained_query = urlencode([
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() not in {
+                "id", "businessid", "business_id", "recordid", "record_id"
+            }
+        ])
+        return urlunsplit(
+            (parts.scheme, parts.netloc, detail_path, retained_query, "")
+        )
 
     @classmethod
     def _same_resource_detail_urls(
@@ -5154,12 +5327,18 @@ class ModuleSmokeDriver:
         detail_segments = [segment for segment in parts.path.split("/") if segment]
         if len(detail_segments) < 2 or detail_segments[-2] != "detail":
             return (path_url,)
+        query_items = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() != "id"
+        ]
+        query_items.append(("id", cls._normalize_record_text(business_id)))
         query_url = urlunsplit(
             (
                 parts.scheme,
                 parts.netloc,
                 "/" + "/".join(detail_segments[:-1]),
-                urlencode({"id": cls._normalize_record_text(business_id)}),
+                urlencode(query_items),
                 "",
             )
         )
@@ -6279,6 +6458,29 @@ class ModuleSmokeDriver:
             if str(value).strip().startswith(AUTOMATION_RECORD_PREFIXES)
         ])
 
+    @classmethod
+    def _delete_identity_allows_hidden_row_id(
+        cls,
+        identity: Any,
+        automation_markers: Iterable[Any],
+        *,
+        arbitrary_row: bool = False,
+    ) -> bool:
+        """Allow a hidden row ID only when row identity is independently exact."""
+        if arbitrary_row:
+            return True
+        normalized_identity = cls._normalize_record_text(identity)
+        if (
+            normalized_identity.startswith("响应关联字段=")
+            or normalized_identity == "保存字段组合"
+        ):
+            return True
+        return normalized_identity in {
+            cls._normalize_record_text(marker)
+            for marker in automation_markers
+            if cls._normalize_record_text(marker).startswith(AUTOMATION_RECORD_PREFIXES)
+        }
+
     @staticmethod
     def _normalize_record_text(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -6566,8 +6768,9 @@ class ModuleSmokeDriver:
         """Return exact-ID detail presence after delete, or None when unavailable.
 
         This is a read-only fallback for an inconclusive rendered list. A
-        successful detail response proves the record remains; only HTTP 404 or
-        the backend's explicit not-found business response proves deletion.
+        successful detail response with the exact ID proves the record remains;
+        HTTP 404, explicit not-found, or an explicitly empty data envelope proves
+        deletion. Other successful response shapes remain inconclusive.
         """
         normalized_id = self._normalize_record_text(business_id)
         if not normalized_id or delete_response is None:
@@ -6607,12 +6810,14 @@ class ModuleSmokeDriver:
                 if re.search(r"(?:不存在|not\s+found)", message, re.I):
                     return False
                 raise
+            for key in ("data", "result", "body", "content"):
+                if key in payload and payload[key] in (None, {}, []):
+                    return False
+        elif payload in (None, []):
+            return False
         payload_ids = self._record_scalar_texts(payload)
         if normalized_id not in payload_ids:
-            raise AssertionError(
-                "删除后详情响应未返回目标业务 ID："
-                f"expected={normalized_id}"
-            )
+            return None
         return True
 
     def _browser_authenticated_get_response(self, url: str):
@@ -8351,38 +8556,77 @@ class ModuleSmokeDriver:
         for spec in getattr(self, "dynamic_collections", ()):
             if not getattr(spec, "create_on_outer_add", True):
                 continue
-            root = scope.locator(spec.root_selector).first
-            if not root.count() or not root.is_visible():
-                raise DynamicFieldContractError(
-                    f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
-                )
-            rows = self._configured_collection_rows(root, spec)
-            retained_row_count = len(rows)
-            if len(rows) < spec.min_rows:
-                trigger = root.locator(spec.create_selector).first
-                if not trigger.count() or not trigger.is_visible():
-                    raise DynamicFieldContractError(
-                        f"动态字段契约缺失：{spec.field_code} 没有可新增行"
-                    )
-                self._activate_configured_collection_trigger(trigger, spec)
-                rows = self._wait_for_configured_collection_rows(root, spec)
-            # min_rows is a creation threshold. Hydrated collections may already
-            # contain more rows, and every rendered row participates in Save.
-            for row_index, row in enumerate(rows):
-                row_submitted = self._fill_configured_collection_row(
-                    spec, row, row_index, value_offset=len(submitted)
-                )
-                submitted.update(row_submitted)
-                if row_index < retained_row_count:
-                    excluded = getattr(
-                        self, "_readback_excluded_submission_codes", None
-                    )
-                    if excluded is None:
-                        excluded = self._readback_excluded_submission_codes = set()
-                    excluded.update(row_submitted)
-            submitted[spec.field_code] = spec.mode
-            self._collection_submission_codes.add(spec.field_code)
+            submitted.update(
+                self._prepare_configured_dynamic_collection(scope, spec)
+            )
         return submitted
+
+    def _prepare_configured_dynamic_collection(
+        self, scope, spec: DynamicCollectionSpec,
+    ) -> dict[str, Any]:
+        """Create and baseline one manifest-owned collection when its field is targeted."""
+        submitted: dict[str, Any] = {}
+        root = scope.locator(spec.root_selector).first
+        if not root.count() or not root.is_visible():
+            raise DynamicFieldContractError(
+                f"动态字段契约缺失：{spec.field_code} 未找到集合根节点"
+            )
+        rows = self._configured_collection_rows(root, spec)
+        retained_row_count = len(rows)
+        if len(rows) < spec.min_rows:
+            trigger = root.locator(spec.create_selector).first
+            if not trigger.count() or not trigger.is_visible():
+                raise DynamicFieldContractError(
+                    f"动态字段契约缺失：{spec.field_code} 没有可新增行"
+                )
+            self._activate_configured_collection_trigger(trigger, spec)
+            rows = self._wait_for_configured_collection_rows(root, spec)
+        # min_rows is a creation threshold. Hydrated collections may already
+        # contain more rows, and every rendered row participates in Save.
+        for row_index, row in enumerate(rows):
+            row_submitted = self._fill_configured_collection_row(
+                spec, row, row_index, value_offset=len(submitted)
+            )
+            submitted.update(row_submitted)
+            if row_index < retained_row_count:
+                excluded = getattr(
+                    self, "_readback_excluded_submission_codes", None
+                )
+                if excluded is None:
+                    excluded = self._readback_excluded_submission_codes = set()
+                excluded.update(row_submitted)
+        submitted[spec.field_code] = spec.mode
+        self._collection_submission_codes.add(spec.field_code)
+        return submitted
+
+    @staticmethod
+    def _configured_collection_child_matches(
+        field_code: str, child: DynamicCollectionChild,
+    ) -> bool:
+        pattern = re.escape(child.field_code_template).replace(
+            re.escape("{index}"), r"(?:\d+|\*)"
+        )
+        return bool(re.fullmatch(pattern, str(field_code or "").strip()))
+
+    def _prepare_configured_dynamic_collection_for_field(
+        self, scope, field_code: str,
+    ) -> dict[str, Any]:
+        """Materialize only the configured collection that owns ``field_code``."""
+        matches = [
+            spec
+            for spec in getattr(self, "dynamic_collections", ())
+            if any(
+                self._configured_collection_child_matches(field_code, child)
+                for child in spec.children
+            )
+        ]
+        if not matches:
+            return {}
+        if len(matches) != 1:
+            raise DynamicFieldContractError(
+                f"动态字段契约重复：字段 {field_code} 匹配多个集合"
+            )
+        return self._prepare_configured_dynamic_collection(scope, matches[0])
 
     @staticmethod
     def _configured_collection_row_headers(row) -> list[str]:
@@ -9636,25 +9880,28 @@ class ModuleSmokeDriver:
             )
             if match:
                 return match
+            # A page-provided business ID is already more authoritative than a
+            # source label.  Never rewrite it merely because an older source
+            # form happens to use the same display name for another field.
+            return (dom.field_code, dom.label, bool(dom.qcc_remote))
         normalized_label = self._normalize_label(dom.label)
         if normalized_label:
-            match = next(
-                (field for field in self.source_fields if self._normalize_label(field[1]) == normalized_label),
-                None,
-            )
-            if match:
-                return match
-            semantic_match = next(
-                (
-                    field for field in self.source_fields
-                    if self._semantic_numeric_source_identity_safe(
-                        dom, field[0], field[1]
-                    )
-                ),
-                None,
-            )
-            if semantic_match:
-                return semantic_match
+            label_matches = [
+                field
+                for field in self.source_fields
+                if self._normalize_label(field[1]) == normalized_label
+            ]
+            if len(label_matches) == 1:
+                return label_matches[0]
+            semantic_matches = [
+                field
+                for field in self.source_fields
+                if self._semantic_numeric_source_identity_safe(
+                    dom, field[0], field[1]
+                )
+            ]
+            if len(semantic_matches) == 1:
+                return semantic_matches[0]
             semantic_code = self.SEMANTIC_LABEL_CODES.get(
                 self._normalize_identity_label(dom.label)
             )

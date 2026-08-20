@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -6,8 +7,9 @@ import ei_ui_smoke.module_driver as module_driver_module
 from ei_ui_smoke.interactions import FieldInteractor
 from ei_ui_smoke.data_pool import UniqueConstraintSpec
 from ei_ui_smoke.module_driver import (
-    ADD_BUTTON, EDITABLE_FORM_CONTROL, INLINE_FORM, DynamicFieldContractError,
-    FieldCompletionReport, ModuleSmokeDriver, ModuleSmokeResult,
+    ADD_BUTTON, ARBITRARY_DELETE_ROW_MARKER, EDITABLE_FORM_CONTROL, INLINE_FORM,
+    CrudValidationPolicy, DynamicFieldContractError, FieldCompletionReport,
+    ModuleSmokeDriver, ModuleSmokeResult, ORDINARY_SAVE_COMMAND_PATTERN,
     RecordNotDeletableError,
 )
 from ei_ui_smoke.dynamic_collections import (
@@ -593,6 +595,40 @@ def test_explicit_submit_command_does_not_fall_back_to_save_button():
     selected = driver._save_button(Scope(), operation="提交")
 
     assert selected.count() == 0
+
+
+def test_ordinary_save_button_accepts_temporary_storage():
+    class Buttons:
+        def __init__(self, labels=()):
+            self.labels = tuple(labels)
+
+        @property
+        def last(self):
+            return self
+
+        def filter(self, *, has_text):
+            return Buttons(label for label in self.labels if has_text.fullmatch(label))
+
+        def count(self):
+            return len(self.labels)
+
+        def is_visible(self):
+            return bool(self.labels)
+
+    class Scope:
+        @staticmethod
+        def locator(selector):
+            assert selector == "button:visible"
+            return Buttons(("暂存",))
+
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = object()
+
+    selected = driver._save_button(Scope())
+
+    assert selected.labels == ("暂存",)
+    assert ORDINARY_SAVE_COMMAND_PATTERN.fullmatch("暂存")
+    assert not ORDINARY_SAVE_COMMAND_PATTERN.fullmatch("提交")
 
 
 def test_add_entry_skips_hidden_or_disabled_stale_buttons():
@@ -1392,7 +1428,7 @@ def _dialog_save_driver(monkeypatch, save_response):
         "is_visible": staticmethod(lambda: True),
         "is_enabled": staticmethod(lambda: True),
     })()
-    driver._save_button = lambda _scope, _operation: save_button
+    driver._save_button = lambda _scope, _operation="": save_button
     driver._save_with_validation_repairs = (
         lambda _scope, _save, responses, _submitted: responses.append(save_response)
     )
@@ -1408,6 +1444,46 @@ def _dialog_save_driver(monkeypatch, save_response):
     return driver
 
 
+@pytest.mark.parametrize(
+    ("data_mode", "readback", "delete_detail"),
+    [
+        ("probe", False, False),
+        ("standard", True, True),
+        ("stable", True, True),
+        ("", True, True),
+    ],
+)
+def test_crud_validation_policy_isolates_probe_only(
+    data_mode, readback, delete_detail,
+):
+    policy = CrudValidationPolicy.for_mode(data_mode)
+
+    assert policy.require_dialog_persistence_readback is readback
+    assert policy.require_arbitrary_delete_detail_absence is delete_detail
+
+
+def test_probe_dialog_save_keeps_legacy_response_only_validation(monkeypatch):
+    save = JsonResponse(
+        "https://host/api/projects/update",
+        {"code": 200, "data": None},
+        payload={"name": "未变化的已有名称"},
+    )
+    driver = _dialog_save_driver(monkeypatch, save)
+    driver.data_strategy = SimpleNamespace(data_mode="probe")
+    driver._ensure_field_contract = lambda: pytest.fail(
+        "probe must not enter standard field-contract readback"
+    )
+    driver._verify_saved_record_by_business_id_detail = lambda *_args, **_kwargs: (
+        pytest.fail("probe must not enter standard detail readback")
+    )
+
+    result = driver.save_open_dialog("编辑")
+
+    assert result.mode == "dialog_action_saved"
+    assert result.business_id == ""
+    assert result.save_url == save.url
+
+
 def test_save_open_dialog_uses_response_id_and_returns_detail_verified(monkeypatch):
     save = JsonResponse(
         "https://host/api/projects/update",
@@ -1416,6 +1492,11 @@ def test_save_open_dialog_uses_response_id_and_returns_detail_verified(monkeypat
     )
     driver = _dialog_save_driver(monkeypatch, save)
     captured = {}
+    save_button_operations = []
+    original_save_button = driver._save_button
+    driver._save_button = lambda scope, operation="": (
+        save_button_operations.append(operation) or original_save_button(scope, operation)
+    )
 
     def verify(_save, submitted, **kwargs):
         captured.update(kwargs)
@@ -1433,8 +1514,83 @@ def test_save_open_dialog_uses_response_id_and_returns_detail_verified(monkeypat
 
     assert result.mode == "dialog_action_detail_verified"
     assert result.business_id == "record-2"
+    assert save_button_operations == [""]
     assert captured["business_id"] == "record-2"
     assert captured["required_codes"] == {"name"}
+
+
+def _arbitrary_delete_driver(monkeypatch, *, data_mode, detail_presence):
+    class Button:
+        @property
+        def last(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def is_visible():
+            return True
+
+        @staticmethod
+        def click():
+            return None
+
+    class Confirm:
+        @staticmethod
+        def get_by_role(*_args, **_kwargs):
+            return Button()
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+    delete_response = JsonResponse(
+        "https://host/api/projects/delete/actual-record",
+        {"code": 200},
+    )
+    delete_response.request.method = "DELETE"
+    delete_response.request.url = delete_response.url
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.data_strategy = SimpleNamespace(data_mode=data_mode)
+    driver.page = SimpleNamespace(wait_for_timeout=lambda _timeout: None)
+    driver._open_delete_confirmation = lambda _result, responses: (
+        responses.append(delete_response)
+        or ({}, [ARBITRARY_DELETE_ROW_MARKER], [], Confirm())
+    )
+    driver._assert_business_success = lambda *_args, **_kwargs: None
+    driver._refresh_list_after_delete = lambda: None
+    driver._deleted_record_detail_presence = detail_presence
+    return driver
+
+
+def test_probe_arbitrary_delete_does_not_inherit_strict_detail_absence(monkeypatch):
+    driver = _arbitrary_delete_driver(
+        monkeypatch,
+        data_mode="probe",
+        detail_presence=lambda *_args: pytest.fail(
+            "probe must not enter standard delete-detail verification"
+        ),
+    )
+
+    result = driver.delete_created_record(
+        ModuleSmokeResult(mode="delete_any_available")
+    )
+
+    assert result.mode == "add_and_delete_verified"
+    assert result.business_id == "actual-record"
+
+
+def test_standard_arbitrary_delete_keeps_strict_detail_absence(monkeypatch):
+    driver = _arbitrary_delete_driver(
+        monkeypatch,
+        data_mode="standard",
+        detail_presence=lambda *_args: True,
+    )
+
+    with pytest.raises(AssertionError, match="详情接口未证明记录已删除"):
+        driver.delete_created_record(ModuleSmokeResult(mode="delete_any_available"))
 
 
 def test_save_open_dialog_uses_only_explicit_established_id_when_response_has_none(
@@ -2502,7 +2658,6 @@ def test_fieldless_detail_response_defers_to_rendered_readback(monkeypatch):
         "classification": "automation_detail_adapter",
     }]
 
-
 def test_partial_associated_list_defers_when_target_fields_are_missing(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     response = JsonResponse(
@@ -2527,7 +2682,7 @@ def test_same_resource_detail_url_keeps_resource_prefix_and_exact_id():
     assert ModuleSmokeDriver._same_resource_detail_url(
         "https://host/fi-service/risk/add?draft=true",
         "record/1",
-    ) == "https://host/fi-service/risk/detail/record%2F1"
+    ) == "https://host/fi-service/risk/detail/record%2F1?draft=true"
 
 
 def test_same_resource_detail_urls_prefer_query_id_and_keep_path_fallback():
@@ -2536,6 +2691,16 @@ def test_same_resource_detail_urls_prefer_query_id_and_keep_path_fallback():
     ) == (
         "https://host/ei-service/project/projStorage/detail?id=record%2F1",
         "https://host/ei-service/project/projStorage/detail/record%2F1",
+    )
+
+
+def test_same_resource_detail_urls_keep_non_identity_resource_query():
+    assert ModuleSmokeDriver._same_resource_detail_urls(
+        "https://host/ei-service/epValueRpt/delete/9001?formCode=JSBG&id=old",
+        "9001",
+    ) == (
+        "https://host/ei-service/epValueRpt/detail?formCode=JSBG&id=9001",
+        "https://host/ei-service/epValueRpt/detail/9001?formCode=JSBG",
     )
 
 
@@ -5376,6 +5541,29 @@ def test_source_field_is_matched_by_visible_label_before_position():
     assert driver._source_for_dom(dom, 1) == ("remark", "备注", False)
 
 
+def test_stable_dom_business_id_is_not_rewritten_by_same_named_source_field():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("legacyName", "名称", False)]
+    dom = DomField("actualName", "名称", "text", "#actual-name")
+
+    assert driver._source_for_dom(dom, 1) == ("actualName", "名称", False)
+
+
+def test_generated_dom_id_uses_only_a_unique_source_label_mapping():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("userName", "委派人员", False)]
+    dom = DomField("el-id-1", "委派人员", "select", "#el-id-1")
+
+    assert driver._source_for_dom(dom, 1) == ("userName", "委派人员", False)
+
+    driver.source_fields = [
+        ("primaryUser", "委派人员", False),
+        ("secondaryUser", "委派人员", False),
+    ]
+
+    assert driver._source_for_dom(dom, 1) == ("el-id-1", "委派人员", False)
+
+
 def test_runtime_manifest_hint_stabilizes_generated_element_id_by_label():
     driver = object.__new__(ModuleSmokeDriver)
     driver.source_fields = [
@@ -5510,6 +5698,18 @@ def test_generated_numeric_placeholders_recover_source_identity_when_unit_differ
     assert (period[0], period[1]) == ("buildPeriodMonth", "建设周期（月）")
     assert (rate[0], rate[1]) == ("expectedReturnRate", "预计回报率（%）")
     assert (amount[0], amount[1]) == ("financeSources.*.amount", "预算金额（万元）")
+
+
+def test_generated_financial_input_recovers_source_identity_from_currency_unit():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.source_fields = [("totalAssets", "总资产（万元）", False)]
+
+    identity = driver._runtime_identity_for_dom(
+        DomField("el-id-4", "请输入总资产", "text", "#total-assets"),
+        1,
+    )
+
+    assert (identity[0], identity[1]) == ("totalAssets", "总资产（万元）")
 
 
 def test_dynamic_table_runtime_prop_matches_source_wildcard_code():
@@ -6577,23 +6777,27 @@ def test_reusable_delete_record_accepts_registered_automation_marker_and_id(
     assert result.record_markers == ("AUTO_delete_me",)
 
 
-def test_registered_marker_without_row_id_still_requires_two_display_values(
-    tmp_path,
-):
+def test_registered_unique_marker_allows_hidden_row_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("EI_AUTOMATION_RUN_ID", "run-current")
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = RecordPage([RecordRow(["AUTO_delete_me", "删除"])])
     driver.automation_record_registry = tmp_path / "automation-record-registry.json"
     driver.automation_record_registry.write_text(
         '{"records":[{"business_id":"auto-1",'
         '"page_scope":"https://host/projects",'
+        '"run_id":"run-current",'
         '"record_markers":["AUTO_delete_me"],'
         '"submitted":{"name":"AUTO_delete_me"},'
         '"record_identity_payload":{"id":"auto-1",'
         '"name":"AUTO_delete_me"}}]}',
         encoding="utf-8",
     )
+    monkeypatch.setattr(driver, "_pin_delete_row", lambda row, *_args, **_kwargs: row)
 
-    assert driver.find_reusable_automation_delete_record() is None
+    result = driver.find_reusable_automation_delete_record()
+
+    assert result is not None
+    assert result.business_id == "auto-1"
 
 
 def test_reusable_delete_record_ignores_business_rows_and_unaddressable_automation_rows():
@@ -6702,6 +6906,53 @@ def test_delete_row_allows_any_enabled_delete_command_when_authorized():
     assert identity == "__arbitrary_delete_row__"
 
 
+def test_delete_confirmation_reports_unlocatable_exact_record_as_not_deletable(
+    monkeypatch,
+):
+    driver = object.__new__(ModuleSmokeDriver)
+
+    class EmptyLocator:
+        @property
+        def last(self):
+            return self
+
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+    driver.page = SimpleNamespace(locator=lambda _selector: EmptyLocator())
+    monkeypatch.setattr(driver, "_latest_automation_delete_candidate", lambda **_kwargs: None)
+
+    def reject_exact_record(*_args, **kwargs):
+        assert kwargs.get("allow_arbitrary_row", False) is False
+        raise AssertionError("未找到本次保存响应业务 ID")
+
+    monkeypatch.setattr(
+        driver,
+        "_find_unique_delete_row",
+        reject_exact_record,
+    )
+
+    with pytest.raises(RecordNotDeletableError, match="未找到本次保存响应业务 ID"):
+        driver._open_delete_confirmation(ModuleSmokeResult(
+            mode="add_provisioned",
+            business_id="record-1",
+            record_markers=("AUTO_record-1",),
+        ))
+
+
 def test_delete_confirmation_allows_hidden_row_id_only_for_unique_saved_values(monkeypatch):
     driver = object.__new__(ModuleSmokeDriver)
     driver.page = object()
@@ -6771,6 +7022,77 @@ def test_delete_confirmation_allows_hidden_row_id_only_for_unique_saved_values(m
         ))
 
     assert captured["allow_missing_id"] is True
+
+
+def test_delete_confirmation_allows_hidden_row_id_for_unique_automation_marker(monkeypatch):
+    driver = object.__new__(ModuleSmokeDriver)
+    captured = {}
+
+    class PinnedRow:
+        def get_by_role(self, *_args, **_kwargs):
+            return type("Delete", (), {
+                "first": type("Delete", (), {
+                    "count": staticmethod(lambda: 1),
+                    "is_visible": staticmethod(lambda: True),
+                    "is_enabled": staticmethod(lambda: True),
+                    "click": staticmethod(lambda: None),
+                })(),
+            })()
+
+    marker = "UI自动化_20260820_S001"
+    monkeypatch.setattr(
+        driver, "_find_unique_delete_row", lambda *_args, **_kwargs: (object(), marker)
+    )
+    monkeypatch.setattr(
+        driver, "_pin_delete_row",
+        lambda _row, _id, **kwargs: captured.update(kwargs) or PinnedRow(),
+    )
+
+    class Rows:
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def wait_for(**_kwargs):
+            return None
+
+    class Locator:
+        @property
+        def last(self):
+            return self
+
+        @property
+        def first(self):
+            return self
+
+        @staticmethod
+        def count():
+            return 0
+
+        @staticmethod
+        def is_visible():
+            return False
+
+    driver.page = type("Page", (), {
+        "locator": lambda _self, selector: Rows() if ".el-table__row" in selector else Locator(),
+    })()
+
+    with pytest.raises(AttributeError):
+        driver._open_delete_confirmation(ModuleSmokeResult(
+            mode="add_provisioned",
+            business_id="record-1",
+            record_markers=(marker,),
+            submitted={"name": marker},
+        ))
+
+    assert captured["allow_missing_id"] is True
+
+
+def test_hidden_row_id_rejects_non_marker_identity():
+    assert not ModuleSmokeDriver._delete_identity_allows_hidden_row_id(
+        "普通业务数据", ["UI自动化_20260820_S001"]
+    )
 
 
 def test_delete_request_guard_aborts_a_different_record_id():
@@ -7187,6 +7509,39 @@ def test_deleted_record_detail_accepts_explicit_not_found_response():
     assert driver.page.request.urls == [
         "https://host/fi-service/projProgress/detail/deleted-record"
     ]
+
+
+@pytest.mark.parametrize("empty_data", [None, {}, []])
+def test_deleted_record_detail_accepts_explicit_empty_data(empty_data):
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RequestPage([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 200, "data": empty_data},
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    assert driver._deleted_record_detail_presence(deleted, "deleted-record") is False
+
+
+def test_deleted_record_detail_returns_inconclusive_for_unknown_success_shape():
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.page = RequestPage([
+        ApiResponse(
+            "https://host/fi-service/projProgress/detail/deleted-record",
+            {"code": 200, "data": {"status": "archived"}},
+        ),
+    ])
+    deleted = JsonResponse(
+        "https://host/fi-service/projProgress/delete/deleted-record",
+        {"code": 200},
+    )
+
+    assert driver._deleted_record_detail_presence(deleted, "deleted-record") is None
 
 
 def test_deleted_record_detail_rejects_successful_response_for_same_id():
@@ -7703,6 +8058,41 @@ def test_configured_collection_can_remain_available_for_nested_actions_without_o
 
     assert driver._prepare_configured_dynamic_collections(object()) == {}
     assert driver._configured_collection_for_section("股权结构") is spec
+
+
+def test_configured_collection_target_matches_wildcard_or_runtime_row_path():
+    spec = DynamicCollectionSpec(
+        field_code="financeSources",
+        mode="add-row",
+        root_selector=".finance-table",
+        create_selector="button",
+        item_selector="tr",
+        min_rows=1,
+        children=(
+            DynamicCollectionChild(
+                "financeSources.{index}.sourceFrom", ".el-select", kind="select"
+            ),
+        ),
+        create_on_outer_add=False,
+    )
+    driver = object.__new__(ModuleSmokeDriver)
+    driver.dynamic_collections = [spec]
+    calls = []
+    driver._prepare_configured_dynamic_collection = (
+        lambda scope, matched: calls.append((scope, matched)) or {"financeSources": "add-row"}
+    )
+    scope = object()
+
+    assert driver._prepare_configured_dynamic_collection_for_field(
+        scope, "financeSources.*.sourceFrom"
+    ) == {"financeSources": "add-row"}
+    assert driver._prepare_configured_dynamic_collection_for_field(
+        scope, "financeSources.0.sourceFrom"
+    ) == {"financeSources": "add-row"}
+    assert driver._prepare_configured_dynamic_collection_for_field(
+        scope, "matterName"
+    ) == {}
+    assert calls == [(scope, spec), (scope, spec)]
 
 
 def test_nested_only_collection_validation_is_scoped_to_selected_action(monkeypatch):

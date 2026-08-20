@@ -93,6 +93,17 @@ def test_probe_generates_valid_semantic_values_without_page_data():
     assert 10 <= amount <= 20
 
 
+def test_amount_semantic_prefers_field_type_then_uses_currency_unit_fallback():
+    data_pool = pool()
+
+    assert data_pool.semantic_for(field("contractValue", "合同价值", "AMOUNT")) == "amount"
+    assert data_pool.semantic_for(field("totalAssets", "总资产（万元）")) == "amount"
+    assert data_pool.semantic_for(field("totalDebt", "总负债（元）", "ElInputNumber-NUMBER")) == "amount"
+    assert data_pool.semantic_for(
+        field("currency", "币种（元）", "PurvarCodeSelect-SELECT")
+    ) == ""
+
+
 def test_probe_is_reproducible_with_same_run_id():
     first = ProbeDataStrategy(pool(), "same").value_for(field("contactPhone"), 1)
     second = ProbeDataStrategy(pool(), "same").value_for(field("contactPhone"), 1)

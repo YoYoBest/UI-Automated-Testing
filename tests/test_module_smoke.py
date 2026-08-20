@@ -38,6 +38,8 @@ def test_selected_module_auto_add_or_page_access(browser_page, request):
         source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=data_pool.default_upload_file(),
         dynamic_collections=dynamic_collections,
+        form_code=os.getenv("EI_FORM_CODE", "") or settings.form_code,
+        component=component,
         automation_record_registry=(
             project_root / "artifacts" / "automation-record-registry.json"
         ),
@@ -54,4 +56,5 @@ def test_selected_module_auto_add_or_page_access(browser_page, request):
             "add_and_detail_verified",
             "add_and_edit_form_verified",
             "add_and_list_verified",
+            "add_and_runtime_verified",
         }, "所选模块存在未完成新增及保存后数据核对的分支"

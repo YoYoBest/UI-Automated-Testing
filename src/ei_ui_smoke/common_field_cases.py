@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
-from .contracts import field_kind
+from .contracts import field_kind, has_currency_amount_unit
 from .dom import is_semantic_numeric_field
 from .models import DomField, FieldDefinition
 
@@ -332,6 +332,12 @@ def _effective_common_kind(
             dom_kind = "number"
         if source_kind == "text":
             source_kind = "number"
+    # A multi-select contract is more specific than the generic combobox DOM
+    # shape.  Some component variants do not expose their multiple state on
+    # the inner input, so preserving the configured MULTI_SELECT prevents
+    # single-select Excel rules from being bound to that control.
+    if "multi_select" in {dom_kind, source_kind}:
+        return "multi_select"
     if dom_kind == source_kind:
         return dom_kind
     if dom_kind == "unknown":
@@ -351,10 +357,12 @@ def classify_common_field_type(label: str, kind: str, field_code: str = "") -> s
         return kind
     if kind == "textarea":
         return "textarea"
+    if kind == "amount":
+        return "amount"
     if kind in {"number", "text"}:
         if PERCENTAGE_LABEL.search(normalized) or PERCENTAGE_CODE.search(field_code or ""):
             return "percentage"
-        if AMOUNT_LABEL.search(normalized):
+        if AMOUNT_LABEL.search(normalized) or has_currency_amount_unit(normalized):
             return "amount"
     if kind == "number":
         return "number"

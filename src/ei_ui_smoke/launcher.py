@@ -69,6 +69,26 @@ EXECUTION_MODES = (
     ("稳定冒烟", "stable"),
 )
 DEFAULT_EXECUTION_MODE = "standard"
+WORKFLOW_TEST_FILE = "tests/test_business_workflow.py"
+RESOURCE_POOL_APPROVAL_CONFIG_ENV = "EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON"
+WORKFLOW_ENVIRONMENT_KEYS = (
+    "EI_WORKFLOW_ID",
+    "EI_WORKFLOW_FACTORY",
+    "EI_WORKFLOW_ROLE_STATES_JSON",
+    RESOURCE_POOL_APPROVAL_CONFIG_ENV,
+)
+DEFAULT_WORKFLOW_ID = "resource-pool-approval"
+WORKFLOW_CATALOG = {
+    DEFAULT_WORKFLOW_ID: {
+        "project": "EI",
+        "factory": (
+            "ei_ui_smoke.workflows.resource_pool_approval:build_workflow"
+        ),
+    },
+}
+WORKFLOW_AUTH_ROLE_LABELS = {
+    "maker": "经办人",
+}
 ADD_ACTION_PREFIXES = ("新增", "添加", "新建")
 EDIT_ACTION_PREFIXES = ("编辑", "修改")
 DELETE_ACTION_PREFIXES = ("删除", "移除", "清空")
@@ -116,12 +136,12 @@ PROJECT_LABELS = {"EI": "EI 项目", "FI": "FI 项目"}
 def namespace_project_items(
     project_key: str, project_label: str, items: list[ModuleItem],
 ) -> list[ModuleItem]:
-    """Keep otherwise identical EI/FI menu identities distinct in one tree."""
+    """Keep EI/FI identities internal while showing business modules at the root."""
     return [
         replace(
             item,
             id=f"{project_key}::{item.id}",
-            path=(project_label, *item.path),
+            path=item.path,
         )
         for item in items
     ]
@@ -133,18 +153,29 @@ def project_key_from_item(item: ModuleItem) -> str:
     return prefix if marker and prefix in PROJECT_ORDER else "EI"
 
 
+def tree_branch_identity(item: ModuleItem, depth: int) -> tuple[str, ...]:
+    """Keep same-named EI/FI display branches separate without showing project roots."""
+    return (project_key_from_item(item), *item.path[:depth])
+
+
+def is_global_all_item(item: ModuleItem) -> bool:
+    """Return whether the launcher-only shortcut selects every loaded project."""
+    return item.id == "ALL" and item.path == ("ALL",)
+
+
 def is_project_all_item(item: ModuleItem) -> bool:
-    return item.id == "ALL" or item.id.endswith("::ALL")
+    return item.id.endswith("::ALL")
 
 
-def ordered_project_all_items(items: list[ModuleItem]) -> list[ModuleItem]:
-    """Return one ALL shortcut per project in the launcher display order."""
-    all_items = {
-        project_key_from_item(item): item
-        for item in items
-        if is_project_all_item(item)
-    }
-    return [all_items[project_key] for project_key in PROJECT_ORDER if project_key in all_items]
+def is_all_item(item: ModuleItem) -> bool:
+    return is_global_all_item(item) or is_project_all_item(item)
+
+
+def global_all_item(items: list[ModuleItem]) -> ModuleItem | None:
+    """Build one visual ALL shortcut for every currently loaded project tree."""
+    if not any(is_project_all_item(item) for item in items):
+        return None
+    return ModuleItem("ALL", "ALL", ("ALL",), runnable=True)
 
 
 def run_button_running_text(headless: bool) -> str:
@@ -399,6 +430,18 @@ def common_field_batch_timeout_seconds(
     return max(default_timeout_seconds, dynamic_budget)
 
 
+def workflow_timeout_seconds(
+    command_environment,
+    default_timeout_seconds: int,
+) -> int:
+    """Give a multi-step workflow its own bounded outer-process budget."""
+    explicit = str(
+        command_environment.get("EI_WORKFLOW_TIMEOUT_SECONDS", "") or ""
+    ).strip()
+    configured = int(explicit) if explicit else 1_200
+    return max(default_timeout_seconds, 30, configured)
+
+
 def register_discovered_validation_counts(
     command_entries, discovery_env, case_progress: CaseProgressTracker,
 ) -> int:
@@ -454,6 +497,7 @@ def execution_stage_label(test_file: str, sheet_name: str = "") -> str:
         "tests/test_module_action.py": "页面操作",
         "tests/test_form_smoke.py": "表单测试",
         "tests/test_module_smoke.py": "模块测试",
+        WORKFLOW_TEST_FILE: "业务流程",
     }
     label = labels.get(test_file, Path(test_file).stem)
     return f"{label}（{sheet_name}）" if sheet_name else label
@@ -566,6 +610,13 @@ def save_url_history(cache_file: Path, url: str) -> list[str]:
     return history
 
 
+def default_system_url(url_history: list[str]) -> str:
+    """Prefer the most recently entered address over optional environment defaults."""
+    return url_history[0] if url_history else (
+        os.getenv("EI_BASE_URL", "") or os.getenv("FI_BASE_URL", "")
+    )
+
+
 def should_open_tree_branch(item: ModuleItem, depth: int, query: str) -> bool:
     return bool(query.strip()) or depth < 2
 
@@ -656,6 +707,60 @@ def safe_run_log_name(module_id: str) -> str:
     return f"{safe or 'module'}.log"
 
 
+def workflow_role_storage_state_path(
+    project_root: Path,
+    workflow_id: str,
+    role: str,
+) -> Path:
+    """Return one absolute, traversal-safe storage-state path per workflow role."""
+    role = str(role or "").strip()
+    if role not in WORKFLOW_AUTH_ROLE_LABELS:
+        raise ValueError(f"不支持的业务流程角色：{role or '空'}")
+    safe_workflow_id = re.sub(
+        r"[^A-Za-z0-9._-]+", "_", str(workflow_id or "").strip()
+    )
+    safe_workflow_id = re.sub(r"_+", "_", safe_workflow_id).strip(" ._-")
+    safe_workflow_id = safe_workflow_id[:96].rstrip(" ._-") or "workflow"
+    return (
+        Path(project_root)
+        / "artifacts"
+        / "workflow-auth"
+        / f"{safe_workflow_id}-{role}.json"
+    ).resolve()
+
+
+def merge_workflow_role_states_json(
+    current_json: str,
+    *,
+    role: str,
+    state_path: str | Path,
+    project_root: Path,
+) -> str:
+    """Merge one absolute role path without embedding storage-state content."""
+    role = str(role or "").strip()
+    if role not in WORKFLOW_AUTH_ROLE_LABELS:
+        raise ValueError(f"不支持的业务流程角色：{role or '空'}")
+    raw = str(current_json or "").strip()
+    try:
+        mapping = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError("角色登录态 JSON 不是有效对象，请修正后重试") from exc
+    if not isinstance(mapping, dict):
+        raise ValueError("角色登录态 JSON 必须是 role -> 文件路径对象")
+    for existing_role, existing_path in mapping.items():
+        if not str(existing_role or "").strip():
+            raise ValueError("角色登录态 JSON 包含空角色名称")
+        if not isinstance(existing_path, str) or not existing_path.strip():
+            raise ValueError(
+                f"角色 {str(existing_role).strip()} 必须配置 storage-state 文件路径"
+            )
+    path = Path(state_path).expanduser()
+    if not path.is_absolute():
+        path = Path(project_root) / path
+    mapping[role] = str(path.resolve())
+    return json.dumps(mapping, ensure_ascii=False, separators=(",", ":"))
+
+
 def preferred_common_cases_sheet(sheets: list[str], current: str = "") -> str:
     """Keep a valid selection, otherwise prefer the conventional add sheet."""
     if current in sheets:
@@ -721,19 +826,16 @@ def build_pytest_command(
     executable: str, test_file: str, command_env, mode: str,
     results_dir: Path | None, *, collect_only: bool = False,
 ) -> list[str]:
-    test_target = (
-        f"{test_file}::test_selected_page_action"
-        if test_file == "tests/test_module_action.py"
-        else (
-            f"{test_file}::test_build_project_add_personalized"
-            if test_file == "tests/test_build_project_add_personalized.py"
-            else (
-                f"{test_file}::test_selected_common_detail_case"
-                if test_file == "tests/test_common_detail_validation.py"
-                else test_file
-            )
-        )
-    )
+    if test_file == "tests/test_module_action.py":
+        test_target = f"{test_file}::test_selected_page_action"
+    elif test_file == WORKFLOW_TEST_FILE:
+        test_target = f"{test_file}::test_selected_business_workflow"
+    elif test_file == "tests/test_build_project_add_personalized.py":
+        test_target = f"{test_file}::test_build_project_add_personalized"
+    elif test_file == "tests/test_common_detail_validation.py":
+        test_target = f"{test_file}::test_selected_common_detail_case"
+    else:
+        test_target = test_file
     command = [
         console_python_executable(executable), "-m", "pytest",
         "-p", "no:cacheprovider", "-p", "ei_ui_smoke.pytest_progress",
@@ -781,6 +883,127 @@ def build_pytest_command(
             "--module-case-ids", command_env.get("EI_MODULE_CASE_IDS_JSON", "[]"),
         ])
     return command
+
+
+def workflow_launcher_configuration_error(
+    project_key: str,
+    workflow_id: str,
+    factory_spec: str,
+    role_states_json: str,
+    workflow_config_json: str = "",
+) -> str:
+    """Validate the launcher-owned portion of a workflow configuration."""
+    project_key = str(project_key or "").strip().upper()
+    workflow_id = str(workflow_id or "").strip()
+    factory_spec = str(factory_spec or "").strip()
+    if project_key not in PROJECT_ORDER:
+        return "业务流程项目必须选择 EI 或 FI。"
+    if not workflow_id:
+        return "业务流程 ID 不能为空。"
+    module_name, separator, factory_name = factory_spec.partition(":")
+    if not separator or not module_name.strip() or not factory_name.strip():
+        return "业务流程 Factory 必须使用 python.module:factory 格式。"
+    try:
+        role_states = json.loads(str(role_states_json or ""))
+    except json.JSONDecodeError:
+        return "角色登录态必须是有效的 role -> storage-state 文件路径 JSON。"
+    if not isinstance(role_states, dict) or not role_states:
+        return "角色登录态必须是非空的 role -> storage-state 文件路径对象。"
+    for role, state_path in role_states.items():
+        role_name = str(role or "").strip()
+        if not role_name:
+            return "角色登录态包含空角色名称。"
+        if not isinstance(state_path, str) or not state_path.strip():
+            return f"角色 {role_name} 必须配置 storage-state 文件路径。"
+    registered = WORKFLOW_CATALOG.get(workflow_id)
+    is_repository_workflow = bool(
+        registered
+        and factory_spec == str(registered.get("factory", "")).strip()
+    )
+    if is_repository_workflow:
+        try:
+            workflow_config = json.loads(str(workflow_config_json or ""))
+        except json.JSONDecodeError:
+            return (
+                "内建资源池审批流程配置必须是有效的非空 JSON 对象（"
+                f"{RESOURCE_POOL_APPROVAL_CONFIG_ENV}）。"
+            )
+        if not isinstance(workflow_config, dict) or not workflow_config:
+            return (
+                "内建资源池审批流程配置必须是非空 JSON 对象（"
+                f"{RESOURCE_POOL_APPROVAL_CONFIG_ENV}）。"
+            )
+    return ""
+
+
+def workflow_launcher_defaults(
+    workflow_id: str,
+    *,
+    project_key: str = "",
+    factory_spec: str = "",
+) -> tuple[str, str, str]:
+    """Resolve repository-owned workflow defaults without hiding custom factories."""
+    selected_id = str(workflow_id or "").strip() or DEFAULT_WORKFLOW_ID
+    registered = WORKFLOW_CATALOG.get(selected_id, {})
+    selected_project = (
+        str(project_key or "").strip().upper()
+        or str(registered.get("project", "")).strip().upper()
+        or "EI"
+    )
+    selected_factory = (
+        str(factory_spec or "").strip()
+        or str(registered.get("factory", "")).strip()
+    )
+    return selected_project, selected_id, selected_factory
+
+
+def build_workflow_environment(
+    base_environment,
+    *,
+    workflow_id: str,
+    factory_spec: str,
+    role_states_json: str,
+    workflow_config_json: str = "",
+    workflow_login_password: str = "",
+) -> dict[str, str]:
+    """Create an isolated workflow environment without independent-action state."""
+    environment = dict(base_environment)
+    for name in tuple(environment):
+        if name.startswith("EI_ACTION"):
+            environment.pop(name, None)
+    for name in (
+        "EI_REQUIRE_ADD",
+        "EI_STORAGE_STATE",
+        "EI_USERNAME",
+        "EI_PASSWORD",
+        "EI_WORKFLOW_LOGIN_PASSWORD",
+        RESOURCE_POOL_APPROVAL_CONFIG_ENV,
+    ):
+        environment.pop(name, None)
+    environment.update({
+        "EI_WORKFLOW_ID": str(workflow_id).strip(),
+        "EI_WORKFLOW_FACTORY": str(factory_spec).strip(),
+        "EI_WORKFLOW_ROLE_STATES_JSON": str(role_states_json).strip(),
+    })
+    workflow_config_json = str(workflow_config_json or "").strip()
+    if workflow_config_json:
+        environment[RESOURCE_POOL_APPROVAL_CONFIG_ENV] = workflow_config_json
+    if str(workflow_login_password or ""):
+        environment["EI_WORKFLOW_LOGIN_PASSWORD"] = str(
+            workflow_login_password
+        )
+    return environment
+
+
+def workflow_launcher_target(project_key: str, workflow_id: str) -> ModuleItem:
+    project_key = str(project_key).strip().upper()
+    workflow_id = str(workflow_id).strip()
+    return ModuleItem(
+        id=f"{project_key}::workflow::{workflow_id}",
+        name=workflow_id,
+        path=(PROJECT_LABELS[project_key], "业务流程", workflow_id),
+        runnable=True,
+    )
 
 
 def collect_pytest_case_count(
@@ -1175,6 +1398,7 @@ def group_action_commands(commands):
             "form_code": target.form_code,
             "require_add": command_env.get("EI_REQUIRE_ADD", ""),
             "requires_business_id": target.requires_business_id,
+            "page_tab": command_env.get("EI_PAGE_TAB", ""),
         }
         if batch_index is None:
             batch_index = len(grouped)
@@ -1404,6 +1628,7 @@ def command_failure_names(target, command_env, test_file: str, output: str = "")
 
 
 def resolve_selected_targets(items: list[ModuleItem], selected_items: list[ModuleItem]) -> list[ModuleItem]:
+    selected_everything = any(is_global_all_item(item) for item in selected_items)
     selected_all_projects = {
         project_key_from_item(item)
         for item in selected_items
@@ -1412,10 +1637,11 @@ def resolve_selected_targets(items: list[ModuleItem], selected_items: list[Modul
     selected_ids = {item.id for item in selected_items}
     selected = [
         item for item in items
-        if not is_project_all_item(item)
+        if not is_all_item(item)
         and is_executable_target(item)
         and (
-            project_key_from_item(item) in selected_all_projects
+            selected_everything
+            or project_key_from_item(item) in selected_all_projects
             or item.id in selected_ids
         )
     ]
@@ -1618,7 +1844,6 @@ class Launcher(tk.Tk):
         except RuntimeError:
             # Execution performs the same check and shows the actionable error.
             pass
-        register_launcher_process(self.project_root)
         self.protocol("WM_DELETE_WINDOW", self._close_launcher)
         self.url_history_file = self.project_root / "artifacts" / "launcher-history.json"
         self.url_history = load_url_history(self.url_history_file)
@@ -1629,9 +1854,7 @@ class Launcher(tk.Tk):
         }
         self.by_tree_id: dict[str, ModuleItem] = {}
         self.source = tk.StringVar(value=DEFAULT_SOURCE)
-        self.system_url = tk.StringVar(
-            value=os.getenv("EI_BASE_URL", "") or os.getenv("FI_BASE_URL", "")
-        )
+        self.system_url = tk.StringVar(value=default_system_url(self.url_history))
         self.query = tk.StringVar()
         self.mode = tk.StringVar(value=DEFAULT_EXECUTION_MODE)
         self.headless = tk.BooleanVar(value=False)
@@ -1869,6 +2092,8 @@ class Launcher(tk.Tk):
             row=1, column=0, sticky="ew", pady=(6, 0)
         )
         url_input.bind("<Button-1>", self._show_url_history)
+        url_input.bind("<FocusOut>", self._remember_system_url)
+        url_input.bind("<Return>", self._remember_system_url)
         self.project_url_inputs = {"EI": url_input}
         project_row = ttk.Frame(environment_body, style="Surface.TFrame")
         project_row.grid(row=2, column=0, sticky="ew", pady=(14, 0))
@@ -1975,6 +2200,7 @@ class Launcher(tk.Tk):
             style="Primary.TButton",
         )
         self.run_button.pack(side="right")
+
         execution_body = ttk.Frame(execution, style="Surface.TFrame")
         execution_body.grid(row=1, column=0, sticky="ew", pady=(9, 0))
         file_panel = ttk.Frame(execution_body, style="Surface.TFrame")
@@ -2481,33 +2707,40 @@ class Launcher(tk.Tk):
             widget = getattr(_event, "widget", None) or self.system_url_input
             self.after_idle(lambda: self.tk.call("ttk::combobox::Post", widget))
 
+    def _remember_system_url(self, _event=None) -> None:
+        """Persist an editable address as soon as the user finishes entering it."""
+        self.url_history = save_url_history(
+            self.url_history_file, self.system_url.get()
+        )
+        for input_widget in getattr(self, "project_url_inputs", {}).values():
+            input_widget.configure(values=self.url_history)
+
     def render(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self.by_tree_id.clear()
         filtered = search_modules(self.items, self.query.get())
-        # Project-wide execution shortcuts remain fixed at the top, while the
-        # project menu trees below retain their source/runtime hierarchy.
-        all_items = ordered_project_all_items(self.items)
-        visible_items = [item for item in filtered if not is_project_all_item(item)]
-        for item in all_items:
-            project_key = project_key_from_item(item)
+        # One global shortcut remains fixed at the top. Project namespaces are
+        # retained only in branch identities, not displayed as tree roots.
+        all_item = global_all_item(self.items)
+        visible_items = [item for item in filtered if not is_all_item(item)]
+        if all_item is not None:
             tree_id = self.tree.insert(
-                "", "end", text=f"{PROJECT_LABELS[project_key]} / ALL",
+                "", "end", text="ALL",
                 values=("", "全部可运行模块"), tags=("all",),
                 image=self._tree_blank_image,
             )
-            self.by_tree_id[tree_id] = item
+            self.by_tree_id[tree_id] = all_item
         parent_paths = {
-            item.path[:depth]
+            tree_branch_identity(item, depth)
             for item in visible_items
             for depth in range(1, len(item.path))
         }
         branch_ids: dict[tuple[str, ...], str] = {}
-        visual_row = len(all_items)
+        visual_row = 1 if all_item is not None else 0
         for item in visible_items:
             parent = ""
             for depth, label in enumerate(item.path):
-                branch = item.path[: depth + 1]
+                branch = tree_branch_identity(item, depth + 1)
                 if branch not in branch_ids:
                     leaf = depth == len(item.path) - 1
                     should_open = should_open_tree_branch(item, depth, self.query.get())
@@ -2584,22 +2817,58 @@ class Launcher(tk.Tk):
                     runtime_version_mismatch_message(launch_version, current_version),
                 )
                 return
-        targets = self._selected_targets()
-        if not targets:
-            messagebox.showwarning("请选择模块", "请选择一个或多个模块，父模块会自动包含其可执行子模块。")
-            return
-        targets_by_project = {
-            project_key: [
-                target for target in targets
-                if project_key_from_item(target) == project_key
-            ]
-            for project_key in PROJECT_ORDER
-        }
-        targets_by_project = {
-            project_key: project_targets
-            for project_key, project_targets in targets_by_project.items()
-            if project_targets
-        }
+        workflow_enabled = bool(
+            getattr(self, "workflow_enabled", _StaticValue(False)).get()
+        )
+        workflow_project = "EI"
+        workflow_id = DEFAULT_WORKFLOW_ID
+        _project, workflow_id, workflow_factory = workflow_launcher_defaults(
+            workflow_id
+        )
+        workflow_role_states = json.dumps(
+            {
+                "maker": str(
+                    workflow_role_storage_state_path(
+                        self.project_root, workflow_id, "maker"
+                    )
+                )
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        workflow_config = os.getenv(RESOURCE_POOL_APPROVAL_CONFIG_ENV, "").strip()
+        if workflow_enabled:
+            if error := workflow_launcher_configuration_error(
+                workflow_project,
+                workflow_id,
+                workflow_factory,
+                workflow_role_states,
+                workflow_config,
+            ):
+                messagebox.showwarning("业务流程配置无效", error)
+                return
+            targets: list[ModuleItem] = []
+            targets_by_project = {workflow_project: []}
+        else:
+            targets = self._selected_targets()
+            if not targets:
+                messagebox.showwarning(
+                    "请选择模块",
+                    "请选择一个或多个模块，父模块会自动包含其可执行子模块。",
+                )
+                return
+            targets_by_project = {
+                project_key: [
+                    target for target in targets
+                    if project_key_from_item(target) == project_key
+                ]
+                for project_key in PROJECT_ORDER
+            }
+            targets_by_project = {
+                project_key: project_targets
+                for project_key, project_targets in targets_by_project.items()
+                if project_targets
+            }
         aligned_urls: dict[str, str] = {}
         for project_key in targets_by_project:
             profile = Launcher._project_profile(self, project_key)
@@ -2609,7 +2878,7 @@ class Launcher(tk.Tk):
                     f"已选择 {profile.label} 模块，请先勾选该项目后再执行。",
                 )
                 return
-            if not profile.storage.get() and (
+            if not workflow_enabled and not profile.storage.get() and (
                 not profile.username.get() or not profile.password.get()
             ):
                 messagebox.showwarning(
@@ -2628,7 +2897,7 @@ class Launcher(tk.Tk):
                 )
                 return
         mode = self.mode.get()
-        resource_pool_mode_errors = [
+        resource_pool_mode_errors = [] if workflow_enabled else [
             (target, resource_pool_mode_preflight_error(target, mode))
             for target in targets
         ]
@@ -2651,11 +2920,15 @@ class Launcher(tk.Tk):
                     "勾选‘失败后录入禅道’前，请先配置：" + ", ".join(missing),
                 )
                 return
-        common_workbook = self.common_cases_excel.get().strip()
-        module_workbook = self.module_cases_excel.get().strip()
+        common_workbook = (
+            "" if workflow_enabled else self.common_cases_excel.get().strip()
+        )
+        module_workbook = (
+            "" if workflow_enabled else self.module_cases_excel.get().strip()
+        )
         effective_common_case_ids: list[str] = []
         effective_module_case_ids: list[str] = []
-        if mode == "standard":
+        if mode == "standard" and not workflow_enabled:
             workbook_path = Path(common_workbook).expanduser() if common_workbook else None
             if workbook_path and not workbook_path.is_absolute():
                 workbook_path = (self.project_root / workbook_path).resolve()
@@ -2724,7 +2997,9 @@ class Launcher(tk.Tk):
         # must not carry the EI browser/session environment into FI actions.
         for project_key in PROJECT_ORDER:
             project_targets = targets_by_project.get(project_key, [])
-            if not project_targets:
+            if not project_targets and not (
+                workflow_enabled and project_key == workflow_project
+            ):
                 continue
             profile = Launcher._project_profile(self, project_key)
             aligned_url = aligned_urls[project_key]
@@ -2738,6 +3013,26 @@ class Launcher(tk.Tk):
                 "EI_AUTOMATION_PROJECT": project_key,
                 "EI_AUTOMATION_RUN_ID": f"{root_run_id}_{project_key.lower()}",
             })
+            if workflow_enabled:
+                workflow_env = build_workflow_environment(
+                    project_env,
+                    workflow_id=workflow_id,
+                    factory_spec=workflow_factory,
+                    role_states_json=workflow_role_states,
+                    workflow_config_json=workflow_config,
+                    workflow_login_password=(
+                        os.getenv("EI_WORKFLOW_LOGIN_PASSWORD", "")
+                        or str(profile.password.get() or "")
+                    ),
+                )
+                commands.append((
+                    workflow_launcher_target(project_key, workflow_id),
+                    workflow_env,
+                    WORKFLOW_TEST_FILE,
+                ))
+                continue
+            for name in WORKFLOW_ENVIRONMENT_KEYS:
+                project_env.pop(name, None)
             project_commands = []
             for target in project_targets:
                 if error := target_preflight_error(target):
@@ -2951,7 +3246,11 @@ class Launcher(tk.Tk):
                 command_env[DEFER_SKILL_GATE_ENV] = "true"
                 if test_file == "tests/test_common_field_discovery.py":
                     clear_discovery_manifest(command_env)
-                if test_file == "tests/test_common_field_validation.py":
+                if test_file == WORKFLOW_TEST_FILE:
+                    timeout_seconds = workflow_timeout_seconds(
+                        command_env, timeout_seconds
+                    )
+                elif test_file == "tests/test_common_field_validation.py":
                     # Its parameters depend on the fresh manifest created by this run's
                     # discovery command. A previous run's manifest is not a valid total.
                     continue
@@ -3276,7 +3575,9 @@ class Launcher(tk.Tk):
                 )
 
 def main() -> int:
-    Launcher().mainloop()
+    launcher = Launcher()
+    register_launcher_process(launcher.project_root)
+    launcher.mainloop()
     return 0
 
 

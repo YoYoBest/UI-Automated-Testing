@@ -97,15 +97,34 @@ def runtime_version_changed(started: RuntimeVersion, current: RuntimeVersion) ->
     return started != current
 
 
+def runtime_version_change_reason(
+    started: RuntimeVersion, current: RuntimeVersion,
+) -> str:
+    """Describe which immutable runtime identity changed after launcher startup."""
+    commit_changed = started.commit != current.commit
+    source_changed = started.worktree_fingerprint != current.worktree_fingerprint
+    if commit_changed and source_changed:
+        return "Git 提交和自动化运行源码内容均已变化"
+    if commit_changed:
+        return "Git 提交已变化"
+    if source_changed:
+        return "自动化运行源码内容已变化（Git 提交号未变化，通常是本地未提交修改）"
+    return "自动化运行代码版本未变化"
+
+
 def runtime_version_mismatch_message(
     started: RuntimeVersion, current: RuntimeVersion,
 ) -> str:
-    started_label = started.commit[:12] or started.worktree_fingerprint[:12]
-    current_label = current.commit[:12] or current.worktree_fingerprint[:12]
+    started_commit = started.commit[:12] or "不可用"
+    current_commit = current.commit[:12] or "不可用"
     return (
         "自动化代码版本已在启动后发生变化，已阻止本次执行。\n\n"
-        f"启动版本：{started_label}\n"
-        f"当前版本：{current_label}\n\n"
+        f"变化原因：{runtime_version_change_reason(started, current)}\n"
+        f"启动 Git 提交：{started_commit}\n"
+        f"当前 Git 提交：{current_commit}\n"
+        "运行源码指纹："
+        f"{started.worktree_fingerprint[:12]} -> "
+        f"{current.worktree_fingerprint[:12]}\n\n"
         "请关闭启动器并重新运行 run_test.vbs，再重新执行测试。"
     )
 

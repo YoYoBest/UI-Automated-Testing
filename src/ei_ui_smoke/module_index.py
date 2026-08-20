@@ -261,6 +261,9 @@ def modules_from_menu(payload: object, source_root: Path) -> list[ModuleItem]:
             owner.route.rstrip("/") + "/detail",
             f"father:{father_id}",
             by_component,
+            tab_label=owner.tab_label,
+            tab_value=owner.tab_value,
+            tab_owner_component=owner.tab_owner_component,
         )
     _append_father_detail_actions(
         result, by_component, actions_by_component, granted_button_codes
@@ -285,6 +288,10 @@ def _demote_directory_nodes(items: list[ModuleItem]) -> list[ModuleItem]:
 def _append_detail_modules(
     result: list[ModuleItem], nodes: list[object], parents: tuple[str, ...],
     detail_route: str, prefix: str, by_component: dict[str, ModuleItem],
+    *,
+    tab_label: str = "",
+    tab_value: str = "",
+    tab_owner_component: str = "",
 ) -> None:
     for position, raw in enumerate(nodes):
         if not isinstance(raw, dict):
@@ -302,9 +309,17 @@ def _append_detail_modules(
             source_file=source.source_file if source else "", component=component,
             route=detail_route, form_code=source.form_code if source else "",
             runnable=False, requires_business_id=True,
+            tab_label=tab_label,
+            tab_value=tab_value,
+            tab_owner_component=tab_owner_component,
         ))
         children = raw.get("children") if isinstance(raw.get("children"), list) else []
-        _append_detail_modules(result, children, item_path, detail_route, prefix, by_component)
+        _append_detail_modules(
+            result, children, item_path, detail_route, prefix, by_component,
+            tab_label=tab_label,
+            tab_value=tab_value,
+            tab_owner_component=tab_owner_component,
+        )
 
 
 def _actions_for_source_binding(
@@ -312,17 +327,33 @@ def _actions_for_source_binding(
     structural_source: ModuleItem,
     actions_by_component: dict[str, list[ModuleItem]],
     granted_button_codes: set[str] | None,
+    *,
+    allow_uncovered_permission_fallback: bool = False,
 ) -> list[ModuleItem]:
     source_actions = actions_by_component.get(_source_identity(structural_source), [])
     structural_actions = [action for action in source_actions if action.operation_path]
     if source is None:
         return structural_actions
-    return [
+    filtered_actions = [
         action for action in source_actions
         if granted_button_codes is None
         or not action.permission_codes
         or bool(granted_button_codes.intersection(action.permission_codes))
     ]
+    if not allow_uncovered_permission_fallback or granted_button_codes is None:
+        return filtered_actions
+
+    # The menu-level permission endpoint may omit codes for dynamically loaded
+    # father-ID detail components.  Keep their exact-source actions discoverable
+    # only when it covers none of that component's controlled actions.
+    controlled_actions = [action for action in source_actions if action.permission_codes]
+    has_component_permission = any(
+        granted_button_codes.intersection(action.permission_codes)
+        for action in controlled_actions
+    )
+    if controlled_actions and not has_component_permission:
+        return source_actions
+    return filtered_actions
 
 
 def _append_father_detail_actions(
@@ -344,7 +375,11 @@ def _append_father_detail_actions(
         if structural_source is None:
             continue
         for position, action in enumerate(_actions_for_source_binding(
-            source, structural_source, actions_by_component, granted_button_codes
+            source,
+            structural_source,
+            actions_by_component,
+            granted_button_codes,
+            allow_uncovered_permission_fallback=True,
         )):
             operation_tail = (
                 action.path[-(len(action.operation_path) + 1):]
@@ -363,6 +398,9 @@ def _append_father_detail_actions(
                 operation=action.operation,
                 operation_path=action.operation_path,
                 permission_codes=action.permission_codes,
+                tab_label=item.tab_label,
+                tab_value=item.tab_value,
+                tab_owner_component=item.tab_owner_component,
             ))
 
 

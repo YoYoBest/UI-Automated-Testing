@@ -6,6 +6,8 @@ from ei_ui_smoke.execution_guard import (
     capture_runtime_version,
     clear_launcher_process_record,
     launcher_process_file,
+    runtime_version_change_reason,
+    runtime_version_mismatch_message,
 )
 
 
@@ -37,6 +39,19 @@ def test_capture_runtime_version_detects_loaded_source_edits_without_git(tmp_pat
 
     assert before.commit == ""
     assert before.worktree_fingerprint != after.worktree_fingerprint
+
+
+def test_version_message_explains_an_uncommitted_runtime_source_change():
+    started = RuntimeVersion(commit="a" * 40, worktree_fingerprint="before" * 11)
+    current = RuntimeVersion(commit="a" * 40, worktree_fingerprint="after" * 13)
+
+    assert runtime_version_change_reason(started, current) == (
+        "自动化运行源码内容已变化（Git 提交号未变化，通常是本地未提交修改）"
+    )
+    message = runtime_version_mismatch_message(started, current)
+    assert "启动 Git 提交：aaaaaaaaaaaa" in message
+    assert "当前 Git 提交：aaaaaaaaaaaa" in message
+    assert "运行源码指纹：beforebefore -> afterafteraf" in message
 
 
 def test_launcher_script_excludes_tortoisesvn_runtime_from_child_path():

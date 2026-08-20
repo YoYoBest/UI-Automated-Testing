@@ -30,7 +30,8 @@ LOCAL_FORM_IMPORT = re.compile(
     r"import\s+(?P<name>[A-Za-z_$][\w$]*Form)\s+from\s+['\"](?P<path>\.[^'\"]+)['\"]"
 )
 LOCAL_COMPONENT_IMPORT = re.compile(
-    r"import\s+(?P<name>[A-Za-z_$][\w$]*)\s+from\s+['\"](?P<path>\.[^'\"]+)['\"]"
+    r"import\s+(?P<name>[A-Za-z_$][\w$]*)(?:\s*,\s*\{[^}]*\})?\s+"
+    r"from\s+['\"](?P<path>\.[^'\"]+)['\"]"
 )
 ADD_DIALOG_HANDLER = re.compile(
     r"\b(?:open(?:Add|Create|New)[\w$]*|(?:add|create|new)[\w$]*Dialog)\s*"

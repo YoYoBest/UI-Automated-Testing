@@ -35,12 +35,26 @@ from ei_ui_smoke.models import DomField, FieldDefinition
 
 
 def test_classifies_semantic_number_fields_without_overriding_control_kind():
+    assert classify_common_field_type("合同价值", "amount") == "amount"
     assert classify_common_field_type("投资金额", "number") == "amount"
+    assert classify_common_field_type("总资产（万元）", "text") == "amount"
+    assert classify_common_field_type("总负债（元）", "number") == "amount"
     assert classify_common_field_type("投资比例", "number") == "percentage"
     assert classify_common_field_type("预计回报", "number", "expectedReturnRate") == "percentage"
     assert classify_common_field_type("项目名称", "text") == "text"
     assert classify_common_field_type("项目基本情况", "textarea") == "textarea"
     assert classify_common_field_type("金额币种", "select") == "select"
+
+
+def test_source_amount_type_wins_before_label_unit_fallback():
+    fields = discover_common_fields(
+        [DomField("contractValue", "合同价值", "text", "#contract-value")],
+        [FieldDefinition("contractValue", "合同价值", "AMOUNT")],
+    )
+
+    assert [(field.kind, field.field_type) for field in fields] == [
+        ("amount", "amount")
+    ]
 
 
 def test_binds_choice_rules_only_to_matching_runtime_control_kinds():
@@ -59,6 +73,27 @@ def test_binds_choice_rules_only_to_matching_runtime_control_kinds():
     assert [(case.field_key, case.case_id) for case in cases] == [
         ("type", "SELECT"),
         ("decision", "RADIO"),
+    ]
+
+
+def test_source_multi_select_contract_excludes_single_select_rules():
+    fields = discover_common_fields(
+        [DomField("categories", "项目分类", "select", "#categories")],
+        [FieldDefinition("categories", "项目分类", "ElSelect-MULTIPLE")],
+    )
+    rules = [
+        CommonFieldRule("ADD-056", "select", "固定码值", None, "accepted"),
+        CommonFieldRule("ADD-057", "select", "只能选择一项", None, "accepted"),
+        CommonFieldRule("ADD-055", "multi_select", "取消选中", None, "accepted"),
+    ]
+
+    cases = bind_common_rules(fields, rules)
+
+    assert [(field.kind, field.field_type) for field in fields] == [
+        ("multi_select", "multi_select")
+    ]
+    assert [(case.field_key, case.case_id) for case in cases] == [
+        ("categories", "ADD-055")
     ]
 
 

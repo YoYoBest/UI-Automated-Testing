@@ -1225,6 +1225,31 @@ def test_choice_frontend_assertions_do_not_terminate_form_session():
     assert not CommonFieldFormSession._has_terminal_effect(results)
 
 
+@pytest.mark.parametrize("data_mode, expected_calls", [
+    ("standard", 1), ("probe", 0), ("stable", 0),
+])
+def test_choice_collection_preparation_is_standard_mode_only(
+    data_mode, expected_calls,
+):
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    calls = []
+    executor.driver = type("Driver", (), {
+        "data_strategy": type("Strategy", (), {"data_mode": data_mode})(),
+        "_prepare_configured_dynamic_collection_for_field": staticmethod(
+            lambda scope, field_key: calls.append((scope, field_key))
+        ),
+    })()
+    case = BoundCommonCase(
+        "ADD-056", "financeSources.*.sourceFrom", "资金来源", "select",
+        "#source", "固定码值", "", "accepted", "", "P1", source_row=1,
+    )
+    scope = object()
+
+    executor._prepare_standard_choice_collection(case, scope)
+
+    assert calls == [(scope, "financeSources.*.sourceFrom")] * expected_calls
+
+
 def test_unique_record_identity_value_appends_per_save_token_and_respects_max_length():
     value = CommonFieldExecutor._unique_record_identity_value(
         "UI自动化_20260806224425_1", "S003"
@@ -1449,6 +1474,26 @@ def test_readonly_choice_case_is_not_applicable_without_interaction():
     assert result.outcome == "runtime_not_applicable"
     assert result.observed == "当前记录该字段为只读：progressType（项目进度）"
     assert result.outcome in CommonFieldFormSession._REUSABLE_OUTCOMES
+
+
+def test_single_select_case_skips_when_runtime_field_is_multi_select():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor._apply_case_branch_conditions = lambda *_args: None
+    executor._scan_fields = lambda _scope=None: [
+        DomField("categories", "项目分类", "multi_select", "#categories")
+    ]
+    case = BoundCommonCase(
+        "ADD-057", "categories", "项目分类", "select", "#categories",
+        "只能选择一项", "", "accepted", "", "P1",
+    )
+
+    field = executor._current_field(case, object())
+    result = executor._execute_choice_case(case, field, object())
+
+    assert field.kind == "multi_select"
+    assert result.outcome == "runtime_not_applicable"
+    assert "多选下拉框" in result.observed
+    assert "单选下拉框用例不适用" in result.observed
 
 
 def test_choice_case_rescans_readonly_state_after_baseline_rerender():
@@ -2741,7 +2786,7 @@ def test_new_form_scope_skips_visible_empty_shell_before_real_editor(monkeypatch
     assert executor._wait_for_new_form_scope("old", timeout=1).visible_controls
 
 
-def test_scan_fields_rebinds_only_to_a_unique_live_form_after_rerender(monkeypatch):
+def test_scan_fields_rebinds_only_during_an_expected_rerender(monkeypatch):
     stale = object()
     rebound = object()
 
@@ -2806,14 +2851,18 @@ def test_scan_fields_rebinds_only_to_a_unique_live_form_after_rerender(monkeypat
         ],
     )
 
-    fields = executor._scan_fields(stale)
+    assert executor._scan_fields(stale) == []
+    assert executor._form_session.active.scope is stale
+    assert not hasattr(executor, "bound_scope")
+
+    fields = executor._scan_fields(stale, allow_scope_rebind=True)
 
     assert [field.field_code for field in fields] == ["assetYear"]
     assert executor._form_session.active.scope is rebound
     assert executor.bound_scope is rebound
 
 
-def test_scan_fields_rebinds_when_old_scope_retains_partial_controls(monkeypatch):
+def test_scan_fields_does_not_rebind_when_old_scope_retains_controls(monkeypatch):
     class Controls:
         def __init__(self, count):
             self._count = count
@@ -2895,11 +2944,51 @@ def test_scan_fields_rebinds_when_old_scope_retains_partial_controls(monkeypatch
         ),
     )
 
-    fields = executor._scan_fields(stale)
+    fields = executor._scan_fields(stale, allow_scope_rebind=True)
 
-    assert [field.field_code for field in fields] == ["assetYear", "assetName"]
-    assert executor._form_session.active.scope is rebound
-    assert executor.bound_scope is rebound
+    assert [field.field_code for field in fields] == ["legacy"]
+    assert executor._form_session.active.scope is stale
+    assert not hasattr(executor, "bound_scope")
+
+
+@pytest.mark.parametrize(
+    ("branch_changed", "expected_rebind", "tracks_network"),
+    [
+        (False, False, False),
+        (True, True, True),
+    ],
+)
+def test_branch_conditions_open_rebind_window_only_after_value_change(
+    branch_changed, expected_rebind, tracks_network,
+):
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    scope = object()
+    tracker = object()
+    driver = DiscoveredCommonField(
+        "investType", "投资类型", "select", "select", "#invest-type",
+        FieldConstraints(),
+    )
+    waits = []
+    stopped = []
+    executor._active_form_scope = lambda: None
+    executor._branch_driver_field = lambda _field_key, actual_scope: (
+        driver if actual_scope is scope else None
+    )
+    executor._start_branch_network_tracker = lambda: tracker
+    executor._select_branch_option = lambda *_args: branch_changed
+    executor._wait_for_fields_stable = lambda actual_scope, **kwargs: (
+        waits.append((actual_scope, kwargs)) or []
+    )
+    executor._stop_branch_network_tracker = lambda actual_tracker: stopped.append(
+        actual_tracker
+    )
+
+    executor._apply_branch_conditions((("investType", "非股权"),), scope)
+
+    assert waits[0][0] is scope
+    assert waits[0][1]["allow_scope_rebind"] is expected_rebind
+    assert (waits[0][1]["network_tracker"] is tracker) is tracks_network
+    assert stopped == [tracker]
 
 
 def test_branch_stability_waits_for_loading_and_tracked_request_idle(
@@ -3934,6 +4023,55 @@ def test_common_executor_reuses_date_interactor_for_replace():
     executor._replace_value(field, "2026-08-12")
 
     assert ("fill", "riskOccurredDate", "date", "2026-08-12") in calls
+
+
+def test_common_executor_uses_raw_input_for_invalid_date_case():
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    field = DiscoveredCommonField(
+        "riskOccurredDate", "发生时间", "date", "date", "#risk-date", FieldConstraints()
+    )
+    dom = DomField("riskOccurredDate", "发生时间", "date", "#risk-date")
+    calls = []
+
+    class _Interactor:
+        @staticmethod
+        def locate(resolved):
+            return type("Locator", (), {"input_value": staticmethod(lambda: "2025-02-29")})()
+
+        @staticmethod
+        def fill(resolved, value, **kwargs):
+            calls.append((resolved.definition.field_code, resolved.dom.kind, value, kwargs))
+
+    executor.driver = type("Driver", (), {"interactor": _Interactor()})()
+    executor._scan_fields = lambda _scope=None: [dom]
+
+    executor._replace_value(field, "2025-02-29", raw_date_input=True)
+
+    assert calls == [("riskOccurredDate", "date", "2025-02-29", {"raw_date_input": True})]
+
+
+@pytest.mark.parametrize(
+    ("expected_type", "field_kind", "value", "expected"),
+    [
+        ("field_error", "date", "2025-02-29", True),
+        ("field_error", "datetime", "2025-02-29 10:00:00", True),
+        ("accepted", "date", "2025-02-29", False),
+        ("field_error", "date", "2026-08-12", False),
+        ("field_error", "text", "2025-02-29", False),
+    ],
+)
+def test_raw_date_input_is_reserved_for_calendar_invalid_negative_cases(
+    expected_type, field_kind, value, expected,
+):
+    case = BoundCommonCase(
+        "ADD-045", "dueDate", "日期", field_kind, "#due-date", "非法日期手工输入",
+        value, expected_type, "应提示错误", "P1",
+    )
+    field = DiscoveredCommonField(
+        "dueDate", "日期", field_kind, field_kind, "#due-date", FieldConstraints()
+    )
+
+    assert CommonFieldExecutor._should_use_raw_date_input(case, field, value) is expected
 
 
 def test_required_file_is_retried_after_other_required_controls_are_restored():
@@ -7012,6 +7150,78 @@ def test_discovers_visible_form_close_command():
     ]
 
 
+def test_form_command_discovery_uses_rebound_session_scope():
+    class Match:
+        def __init__(self, matched):
+            self.matched = matched
+
+        def count(self):
+            return int(self.matched)
+
+    class Buttons:
+        def filter(self, *, has_text):
+            return Match(bool(has_text.search("保存")))
+
+        def count(self):
+            return 1
+
+    class Scope:
+        def __init__(self, name):
+            self.name = name
+
+        def locator(self, selector):
+            if self.name == "old":
+                raise AssertionError("stale scope must not be queried")
+            assert selector == "button:visible"
+            return Buttons()
+
+    old_scope = Scope("old")
+    new_scope = Scope("new")
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = type("Page", (), {"url": "https://example.test/form"})()
+    executor._form_session = CommonFieldFormSession(executor)
+    executor._form_session.active = executor_module._ActiveCommonFieldForm(
+        new_scope, None, executor.page.url
+    )
+    executor._form_close_button = lambda _scope: None
+    executor._form_title = lambda _scope: None
+
+    commands = executor._discover_form_commands(old_scope)
+
+    assert [(command.field_key, command.field_type) for command in commands] == [
+        ("__save_command", "save_command")
+    ]
+
+
+def test_submit_case_uses_rebound_session_scope_before_preflight():
+    old_scope = object()
+    new_scope = object()
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = type("Page", (), {"url": "https://example.test/form"})()
+    executor._form_session = CommonFieldFormSession(executor)
+    executor._form_session.active = executor_module._ActiveCommonFieldForm(
+        new_scope, None, executor.page.url
+    )
+
+    def preflight(_case, actual_scope, _submitted, **_kwargs):
+        assert actual_scope is new_scope
+        raise RuntimeError("preflight reached with current scope")
+
+    executor._preflight_branch_baseline = preflight
+    case = _transaction_case("ADD-SCOPE", "name", "text", "value")
+
+    with pytest.raises(RuntimeError, match="current scope"):
+        executor._submit_case(
+            case,
+            old_scope,
+            None,
+            {"name": "value"},
+            "value",
+            "value",
+            "",
+        )
+
+
 def test_discovers_and_verifies_visible_dialog_title():
     class Title:
         def count(self):
@@ -7241,7 +7451,7 @@ def test_discovers_inline_edit_commands_from_nearest_page_host():
 
         def locator(self, selector):
             assert selector == "button:visible"
-            return Buttons(("保存", "取消编辑"))
+            return Buttons(("暂存", "取消编辑"))
 
         def count(self):
             return 1
@@ -8746,6 +8956,63 @@ def test_required_file_recovery_scopes_upload_to_target_form_item():
     executor._upload_required_attachment(Locator("scope"), field)
 
     assert uploaded == ["target-owner"]
+
+
+def test_required_file_recovery_re_resolves_selector_in_rebound_scope():
+    class Locator:
+        def __init__(self, name):
+            self.name = name
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def locator(self, selector):
+            assert "el-form-item" in selector
+            return Locator("new-owner")
+
+    class Scope:
+        def __init__(self, name):
+            self.name = name
+
+        def locator(self, selector):
+            if self.name == "old":
+                raise AssertionError("stale scope must not be queried")
+            assert selector == "#new-report-file"
+            return Locator("new-file-input")
+
+    old_scope = Scope("old")
+    new_scope = Scope("new")
+    executor = CommonFieldExecutor.__new__(CommonFieldExecutor)
+    executor.page = type("Page", (), {"url": "https://example.test/form"})()
+    executor._form_session = CommonFieldFormSession(executor)
+    executor._form_session.active = executor_module._ActiveCommonFieldForm(
+        new_scope, None, executor.page.url
+    )
+    uploaded = []
+    executor.driver = type(
+        "Driver", (), {
+            "_upload_default_attachments": (
+                lambda _self, owner: uploaded.append(owner.name) or 1
+            ),
+        }
+    )()
+    executor._dom_for_discovered_field = lambda _field, scope: (
+        DomField("file:report", "立项报告", "file", "#new-report-file")
+        if scope is new_scope else None
+    )
+    executor._required_control_has_value = lambda _field: True
+    field = DiscoveredCommonField(
+        "file:report", "立项报告", "file", "file", "#old-report-file",
+        FieldConstraints(required=True),
+    )
+
+    executor._upload_required_attachment(old_scope, field)
+
+    assert uploaded == ["new-owner"]
 
 
 def test_required_error_snapshot_waits_for_late_field_messages(monkeypatch):

@@ -82,6 +82,31 @@ def test_project_adjustment_collection_uses_rendered_form_root():
     assert specs[0].root_selector == ".adjustment-type-form"
 
 
+def test_project_decision_finance_sources_match_the_exact_component_contract():
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+
+    specs = load_dynamic_collection_specs(
+        data_dir,
+        component="src/views/buildProject/before/projectDecision/index.vue",
+    )
+
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.field_code == "financeSources"
+    assert spec.section_title == "预算及资金来源明细子表"
+    assert spec.create_on_outer_add is False
+    assert spec.root_selector == ".form_content:has(.finance-table)"
+    assert spec.create_selector == "button:has-text('新增')"
+    assert spec.item_selector == (
+        ".finance-table .el-table__body-wrapper .el-table__row:has(input)"
+    )
+    assert [child.field_code_template for child in spec.children] == [
+        "financeSources.{index}.sourceFrom",
+        "financeSources.{index}.amount",
+        "financeSources.{index}.fundsPlan",
+    ]
+
+
 def test_resource_pool_collections_declare_all_persisted_numeric_and_currency_children():
     data_dir = Path(__file__).resolve().parents[1] / "data"
 

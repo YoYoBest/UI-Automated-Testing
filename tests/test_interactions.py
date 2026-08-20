@@ -13,6 +13,7 @@ class FakeLocator:
         self.attributes = {"role": role, "readonly": readonly, "class": classes}
         self.editable = editable
         self.fill_calls = []
+        self.press_calls = []
 
     def evaluate(self, script):
         return "input"
@@ -28,6 +29,9 @@ class FakeLocator:
 
     def input_value(self):
         return self.fill_calls[-1] if self.fill_calls else ""
+
+    def press(self, key):
+        self.press_calls.append(key)
 
 
 def test_fill_routes_readonly_numeric_labeled_combobox_to_select(monkeypatch):
@@ -95,6 +99,23 @@ def test_fill_routes_date_to_picker_without_manual_input(monkeypatch):
 
     assert interactor.fill(field, "2026-08-15") == "picked:2026-08-15"
     assert locator.fill_calls == []
+
+
+def test_fill_routes_invalid_date_to_raw_manual_input(monkeypatch):
+    locator = FakeLocator()
+    interactor = FieldInteractor(object())
+    monkeypatch.setattr(interactor, "locate", lambda _field: locator)
+    monkeypatch.setattr(
+        interactor,
+        "_select_date",
+        lambda *_args: pytest.fail("invalid date must not open the calendar"),
+    )
+    field = ResolvedField(FieldDefinition("dueDate", "Due date", "DATE"))
+
+    assert not FieldInteractor.is_valid_date_value("2025-02-29")
+    assert interactor.fill(field, "2025-02-29", raw_date_input=True) == "2025-02-29"
+    assert locator.fill_calls == ["2025-02-29"]
+    assert locator.press_calls == ["Tab"]
 
 
 def test_date_picker_clicks_matching_day_and_verifies_value(monkeypatch):

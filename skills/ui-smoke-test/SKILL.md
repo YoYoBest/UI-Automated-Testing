@@ -29,8 +29,11 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 - Detail action lookup retains the ordinary rendering wait while the selected content is absent or loading. Once visible target content stays unchanged through a short grace window and the requested action remains absent, raise the existing missing-action contract failure immediately rather than repeating the full action timeout for every candidate parent record. This must not preflight dynamic-collection roots, because conditional form fields can render only after baseline linkage.
 - Cover both branches in `tests/test_detail_navigation.py`: a stable rendered target without the action exits after the grace window, while an absent target container consumes the normal bounded timeout.
 - Test doubles for this navigation path must model the Playwright collection access used by the implementation, including `.last` for the selected visible target.
+- When a detail module declares navigation labels after `详情`, every candidate parent must render that exact tab/menu path before action lookup. A missing path makes the parent ineligible; never accept a same-named action on the parent page as a fallback. If all accessible candidates fail only because that path is absent, raise one typed detail-module precondition with the scanned count and path, then cache it by detail URL and component for the pytest batch so later Add/Edit/Delete items are explicitly blocked instead of rescanning or clicking a parent-level action. Keep a rendered target with a missing requested action as a distinct product/contract failure.
 
 ## Runtime Manifest Progress
+
+- 模块、模块操作、工作流和通用字段执行器创建 `ModuleSmokeDriver` 时都传递同一 `form_code` 与 `component`。字段契约 manifest 以精确 `formCode + 规范化 component` 匹配，规范化时仅去除 `@/`、`src/views`、`srcEi/views`、`.vue`、查询和片段包装，不回退到同名兄弟页面。驱动在每个新表单首次打开后缓存一次字段契约，避免每个 pytest 参数重复调用运行时配置接口；浏览器恢复换页时更新契约解析器的 Page，不重新按随机 DOM ID 建立字段映射。只读运行时字段回读可以单独形成 `add_and_runtime_verified`，该结果与详情、编辑、列表回读同属有效新增闭环。
 
 - Schedule every common-field validation command as a two-stage pair: `test_common_field_discovery.py` followed by `test_common_field_validation.py`. Both commands must receive the same manifest path, target context, worksheet, and selected case IDs.
 - Run and prioritize discovery before validation. The launcher must register the validation total only from that run's discovered manifest; do not use a previous manifest, Excel-row count, or partial collected-command count as a progress denominator.
@@ -69,7 +72,8 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 - `run_test.vbs` must clean only the process tree recorded by the previous launcher, never kill every Python, browser, or driver process by executable name.
 - Record the launcher PID together with its Windows creation time and refuse to terminate a reused PID whose creation time differs.
-- Capture a content fingerprint of every `src/ei_ui_smoke/**/*.py` file when the launcher starts. Before any selected test is scheduled, recompute and compare it; if it changed, block the run and require a launcher restart so old in-memory orchestration code cannot run. Read Git HEAD directly only as an optional display label: never depend on `git status`, global Git configuration, user ignore files, or an external Git process for this guard.
+- Register the launcher process only from the GUI application's `main()` entry point, after constructing the real window. Never register from `Launcher.__init__`: unit tests and structural harnesses may instantiate it and would otherwise overwrite the live launcher's process record.
+- Capture a content fingerprint of every `src/ei_ui_smoke/**/*.py` file when the launcher starts. Before any selected test is scheduled, recompute and compare it; if it changed, block the run and require a launcher restart so old in-memory orchestration code cannot run. Read Git HEAD directly only as an optional display label: never depend on `git status`, global Git configuration, user ignore files, or an external Git process for this guard. When blocking, state separately whether the Git commit changed and whether the runtime-source fingerprint changed; equal commit labels do not mean the loaded code is unchanged.
 - A temporary source-file read failure must not prevent the GUI from opening, but execution must retry the fingerprint and block with its actionable error rather than scheduling tests against unverifiable loaded code. Structural unit-test doubles that call `run_selected` without constructing a GUI may omit it, allowing the existing command-planning behavior to be tested without reading the checkout.
 - Preserve this guard with unit coverage for identical and changed fingerprints, and for stale process-record cleanup that cannot remove a newer launcher record.
 - Before `run_test.vbs` starts cleanup Python or the launcher, remove inherited `TortoiseSVN\bin` entries from that process's `PATH`. TortoiseSVN installations can ship an obsolete private `MSVCP140.dll`; allowing Python to load it can crash `pythonw.exe` with `0xc0000005`. Keep the system runtime and Git command directories available, and cover the launcher-script contract in `tests/test_execution_guard.py`.
@@ -113,6 +117,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 - 页面入口是“仅渲染一个本地组件”的透明包装器时，扫描回归必须覆盖该子组件按钮及祖先容器上的 `$hasButton` 权限；同时保留一个含布局或多个子组件的反例，证明普通嵌套组件按钮不会被提升。
 - 修改对话框子模块发现后，使用 public API 组合覆盖“透明包装入口 -> 同文件静态常量 `componentPath` -> 被引用表单的多个静态标题分区”。精确断言同名操作的完整 `operation_path`、源码顺序、外层权限过滤和真实对话框标题；共享同一对话框的新增/编辑调用还要分别成链并继承各自权限。保留未引用组件、无法解析标题和多组件归属不明的反例，证明不会扫目录、跨对话框组合或把按钮串入上一分区。
 - 通用新增的源码字段发现复用同一条透明包装和静态组件引用链，使运行时字段映射到真实业务码；多个字段表单候选并存时保持未解析。详细填写与回读规则由 `generic-module-crud-smoke` 维护。
+- 源码字段发现解析本地 Vue 默认组件导入时，兼容默认导入附带命名或 TypeScript 类型导入的形式，例如 `import FormPage, { type FormData } from "./components/formPage.vue"`。必须确认模板实际引用该默认组件，再跟随到子表单；不能因类型导入使真实表单退化为无字段契约。
 - On the uniquely resolved Add-form source, expose direct `v-if`, `v-show`, and dynamic `:required` string equality/inequality as exact branch candidates. For compound/computed expressions, retain only stable form-model field references as `runtime` probe hints; never calculate the expression or guess its values. Dynamic `:field-code`/`:prop` and auxiliary `v-model:*` still cannot define the affected field identity. Pass all candidates to runtime discovery: the deployed page owns the real selectable options and rendered state, independent runtime choice controls remain eligible, and a source-confirmed driver or affected field must not disappear silently. Reopen a clean form between independent probes, carry parent conditions when a driver appears only inside another branch, and store only runtime-confirmed display branches in the manifest.
 - Resolve the Add form source once per execution entry through the aggregate form contract, and reuse that same selection for stable fields, branch candidates, and an optional exact-detail endpoint. Module smoke, module action, common-field discovery/validation, and personalized Add fixtures must consume this aggregate result instead of calling the field/branch/detail compatibility wrappers independently. A detail contract is eligible only when it is one unambiguous static GET used by that form, binds the record ID directly in a query or path, and shares the created resource prefix; preserve the deployment API base prefix. Reject dynamic URLs, complex ID construction, unrelated resources, and multiple candidates instead of guessing. Pass the resulting endpoint into the CRUD driver; endpoint request order, authentication fallback, strict ID extraction, and persistence comparison remain owned by `generic-module-crud-smoke`.
 - 若列表页在 `openAdd`/`openCreate`/`openNew` 处理器中声明静态 `componentPath`，字段发现优先解析该新增处理器的组件；同页其他编辑、入库、跟进弹窗不构成歧义。没有唯一明确新增处理器时仍保持未解析，并为该优先级添加临时目录回归测试。
@@ -151,7 +156,7 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 
 ## 测试值与关联控件
 
-- 对文本、数字和日期使用满足格式、长度、范围及字段联动约束的动态值，并记录 `runId` 或随机种子、实际提交值、业务主键、保存和详情接口 URL、预期值及实际值。
+- 对文本、数字和日期使用满足格式、长度、范围及字段联动约束的动态值，并记录 `runId` 或随机种子、实际提交值、业务主键、保存和详情接口 URL、预期值及实际值。通用日期用例按预期分流：合法值经日历控件选择；`field_error` 的日历非法值原样输入日期框并失焦，再验证页面或业务接口拦截且没有成功保存。非法日期不得在自动化日历解析阶段提前失败，也不得通过脚本直接修改页面状态。
 - 对下拉、树、组织、人员和业务关联控件，从页面或运行时接口选择真实且可用的候选项；过滤禁用、注销、暂无数据和无权限项，不直接填入随机文本。
 - 以运行时网络请求作为保存、详情和候选值接口的事实标准。源码只用于补充路由、`formCode`、字段定义和组件类型，不用源码推断替代真实接口验证。
 
@@ -166,10 +171,38 @@ description: 在本仓库扫描 UI 模块，或运行、排查、改造 Python P
 页面字段校验触发后，通过错误节点所属表单项和控件 selector 反查字段，不要求提示文字重复字段标签。把该字段的 DOM/源码结构约束与规范化后的约束类别交给共享数据修复器；禁止为提示完整句子的措辞变体添加页面分支。权限、流程状态、系统、网络、模糊业务、上下界冲突和不支持的 pattern 错误保持失败，不得自动猜值。
 底层字段交互定位必须同时覆盖原业务字段码、当前 DOM selector 和规范化标签兜底。规范化标签要去除“请输入/请选择/请上传/请勾选”等提示前缀；可见控件候选不仅包括 input/textarea，也包括 Element Plus/Ant Design 的 select、radio、checkbox、switch、date 和 number 外壳及其内部可操作控件。截图中字段可见而 `Field not rendered` 时，先补共享定位兜底和回归测试，不要写模块专用 selector。
 - DOM 字段契约采集数值控件的真实 `min`、`max`、`step` 和源码 `precision`，并在 manifest 中保留这些可选值；缺失值保持 `None`，不得由字段名称或控件大类臆造。字段级用例如何依据这些约束绑定由 `generic-module-crud-smoke` 维护。
+- 基础字段类型归一化必须保留显式 `AMOUNT`/`*-AMOUNT` 为 `amount`。字段类型没有金额语义时，只有文本、数字或未知输入可根据独立货币单位边界 `（万元）`、`（元）`、`: 元` 兜底为金额；选择类控件保持原类型，且不得把“员工”等包含“元”的普通词误判为货币单位。
+- 表单组件契约的选择类型别名必须覆盖通用 `SELECT`/`MULTI_SELECT` 与 Element Plus `ElSelect-SELECT`/`ElSelect-MULTIPLE`；解析后统一为 `select`/`multi_select`，不得让已声明 `MULTIPLE` 的字段退化为普通下拉。
 
 在执行器清理页面前，把最终异常消息以临时、醒目的页面提示条合并进同一张现场截图，截图后立即移除提示条；不要为错误文本新增第三个附件。提示条只解释自动化断言，不能伪装成系统自身的报错弹窗。Allure 测试详情中位于图片下方的红色 `statusDetails` 区域不属于 PNG；判断错误文字是否已经写进截图时，直接检查 results 目录中的原始 `*-attachment.png`，并确认该报告产生于代码修改之后。
 
+## 业务流程编排
+
+- 有依赖的跨角色业务链使用 `src/ei_ui_smoke/workflow.py`，一个流程对应 `tests/test_business_workflow.py::test_selected_business_workflow` 的一个 pytest/Allure item；步骤在 item 内顺序执行并用 `allure.step` 展示。不要把流程步骤塞进 `EI_ACTIONS_JSON`，也不要复用 `tests/test_module_action.py` 的进程内动作缓存。
+- 流程定义保留在 Python factory 中，先完整校验当前 mode 的步骤依赖和经办人 storage-state 文件，再启动浏览器或执行第一个写步骤。固定角色按角色创建隔离 BrowserContext；同角色可复用自己的 page，但每一步都必须按 `business_id` 重新定位，禁止跨角色传递 Locator、Page、driver 或残留 DOM 状态。
+- 动态审批步骤以经办人会话读取配置声明的只读流程预览，当前节点必须唯一返回机器可用的 `loginName`；中文显示名、空值或多个候选人一律失败，禁止按列表顺序随机选择。以该 `loginName` 建立独立 BrowserContext，优先复用以不可逆摘要命名的账号级 storage-state 缓存；缓存到登录页或页面已关闭时丢弃会话并用 `EI_WORKFLOW_LOGIN_PASSWORD` 重新登录。密码不得进入 JSON、日志、Allure、快照或 state 文件名。
+- 固定角色前置校验要求其 storage-state 文件可读且 JSON 形状有效。需要多个固定角色时，对规范化内容取指纹并拒绝任意两个必需角色的内容完全相同；对结构有效且带数字 `exp` 的 JWT，在创建 BrowserContext 前拒绝已过期认证；能从 `sub`/用户 ID 类稳定 claim 唯一识别主体时，还要拒绝两个角色使用同一主体。不可解析或不含可靠主体的 opaque token 保持兼容，错误只列角色，不输出文件路径、token 或 claim 值。
+- `WorkflowContext` 只持久化 run/workflow/step ID、`business_id`、去 query 的 page scope、自动化标识、前后状态和本轮清理台账。`ModuleSmokeResult` 可作为步骤输出，但快照不得复制 `submitted`、`record_identity_payload`、响应体、storage state、Cookie、Token 或凭证。清理资格只由声明为本流程创建的步骤登记，并同时要求精确 `page_scope + business_id`。
+- 流程创建数据必须经过 UI 保存与真实业务回读，不直写业务数据库。checkpoint 和后续步骤返回的 `business_id` 必须与当前流程记录一致；跨 ID 结果不得改写 page scope、自动化标识或清理台账。
+- 一个流程可同时维护主 `business_id` 和已登记的 `correlation_ids`。mutation 通过 request 或 response 证明关联 ID 时，`mutation_correlation_key` 必须指向执行该步骤前已经存在的 correlation；同一步结果不能新增一个 correlation 再用它给自身授权。response 来源同时要求 `response_business_id` 与 `mutation_business_id` 等于该已登记值，request 来源不得混带响应 ID。
+- 审批等不可逆写请求一旦已返回成功，handler 必须在继续做可能失败的状态回读前调用 `execution.checkpoint_cleanup(...)`，把本轮创建记录原子更新为 `retained` 或 `deleted`。后续回读失败不得让快照继续显示 `pending`，也不允许任意步骤创建新的清理台账记录。
+- 一个动态审批步骤可用 `dynamic_mutation` 汇总多个顺序节点，但每次审批前后都要重新读取流程预览；每个账号待办都按已登记 `business_id`/流程关联 ID 二次确认。汇总证据要求 `mutation_count == request_count == response_count >= 1`，每个审批请求仍须证明同一个既有业务关联 ID；审批已通过而预览仍给出待处理节点是流程状态矛盾，必须失败。
+- 动态链路回归至少覆盖首次登录、有效缓存复用、缓存失效后的重新登录、非 loginName/多人候选拒绝、两个不同处理人的连续节点、动态 mutation 计数不一致拒绝，以及动态账号页面的失败截图归属；测试密码只能是本地假值，不能写入快照或断言输出。
+- 启动器内建动态流程只显示“业务流程”开关和“采集经办人”入口；项目、流程 ID、factory、角色 state 映射和流程 JSON 均为启动器固定默认值，不得作为页面控件或隐藏的可编辑 `StringVar` 保留。处理人 state 不提供人工采集入口，必须由流程预览和自动登录会话池生成。预览配置在源码尚未确认可安全表单化前仅从 `EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON` 读取。启动器回归应断言该单一采集入口不改写普通模块的登录态。
+- 内建流程启动器测试必须通过环境变量提供或清除 `EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON`，并断言运行计划自动生成唯一的 `maker` state 路径；不要为测试重新注入已移除的 GUI 配置变量。
+- 内建资源池审批 adapter 只监听配置的真实审批写请求，禁止把 `/projStorage/approval` BPM 回调当作用户审批动作；业务成功信封只能声明 `state=SUCCESS`、`code=000000` 或 `status=0`。提交步骤登记源码确认的 BPM `projId`，审批 response/body/query 三种 identity 来源都必须证明同一个已登记 `projId`，不能拿资源池记录 ID 替代。
+- `probe` 与 `standard` 可以共用核心“创建 -> 提交 -> 审批 -> 回查”闭环；只把额外深度回读设为 `standard` 专属，并保持 mode 过滤后的依赖闭包完整。`stable` 只运行流程显式声明的只读步骤。异步状态使用 `WorkflowStepExecution.wait_for_status()` 有界轮询，禁止固定长时间 `sleep` 或失败后重放已写入的整个流程。
+- 未设置 `EI_WORKFLOW_ID` 时 live 入口在浏览器启动前显式 skip；一旦选择了流程，未知 factory、无效 role JSON、缺少角色或 state 文件、缺少业务 ID、前后状态不匹配均必须失败，不能降级为 skip 或通过。具体 factory、环境变量和接入检查见 [业务流程编排参考](references/business-workflow-orchestration.md)。
+
 ## 执行流程
+
+### 执行模式变更范围
+
+- 用户要求修改、优化或修复自动化行为但未说明执行模式时，默认只修改 `standard` 标准自动化。
+- 用户明确点名“快速探测”时，只修改 `probe`；明确点名“稳定冒烟”时，只修改 `stable`。
+- 只有用户明确要求“所有模式”“公共底层”或“通用能力”时，才允许同时改变多个执行模式的行为。
+- 修改共享驱动或公共 helper 不代表获得跨模式修改授权。共享实现必须通过集中模式策略保护未点名模式，并增加反向回归，证明 `probe`、`stable` 或其他未授权模式的既有行为不变。
+- 动手前先向用户声明本次影响模式；若完成目标确实需要改变未点名模式，先说明原因和具体影响并取得明确授权，不得因代码共用而静默扩散。
 
 执行配置按“标准自动化、快速探测、稳定冒烟”排列，并默认选择标准自动化。标准自动化必须进入独立 `standard` 模式并严格检查所有当前可编辑字段，不得只修改界面文字或复用 `stable` 冒充。企查查控件仍由普通表单字段能力覆盖，不提供单独的企查查验证执行入口。
 
@@ -258,11 +291,11 @@ exit $pytestExit
 - UI 样式使用明确的主次按钮对比和轻量边界，但不要把一次性的颜色值、间距值或审美偏好固化为 skill 规则。
 - 文件选择器根据当前输入值设置 `initialdir`：已有文件时打开其父目录并预选文件，相对路径从项目根目录解析，空值回退到该输入类型的项目约定目录（例如登录状态使用 artifacts、Excel 使用公共用例目录）；约定目录不存在时回退项目根目录。不要依赖系统最近访问目录，也不要把目录路径写入要求具体文件的输入框。
 - 启动器隐藏登录状态文件、用户名和密码控件时，仍须自动读取 `EI_STORAGE_STATE`；未配置时加载项目内已存在的 `artifacts/auth-state.json`。菜单连接成功后继续更新内存中的状态文件路径，pytest 仍通过 `EI_STORAGE_STATE` 使用该状态；用户名和密码保留环境变量或内部变量兜底，不在常规执行配置中占位。
-- 对已部署系统地址等需要重复输入的非敏感值，使用可编辑 `Combobox` 提供历史选择，同时保留自由输入能力；点击或聚焦输入区时展示历史项，不要求用户必须点击细小箭头。历史按最近成功使用排序、精确去重并限制数量，缓存放在已忽略的 `artifacts` 目录，不写入源码配置。
-- 只在对应操作成功后更新输入历史，失败、取消或空输入不得污染缓存。使用临时文件替换方式写入 JSON，损坏或缺失的缓存按空历史处理；只保存业务地址等非敏感值，禁止缓存账号、密码、Token、Cookie、请求头或 storage state 内容。
+- 对已部署系统地址等需要重复输入的非敏感值，使用可编辑 `Combobox` 提供历史选择，同时保留自由输入能力；点击或聚焦输入区时展示历史项，不要求用户必须点击细小箭头。启动时优先显示最近一次非空输入的地址，未有历史才回退 `EI_BASE_URL`/`FI_BASE_URL`。历史按最近输入或成功使用排序、精确去重并限制数量，缓存放在已忽略的 `artifacts` 目录，不写入源码配置。
+- 地址输入失焦或按回车时立即更新历史；菜单获取成功也应刷新为最近项。空输入不得污染缓存。使用临时文件替换方式写入 JSON，损坏或缺失的缓存按空历史处理；只保存业务地址等非敏感值，禁止缓存账号、密码、Token、Cookie、请求头或 storage state 内容。
 - 树形控件的展开热区应覆盖父节点的层级单元格，且只有真实存在子节点的行显示展开指示器。具体菜单建模和层级规则以 `skills/runtime-module-discovery/SKILL.md` 为准。
 - 登录、菜单接口、详情树和按钮权限等耗时采集不得阻塞 Tk 主线程。用工作线程执行采集，只通过 `after(...)` 回到主线程更新控件、状态和弹窗；开始时禁用重复触发，成功或失败后恢复按钮，避免窗口假死和并发采集覆盖状态。
-- 操作节点执行时传递 `EI_ACTION`；嵌套对话框操作同时传递序列化的 `EI_ACTION_PATH`。新增类操作（包括带路径的分区新增）走完整新增与详情回读测试；删除、移除、清空默认复用可验证的自动化记录。用户明确授权“有符合的数据即可删除”时，删除专用用例改为优先选择当前列表任一启用的行级删除按钮；确认、取消和实际删除都复用该选择，验证确认框和删除响应，但不将无关记录与新增 ID 比对。没有可删行才创建一条前置数据后重试。
+- 操作节点执行时传递 `EI_ACTION`；嵌套对话框操作同时传递序列化的 `EI_ACTION_PATH`。新增类操作（包括带路径的分区新增）走完整新增与详情回读测试。删除、移除、清空统一按惰性候选链执行：本进程同模块新增结果 -> 当前 `page_scope` 和运行登记的自动化记录 -> 用户已授权“有符合的数据即可删除”时页面从上到下第一条启用的行级删除记录 -> 前三层均不可用时新增一条前置数据。每层只有在删除请求发出前证明记录无法精确定位或按钮不可用时才进入下一层；请求已经发出后的业务失败或终态验证失败必须立即停止，禁止继续删除另一条。确认、取消和实际删除复用同一个已锁定候选；取消删除或实际删除 ID 与缓存新增 ID 不同时保留该新增结果，只有精确删除同一业务 ID 后才清除缓存。
 - 批量动作序列化时，缺失的可选 `form_code` 可能变成字符串 `None`、`null` 或 `undefined`。执行器必须把这些哨兵视作未提供，回退到本次目标的真实表单编码；不得让它们覆盖数据策略、动态字段契约或声明式组合唯一约束。
 - 表单编码回退仅影响缺失值解析；已有真实编码仍原样传递，并且同一解析结果必须同时用于数据策略和动态集合契约，避免一个执行路径已应用组合唯一键、另一条路径静默失效。
 - 当动作工作表没有提供表单编码且环境中也没有有效编码时，按当前组件的顶层视图目录从已同步源码解析唯一的 `FORM_CODE` 后再创建数据策略；解析失败才回退模块 ID。此规则确保删除等独立动作命令仍能应用已声明的组合唯一约束。
@@ -273,6 +306,7 @@ exit $pytestExit
 - 提供批量排除删除操作时，先把当前父子选择解析成明确的可执行叶子目标，过滤 `operation` 中的删除操作，再用剩余叶子重建 Treeview selection。禁止只取消可见删除行而保留已选父节点，否则目标解析会再次把删除后代隐式加入；名称包含“删除记录”但没有删除 `operation` 的普通页面应保留。
 - 同一轮选中的所有操作按钮合并为一个操作计划，只启动一次 pytest 进程和一个 session 级 Playwright 浏览器上下文；用 pytest 参数化把计划展开成独立测试用例，按树中有序目标流执行，每项开始前导航到自身页面 URL，以清理上一个模块的弹窗和页面状态。源码或权限过滤改变树顺序后，重新获取菜单得到的新树顺序即为执行顺序；普通页面/表单测试不混入操作批次。
 - 操作批处理必须为每项保留模块 ID、模块名称、页面 URL、组件、`formCode`、操作名和 `operation_path`。单项失败时记录“当前序号/总数 + 操作名”，重新导航后继续执行剩余操作，最后统一汇总，不能让首个失败跳过后续按钮；整批硬超时按单项超时乘操作数计算，避免合并后沿用单项上限导致误杀。
+- 同一路由承载多个页面页签时，批量操作的每一项还必须携带自己的 `page_tab`，执行该 pytest 参数前恢复为 `EI_PAGE_TAB`。详情树的页签上下文必须在打开父列表后、扫描或点击任何业务卡片/行之前通过 `activate_page_tab()` 切换并确认激活；父列表为空而需创建自动化父记录时也适用。不得依赖页面默认页签、批次首项环境或在进入错误详情后再按菜单标题补救。
 - `requires_business_id=True` 的详情操作必须区分“浏览器首次入口”和“目标详情描述”。首次入口使用父列表 URL，目标仍保留详情层级、组件和操作信息；登录恢复、浏览器重建及 session 级 fixture 都不得先访问合成的 `*/detail`，否则测试函数执行前就可能被 SPA 路由守卫送到 `#/404`。进入父列表后由操作测试点击真实记录并按运行时层级导航目标详情子模块。父列表记录没有“详情/查看”按钮时，优先点击该记录内部的业务名称超链接；若点击记录后 URL 未变化但当前页已经出现目标详情菜单、目标组件或目标操作，把当前列表视为详情承载页继续执行，禁止因为没有详情按钮或路由未变化直接失败。
 - 详情导航每次回到父列表后，必须先等待可见加载遮罩消失，并确认当前可见记录的业务标识/文本快照在有界安静窗口内保持稳定，再取得记录 Locator 和点击。遮罩后的残留行、列表显示 `0` 条期间的旧行或持续重渲染的行都不得作为可点击记录；父列表未就绪或点击前仍在刷新时生成一次带 `loading`、记录数和 URL 的前置失败，不要按候选记录数重复耗尽点击超时。
 - 详情候选记录序号必须跨分页解释：从第一页取得真实页大小，按绝对候选序号计算目标页和页内位置，通过分页器跳页并等待新页记录稳定后再点击。禁止每次返回父列表都停在第一页，导致“前 N 条”实际只覆盖第一页。目标操作文字已经渲染但按钮处于禁用态时，短暂等待异步启用后立即判定该业务记录不适用并继续下一条；默认扫描上限由 `EI_DETAIL_RECORD_SCAN_LIMIT` 控制。候选耗尽时应区分“页面没有操作”和“操作存在但因业务阶段禁用”。
@@ -329,7 +363,7 @@ exit $pytestExit
 - 删除、移除和清空操作无论由图形启动器、批量 `EI_ACTIONS_JSON` 或单命令环境变量启动，都必须在执行器中保留 `EI_REQUIRE_ADD=true`，以便没有安全复用候选或候选不可删时仍能创建并定位本次 `AUTO_` 自有记录，再确认删除及验证接口响应和记录消失。不得让单命令回退路径清除此开关，否则详情父列表无法构造前置数据，或删除会误操作业务记录。
 - 删除 Excel 页签属于专用参数化执行：命令必须保留 `EI_COMMON_DELETE_CASES_EXCEL`、页签和 `DELETE-*` ID，并单独运行 `tests/test_module_action.py`。普通动作批量合并只序列化动作元数据，不能合并这类命令，否则会丢失专用环境变量并静默退化为普通删除。
 - 操作节点的 `::action::<position>` 后缀只在当前树实例内有效。执行计划和失败重试不得在重新获取菜单后复用旧位置 ID；重新解析稳定操作身份并确认仍对应同一操作后再调度。
-- 普通操作不能以“点击后页面未关闭”作为通过标准。查询/搜索/重置必须监听点击后实际发出的 XHR/Fetch request，不得把固定时间内尚未到达的 response 误报成“未发请求”；使用有界等待并在每项操作后移除 request/response 监听器，真实未发请求仍失败。编辑、立项准备、入库申请、跟进等弹窗操作必须出现新的可见业务弹窗。删除、移除、清空若没有自动化自建记录，只能验证入口或在确认框取消且不得宣称删除闭环通过；正式删除用例必须对自建记录点击确认，并验证删除响应和记录消失。未观察到对应效果时必须失败。
+- 普通操作不能以“点击后页面未关闭”作为通过标准。查询/搜索/重置必须监听点击后实际发出的 XHR/Fetch request，不得把固定时间内尚未到达的 response 误报成“未发请求”；使用有界等待并在每项操作后移除 request/response 监听器，真实未发请求仍失败。编辑、立项准备、入库申请、跟进等弹窗操作必须出现新的可见业务弹窗。删除、移除、清空默认必须对自建或登记记录验证请求 ID、成功响应和记录消失；仅在用户明确授权任意业务记录删除时，才可使用候选链中的页面首条可删记录，并以实际删除请求 ID 完成终态验证。未观察到对应效果时必须失败。
 - 快速重复点击保存时，第二次点击被 UI 禁止且只观察到一次业务保存响应是有效的防重复结果，执行器返回 `rapid_click_blocked_by_ui`，公共字段验证入口必须将其视为通过。若上层允许结果集合漏掉该值，属于测试契约错误，不得作为产品 API 缺陷上报。
 - `EI_ACTION_PATH` 只在确有至少三段嵌套操作路径时传递和启用。空元组序列化出的 `[]` 必须移除或解析为空路径，禁止仅按环境变量字符串非空判断；否则所有顶层查询、重置、新增、编辑、删除都会误走嵌套新增分支，只打开父新增弹窗后假通过。
 
@@ -358,7 +392,11 @@ exit $pytestExit
 
 ## Date Picker Interaction Contract
 
-- Interaction-unit coverage for a date picker must prove that date fields route to picker selection instead of input `fill()`, the requested date cell is clicked and read back, and an open picker is closed before subsequent commands.
+- Interaction-unit coverage must prove both date paths: valid values route to picker selection, click the requested cell, read it back, and close the picker; calendar-invalid `field_error` values are typed verbatim then blurred without opening the picker.
+
+## Configured Form Save Commands
+
+- The configuration-driven `test_form_smoke.py` runner is available in `probe`, `stable`, and `standard` modes. Its default save selector must include `暂存` alongside `保存` and `确定`, because these are ordinary persistence labels. Retain an explicitly configured or legacy `提交` fallback for workflows that use it; module CRUD drivers still distinguish an explicit submit workflow from ordinary persistence.
 
 ## Parametrized Common-field Reporting
 
@@ -369,7 +407,7 @@ exit $pytestExit
 - The desktop launcher may schedule EI and FI together only as separate project profiles. Each profile owns its source root, storage state and optional credentials; when both applications share one deployment, expose one common base URL and align it to each selected source view before menu capture or execution. Keep legacy single-project fields mapped to EI for existing scripts.
 - Keep storage-state paths internal to the launcher UI. Menu capture creates or refreshes them after interactive login, and normal execution reuses them; users need not select or edit the JSON path.
 - Keep the dual-project launcher compact: put the one shared deployed address above one horizontal EI/FI configuration row. The two rows must share full-width left and right boundaries, and their inputs must expand with the available width; EI/FI source groups split the remaining width evenly, while source-action/menu buttons stay fixed. Do not add a separator merely between those two rows. One trailing menu button captures only checked projects in EI/FI order and merges their namespaced menus. Do not add placeholder columns merely to expose internal state.
-- Namespace menu and action IDs as `EI::...` or `FI::...`, and prefix their visible tree paths with the project label. Render the two project-specific `ALL` shortcuts as the first top-level tree items in EI/FI order, before the project menu trees. `ALL` applies only to its own project namespace, so same-name or same-ID modules never collide.
+- Namespace menu and action IDs as `EI::...` or `FI::...`, but begin the visible tree at each project's first business module instead of rendering `EI 项目`/`FI 项目` roots. Use the project namespace only as an internal branch identity so same-named EI/FI modules remain independently selectable. Render one global `ALL` shortcut as the first top-level tree item; it expands to every currently loaded EI/FI executable target. Keep project-scoped `ALL` markers internal to target resolution, not as duplicated visible rows.
 - Keep the legacy EI `scan()` and `fetch_runtime_menu()` entry points as wrappers around the project-aware implementation, using class-bound helpers rather than instance-only dispatch so existing launch scripts and structural launcher tests retain their single-project contract. Schedule selected-project background completion callbacks through the same class-bound helper with `self` passed explicitly; lightweight launcher harnesses may intentionally provide state without binding every `Launcher` method.
 - Build command plans, action batches, page/action suppression, field-discovery prioritization and API preflight separately for each project. Append the resulting groups in configured order (EI, then FI); never combine them into one browser/pytest session.
 - Set `EI_AUTOMATION_PROJECT` and a project-suffixed `EI_AUTOMATION_RUN_ID` on every command. Preflight must use that command group's own URL, source root and storage state, and Allure environment data must list all participating project environments without credentials or storage-state content.
@@ -390,6 +428,7 @@ exit $pytestExit
 - A configured `valueRelations` entry must be covered as part of the exact collection contract: both endpoints are numeric children of that collection, the operator is supported, and `adjustOrder` names a nonempty unique subset of relation sides. Reject cross-collection, missing-child, nonnumeric, or ambiguous adjustment declarations during manifest loading rather than at Save time.
 - When an exact section-scoped root already makes a collection unique, its create selector should use the source-confirmed rendered toolbar/button classes and runtime visibility checks. Do not add unverified direct-child or exact-text pseudo constraints that can reject a visible framework-wrapped button; assert the final root/create/item selectors in the configuration regression.
 - Model whether a configured collection may create rows during the outer Add separately from its nested-action contract. Resource-pool ownership and external-investment tables are nested-action-only baselines: preserve their selectors and child schema, but set `createOnOuterAdd: false` so a plain resource-pool save does not inject optional rows.
+- When a standard common-field select/radio case targets a nested-only dynamic child, the executor may create only that declared collection's minimum row before resolving the field. Keep this preparation out of `probe` and `stable`, and cover both indexed and wildcard child paths so the extra row is never created for unrelated fields.
 
 ## 安全边界
 

@@ -15,6 +15,8 @@ from ei_ui_smoke.data_pool import GlobalDataPool
 from ei_ui_smoke.data_strategy import create_data_strategy
 from ei_ui_smoke.dynamic_collections import load_dynamic_collection_specs
 from ei_ui_smoke.detail_navigation import (
+    DetailModulePreconditionError,
+    activate_detail_parent_tab as _activate_detail_parent_tab,
     detail_navigation_labels as _detail_navigation_labels,
     enter_available_detail_module as _enter_available_detail_module,
     enter_detail_record as _enter_detail_record,
@@ -22,6 +24,7 @@ from ei_ui_smoke.detail_navigation import (
     visible_action as _visible_action,
 )
 from ei_ui_smoke.module_driver import (
+    CrudValidationPolicy,
     ModuleSmokeDriver,
     RecordNotDeletableError,
 )
@@ -70,13 +73,21 @@ ADD_VERIFIED_MODES = {
     "add_and_detail_verified",
     "add_and_edit_form_verified",
     "add_and_list_verified",
+    "add_and_runtime_verified",
 }
 _CREATED_RESULTS: dict[tuple[str, str], object] = {}
 _DETAIL_PARENT_RESULTS: dict[tuple[str, str], object] = {}
+_DETAIL_MODULE_PRECONDITION_FAILURES: dict[tuple[str, str], str] = {}
 _DELETE_PRECONDITION_FAILURES: dict[tuple[str, str, str], str] = {}
 
 
 class _DeleteSharedPreconditionError(RuntimeError):
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+
+
+class _DeleteCandidatePreconditionError(RuntimeError):
     def __init__(self, original: Exception):
         super().__init__(str(original))
         self.original = original
@@ -91,6 +102,7 @@ def _selected_actions() -> list[dict[str, object]]:
             "action": os.getenv("EI_ACTION", "").strip(),
             "action_path": list(_action_path_steps()),
             "requires_business_id": os.getenv("EI_REQUIRES_BUSINESS_ID", "").lower() == "true",
+            "page_tab": os.getenv("EI_PAGE_TAB", "").strip(),
         }]
     else:
         try:
@@ -211,6 +223,8 @@ def _crud_driver(browser_page, request):
         source_detail_endpoints=source_contract.detail_endpoints,
         default_upload_file=data_pool.default_upload_file(),
         dynamic_collections=dynamic_collections,
+        form_code=form_code,
+        component=component,
         automation_record_registry=(
             project_root / "artifacts" / "automation-record-registry.json"
         ),
@@ -335,6 +349,7 @@ def _prepare_detail_action_context(
             goto = getattr(browser_page, "goto", None)
             if callable(goto):
                 goto(_parent_list_url(form_url), wait_until="domcontentloaded")
+                _activate_detail_parent_tab(browser_page)
             provisioned = _crud_driver(browser_page, request).run(provision_only=True)
             assert provisioned.mode == "add_provisioned"
         return provisioned
@@ -811,6 +826,24 @@ def test_selected_actions_reads_page_batch(monkeypatch):
     assert "nested_action_paths" not in actions[1]
 
 
+def test_selected_actions_keeps_direct_page_tab(monkeypatch):
+    monkeypatch.delenv("EI_ACTIONS_JSON", raising=False)
+    monkeypatch.setenv("EI_MODULE_ID", "AFTER::personnel")
+    monkeypatch.setenv("EI_MODULE_NAME", "对外投资项目/项目投后管理/详情/投后管理/人员委派/新增")
+    monkeypatch.setenv("EI_PAGE_TAB", "项目投后管理")
+    monkeypatch.setenv("EI_ACTION", "新增")
+    monkeypatch.setenv("EI_REQUIRES_BUSINESS_ID", "true")
+
+    actions = _selected_actions()
+
+    assert actions == [{
+        "module_id": "AFTER::personnel",
+        "module_name": "对外投资项目/项目投后管理/详情/投后管理/人员委派/新增",
+        "action": "新增", "action_path": [], "requires_business_id": True,
+        "page_tab": "项目投后管理",
+    }]
+
+
 def test_selected_actions_expands_delete_cases_for_direct_cli(monkeypatch):
     monkeypatch.delenv("EI_ACTIONS_JSON", raising=False)
     monkeypatch.setenv("EI_MODULE_ID", "POOL::action::delete")
@@ -872,6 +905,39 @@ def test_common_delete_cases_share_a_failed_detail_precondition(
     _DELETE_PRECONDITION_FAILURES.clear()
 
 
+def test_detail_actions_share_a_missing_target_module_precondition(monkeypatch):
+    _DETAIL_MODULE_PRECONDITION_FAILURES.clear()
+    calls = []
+    add_case = {
+        "module_id": "DETAIL::staff-assignment::add",
+        "module_name": "对外投资项目/详情/投后管理/人员委派/新增",
+        "action": "新增",
+        "form_url": "https://example.test/projectManage/detail",
+        "component": "projectManage/after/staffAssignment/index",
+        "requires_business_id": True,
+    }
+
+    def unavailable(*_args, **_kwargs):
+        calls.append("prepare")
+        raise DetailModulePreconditionError(
+            "详情模块前置条件未满足：已扫描 10 条父记录，均无法进入“投后管理”"
+        )
+
+    monkeypatch.setitem(globals(), "_prepare_detail_action_context", unavailable)
+
+    with pytest.raises(DetailModulePreconditionError, match="投后管理"):
+        test_selected_page_action(SimpleNamespace(url=""), object(), add_case)
+    with pytest.raises(pytest.skip.Exception, match="详情模块共享前置条件未满足"):
+        test_selected_page_action(
+            SimpleNamespace(url=""),
+            object(),
+            {**add_case, "module_id": "DETAIL::staff-assignment::edit", "action": "编辑"},
+        )
+
+    assert calls == ["prepare"]
+    _DETAIL_MODULE_PRECONDITION_FAILURES.clear()
+
+
 def test_common_delete_cases_share_a_failed_record_provision_precondition(monkeypatch):
     _DELETE_PRECONDITION_FAILURES.clear()
     calls = []
@@ -888,6 +954,10 @@ def test_common_delete_cases_share_a_failed_record_provision_precondition(monkey
     }
 
     class Driver:
+        def find_reusable_automation_delete_record(self):
+            calls.append("registry")
+            return None
+
         def find_available_delete_record(self):
             calls.append("find")
             return None
@@ -915,7 +985,7 @@ def test_common_delete_cases_share_a_failed_record_provision_precondition(monkey
             )},
         )
 
-    assert calls == ["find", "provision"]
+    assert calls == ["registry", "find", "provision"]
     _DELETE_PRECONDITION_FAILURES.clear()
 
 
@@ -934,6 +1004,10 @@ def test_common_delete_precondition_is_scoped_to_one_logical_action(monkeypatch)
     }
 
     class Driver:
+        @staticmethod
+        def find_reusable_automation_delete_record():
+            return None
+
         @staticmethod
         def find_available_delete_record():
             return None
@@ -978,6 +1052,10 @@ def test_common_delete_behavior_failure_does_not_poison_shared_precondition(monk
     reusable = SimpleNamespace(mode="delete_any_available")
 
     class Driver:
+        @staticmethod
+        def find_reusable_automation_delete_record():
+            return None
+
         @staticmethod
         def find_available_delete_record():
             return reusable
@@ -1076,6 +1154,32 @@ def test_dialog_action_accepts_inline_edit_form(monkeypatch):
     assert saved_actions == [("编辑", "9001")]
 
 
+def test_probe_dialog_action_accepts_response_only_result(monkeypatch):
+    page = _InlineEditPage()
+    driver = SimpleNamespace(
+        data_strategy=SimpleNamespace(data_mode="probe"),
+        save_open_dialog=lambda _action, *, established_business_id="": (
+            SimpleNamespace(mode="dialog_action_saved")
+        ),
+    )
+
+    monkeypatch.setitem(
+        globals(),
+        "_visible_action_for_created_record",
+        lambda _browser_page, _action, _created: page.edit_target,
+    )
+    monkeypatch.setitem(globals(), "_crud_driver", lambda *_args: driver)
+
+    result = _run_selected_action(
+        page,
+        request=None,
+        action="编辑",
+        created=SimpleNamespace(business_id="9001"),
+    )
+
+    assert result.mode == "dialog_action_saved"
+
+
 def test_add_action_verifies_every_runtime_branch(monkeypatch):
     verified = SimpleNamespace(mode="add_and_detail_verified", business_id="1")
     final = SimpleNamespace(mode="add_and_list_verified", business_id="2")
@@ -1136,6 +1240,10 @@ def test_selected_page_action(browser_page, request, action_case):
     os.environ["EI_FORM_CODE"] = str(
         action_case.get("form_code") or os.getenv("EI_FORM_CODE", "")
     )
+    if page_tab := str(action_case.get("page_tab") or "").strip():
+        os.environ["EI_PAGE_TAB"] = page_tab
+    else:
+        os.environ.pop("EI_PAGE_TAB", None)
     action_scope = _action_data_scope(action_case)
     os.environ["EI_AUTOMATION_ACTION_SCOPE"] = action_scope
     if _require_add_for_action(action_case, action):
@@ -1153,6 +1261,9 @@ def test_selected_page_action(browser_page, request, action_case):
     delete_precondition_key = (*record_key, action_scope)
     created = _CREATED_RESULTS.get(record_key)
     parent_record = _DETAIL_PARENT_RESULTS.get(record_key)
+    prior_detail_precondition = _DETAIL_MODULE_PRECONDITION_FAILURES.get(record_key)
+    if requires_business_id and prior_detail_precondition:
+        pytest.skip(f"详情模块共享前置条件未满足：{prior_detail_precondition}")
     common_delete_case = action_case.get("common_delete_case")
     if common_delete_case is not None:
         allure.dynamic.title(
@@ -1178,6 +1289,9 @@ def test_selected_page_action(browser_page, request, action_case):
                     action=action,
                     created=parent_record,
                 )
+            except DetailModulePreconditionError as exc:
+                _DETAIL_MODULE_PRECONDITION_FAILURES.setdefault(record_key, str(exc))
+                raise
             except Exception as exc:
                 if common_delete_case is not None:
                     _DELETE_PRECONDITION_FAILURES[delete_precondition_key] = str(exc)
@@ -1191,49 +1305,112 @@ def test_selected_page_action(browser_page, request, action_case):
     print(f"ACTION_START {action}", flush=True)
     if common_delete_case is not None:
         try:
-            result = _run_common_delete_case(browser_page, request, common_delete_case)
+            result = _run_common_delete_case(
+                browser_page, request, common_delete_case, created=created,
+            )
         except _DeleteSharedPreconditionError as exc:
             _DELETE_PRECONDITION_FAILURES[delete_precondition_key] = str(exc.original)
             raise exc.original from exc
     else:
         result = _run_selected_action(browser_page, request, action, created)
-    if result and result.mode in ADD_VERIFIED_MODES:
-        _CREATED_RESULTS[record_key] = result
-    elif action.startswith("删除") and result:
-        _CREATED_RESULTS.pop(record_key, None)
+    _update_created_result_cache(record_key, action, result, created)
     print(f"ACTION_PASSED {action}", flush=True)
 
 
-def _run_common_delete_case(browser_page, request, case):
+def _update_created_result_cache(record_key, action, result, created):
+    if result and result.mode in ADD_VERIFIED_MODES:
+        _CREATED_RESULTS[record_key] = result
+        return
+    if (
+        action.startswith("删除")
+        and getattr(result, "mode", "") == "add_and_delete_verified"
+        and created is not None
+        and str(getattr(result, "business_id", ""))
+        == str(getattr(created, "business_id", ""))
+    ):
+        _CREATED_RESULTS.pop(record_key, None)
+
+
+def _delete_candidate_key(record):
+    business_id = str(getattr(record, "business_id", "") or "").strip()
+    if business_id:
+        return ("business_id", business_id)
+    markers = tuple(
+        str(marker).strip()
+        for marker in (getattr(record, "record_markers", ()) or ())
+        if str(marker).strip()
+    )
+    if markers:
+        return ("markers", markers)
+    return ("object", id(record))
+
+
+def _run_delete_candidate_chain(
+    driver, execute, *, created=None, allow_arbitrary_fallback: bool,
+):
+    seen = set()
+    last_not_deletable = None
+
+    def attempt(record):
+        nonlocal last_not_deletable
+        if record is None:
+            return False, None
+        key = _delete_candidate_key(record)
+        if key in seen:
+            return False, None
+        seen.add(key)
+        try:
+            return True, execute(record)
+        except RecordNotDeletableError as exc:
+            last_not_deletable = exc
+            return False, None
+
+    providers = [
+        ("current-created", lambda: created),
+        ("current-run-registry", driver.find_reusable_automation_delete_record),
+    ]
+    if allow_arbitrary_fallback:
+        providers.append(("first-available-row", driver.find_available_delete_record))
+
+    for source, provider in providers:
+        try:
+            record = provider()
+        except Exception as exc:
+            raise _DeleteCandidatePreconditionError(exc) from exc
+        completed, result = attempt(record)
+        if completed:
+            return result
+
+    try:
+        provisioned = driver.run(provision_only=True)
+        if getattr(provisioned, "mode", "") != "add_provisioned":
+            raise AssertionError(
+                "删除前置创建返回了无效结果："
+                f"{getattr(provisioned, 'mode', '') or 'unknown'}"
+            )
+    except Exception as exc:
+        raise _DeleteCandidatePreconditionError(exc) from exc
+
+    completed, result = attempt(provisioned)
+    if completed:
+        return result
+    error = last_not_deletable or RecordNotDeletableError(
+        "删除前置创建后仍没有可用的删除记录"
+    )
+    raise _DeleteCandidatePreconditionError(error) from error
+
+
+def _run_common_delete_case(browser_page, request, case, *, created=None):
     driver = _crud_driver(browser_page, request)
     try:
-        created = driver.find_available_delete_record()
-    except Exception as exc:
-        raise _DeleteSharedPreconditionError(exc) from exc
-    if created is None:
-        try:
-            driver.run(provision_only=True)
-            created = driver.find_available_delete_record()
-        except Exception as exc:
-            raise _DeleteSharedPreconditionError(exc) from exc
-    if created is None:
-        error = RecordNotDeletableError("删除前置创建后页面仍没有可用的删除记录")
-        raise _DeleteSharedPreconditionError(error) from error
-    try:
-        return _run_delete_case_behavior(driver, created, case)
-    except RecordNotDeletableError:
-        try:
-            created = driver.run(provision_only=True)
-            if created.mode != "add_provisioned":
-                raise AssertionError(
-                    f"删除前置创建返回了无效结果：{created.mode}"
-                )
-        except Exception as exc:
-            raise _DeleteSharedPreconditionError(exc) from exc
-        try:
-            return _run_delete_case_behavior(driver, created, case)
-        except RecordNotDeletableError as exc:
-            raise _DeleteSharedPreconditionError(exc) from exc
+        return _run_delete_candidate_chain(
+            driver,
+            lambda record: _run_delete_case_behavior(driver, record, case),
+            created=created,
+            allow_arbitrary_fallback=True,
+        )
+    except _DeleteCandidatePreconditionError as exc:
+        raise _DeleteSharedPreconditionError(exc.original) from exc
 
 
 def _run_delete_case_behavior(driver, record, case):
@@ -1246,21 +1423,109 @@ def _run_delete_case_behavior(driver, record, case):
     return result
 
 
-def test_common_delete_uses_available_record_without_creating(monkeypatch):
-    reusable = SimpleNamespace(mode="delete_any_available", business_id="")
+def test_common_delete_prefers_current_created_record(monkeypatch):
+    created = SimpleNamespace(mode="add_provisioned", business_id="created-1")
     calls = []
 
     class Driver:
+        def find_reusable_automation_delete_record(self):
+            pytest.fail("current created record must win before registry lookup")
+
         def find_available_delete_record(self):
-            return reusable
+            pytest.fail("current created record must win before arbitrary lookup")
 
         def run(self, *, provision_only=False):
-            calls.append(provision_only)
-            return SimpleNamespace(mode="add_provisioned")
+            pytest.fail("current created record must win before provisioning")
 
         def delete_created_record(self, record):
-            assert record is reusable
-            return SimpleNamespace(mode="add_and_delete_verified")
+            calls.append(("delete", record.business_id))
+            return SimpleNamespace(
+                mode="add_and_delete_verified", business_id=record.business_id,
+            )
+
+    monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())
+
+    result = _run_common_delete_case(
+        object(), object(), CommonDeleteCase("DELETE-004", "删除成功", "删除成功"),
+        created=created,
+    )
+
+    assert result.mode == "add_and_delete_verified"
+    assert calls == [("delete", "created-1")]
+
+
+def test_common_delete_falls_back_in_declared_candidate_order(monkeypatch):
+    created = SimpleNamespace(mode="add_provisioned", business_id="created-1")
+    registered = SimpleNamespace(
+        mode="delete_reusable_record", business_id="registered-2",
+    )
+    arbitrary = SimpleNamespace(
+        mode="delete_any_available", business_id="",
+        record_markers=("__arbitrary_delete_row__",),
+    )
+    calls = []
+
+    class Driver:
+        def find_reusable_automation_delete_record(self):
+            calls.append("registry")
+            return registered
+
+        def find_available_delete_record(self):
+            calls.append("available")
+            return arbitrary
+
+        def run(self, *, provision_only=False):
+            pytest.fail("an available row must win before provisioning")
+
+        def delete_created_record(self, record):
+            calls.append(("delete", record.mode))
+            if record is not arbitrary:
+                raise RecordNotDeletableError("candidate cannot be deleted")
+            return SimpleNamespace(mode="add_and_delete_verified", business_id="3")
+
+    monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())
+
+    result = _run_common_delete_case(
+        object(), object(), CommonDeleteCase("DELETE-004", "删除成功", "删除成功"),
+        created=created,
+    )
+
+    assert result.mode == "add_and_delete_verified"
+    assert calls == [
+        ("delete", "add_provisioned"),
+        "registry",
+        ("delete", "delete_reusable_record"),
+        "available",
+        ("delete", "delete_any_available"),
+    ]
+
+
+def test_common_delete_provisions_only_after_all_existing_candidates_are_absent(
+    monkeypatch,
+):
+    provisioned = SimpleNamespace(mode="add_provisioned", business_id="created-4")
+    calls = []
+
+    class Driver:
+        def find_reusable_automation_delete_record(self):
+            calls.append("registry")
+            return None
+
+        def find_available_delete_record(self):
+            calls.append("available")
+            return None
+
+        def run(self, *, provision_only=False):
+            assert provision_only is True
+            calls.append("provision")
+            return provisioned
+
+        def delete_created_record(self, record):
+            assert record is provisioned
+            calls.append(("delete", record.business_id))
+            return SimpleNamespace(
+                mode="add_and_delete_verified", business_id=record.business_id,
+            )
 
     monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())
 
@@ -1268,33 +1533,40 @@ def test_common_delete_uses_available_record_without_creating(monkeypatch):
         object(), object(), CommonDeleteCase("DELETE-004", "删除成功", "删除成功")
     )
 
-    assert result.mode == "add_and_delete_verified"
-    assert calls == []
+    assert result.business_id == "created-4"
+    assert calls == [
+        "registry", "available", "provision", ("delete", "created-4"),
+    ]
 
 
-def test_common_delete_provisions_only_when_no_available_record_exists(monkeypatch):
-    calls = []
+def test_delete_result_cache_is_removed_only_when_the_created_id_was_deleted():
+    key = ("https://example.test/list", "component/index")
+    created = SimpleNamespace(mode="add_and_detail_verified", business_id="created-1")
+    _CREATED_RESULTS[key] = created
 
-    class Driver:
-        def find_available_delete_record(self):
-            return None if not calls else SimpleNamespace(mode="delete_any_available")
-
-        def run(self, *, provision_only=False):
-            calls.append(provision_only)
-            return SimpleNamespace(mode="add_provisioned")
-
-        def delete_created_record(self, record):
-            assert record.mode == "delete_any_available"
-            return SimpleNamespace(mode="add_and_delete_verified")
-
-    monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())
-
-    result = _run_common_delete_case(
-        object(), object(), CommonDeleteCase("DELETE-004", "删除成功", "删除成功")
+    _update_created_result_cache(
+        key,
+        "删除",
+        SimpleNamespace(mode="delete_confirmation_cancelled", business_id="created-1"),
+        created,
     )
+    assert _CREATED_RESULTS[key] is created
 
-    assert result.mode == "add_and_delete_verified"
-    assert calls == [True]
+    _update_created_result_cache(
+        key,
+        "删除",
+        SimpleNamespace(mode="add_and_delete_verified", business_id="arbitrary-2"),
+        created,
+    )
+    assert _CREATED_RESULTS[key] is created
+
+    _update_created_result_cache(
+        key,
+        "删除",
+        SimpleNamespace(mode="add_and_delete_verified", business_id="created-1"),
+        created,
+    )
+    assert key not in _CREATED_RESULTS
 
 
 def _run_selected_action(browser_page, request, action: str, created=None):
@@ -1309,17 +1581,15 @@ def _run_selected_action(browser_page, request, action: str, created=None):
 
     if action.startswith("删除"):
         driver = _crud_driver(browser_page, request)
-        if created is None:
-            created = driver.find_reusable_automation_delete_record()
-            if created is None:
-                created = driver.run(provision_only=True)
-                assert created.mode == "add_provisioned"
         try:
-            deleted = driver.delete_created_record(created)
-        except RecordNotDeletableError:
-            created = driver.run(provision_only=True)
-            assert created.mode == "add_provisioned"
-            deleted = driver.delete_created_record(created)
+            deleted = _run_delete_candidate_chain(
+                driver,
+                driver.delete_created_record,
+                created=created,
+                allow_arbitrary_fallback=True,
+            )
+        except _DeleteCandidatePreconditionError as exc:
+            raise exc.original from exc
         assert deleted.mode == "add_and_delete_verified"
         return deleted
 
@@ -1341,11 +1611,20 @@ def _run_selected_action(browser_page, request, action: str, created=None):
         before_dialogs = browser_page.locator(ACTION_FORM_SELECTOR).count()
         target.click()
         _wait_for_action_form_effect(browser_page, before_dialogs, action)
-        result = _crud_driver(browser_page, request).save_open_dialog(
+        driver = _crud_driver(browser_page, request)
+        result = driver.save_open_dialog(
             action,
             established_business_id=getattr(created, "business_id", ""),
         )
-        assert result.mode == "dialog_action_detail_verified"
+        policy = CrudValidationPolicy.for_mode(
+            getattr(getattr(driver, "data_strategy", None), "data_mode", "")
+        )
+        expected_modes = (
+            {"dialog_action_detail_verified", "dialog_action_runtime_verified"}
+            if policy.require_dialog_persistence_readback
+            else {"dialog_action_saved"}
+        )
+        assert result.mode in expected_modes
         return result
 
     target = _visible_action(browser_page, action)
@@ -1386,3 +1665,43 @@ def test_detail_action_context_provisions_parent_record_only_when_navigation_req
 
     assert result is provisioned
     assert calls == [True]
+
+
+def test_detail_parent_provision_restores_selected_page_tab(monkeypatch):
+    calls = []
+    provisioned = SimpleNamespace(mode="add_provisioned", business_id="9001")
+
+    class Page:
+        def goto(self, url, *, wait_until):
+            calls.append(("goto", url, wait_until))
+
+    class Driver:
+        def run(self, *, provision_only=False):
+            calls.append(("provision", provision_only))
+            return provisioned
+
+    monkeypatch.setenv("EI_PAGE_TAB", "项目投后管理")
+    monkeypatch.setitem(globals(), "_crud_driver", lambda _page, _request: Driver())
+    monkeypatch.setitem(
+        globals(), "_activate_detail_parent_tab", lambda _page: calls.append(("tab",)),
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_enter_available_detail_module",
+        lambda *_args, **kwargs: kwargs["provision_record"](),
+    )
+
+    result = _prepare_detail_action_context(
+        Page(),
+        object(),
+        form_url="https://example.test/ei-view/#/projectManage/detail",
+        module_name="对外投资项目/项目投后管理/详情/投后管理/人员委派/新增",
+        action="新增",
+    )
+
+    assert result is provisioned
+    assert calls == [
+        ("goto", "https://example.test/ei-view/#/projectManage", "domcontentloaded"),
+        ("tab",),
+        ("provision", True),
+    ]

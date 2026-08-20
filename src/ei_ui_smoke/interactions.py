@@ -95,7 +95,14 @@ class FieldInteractor:
             candidates.append(stripped)
         return candidates
 
-    def fill(self, field: ResolvedField, value: Any, *, root=None) -> Any:
+    def fill(
+        self,
+        field: ResolvedField,
+        value: Any,
+        *,
+        root=None,
+        raw_date_input: bool = False,
+    ) -> Any:
         definition = field.definition
         if definition.readonly or definition.locked or value is None:
             return value
@@ -108,6 +115,8 @@ class FieldInteractor:
         if field.dom is not None and field.dom.kind == "year":
             return self._select_year(locator, value)
         if kind in {"date", "datetime"}:
+            if raw_date_input:
+                return self._fill_raw_date_input(locator, value, definition)
             return self._select_date(locator, value)
         if select_like and kind not in {"select", "multi_select", "user_select", "org_select", "tree_select"}:
             return self._select(locator, value)
@@ -160,6 +169,30 @@ class FieldInteractor:
                 locator.set_input_files(str(path))
             return str(path) if path else None
         return value
+
+    @staticmethod
+    def is_valid_date_value(value: Any) -> bool:
+        """Whether a value can be selected through a calendar picker."""
+        try:
+            FieldInteractor._parse_date_value(value)
+        except AssertionError:
+            return False
+        return True
+
+    @staticmethod
+    def _fill_raw_date_input(locator: "Locator", value: Any, definition: FieldDefinition) -> str:
+        """Type a date verbatim so negative cases reach the browser validator."""
+        if locator.get_attribute("readonly") is not None or not locator.is_editable():
+            raise AssertionError(
+                f"Date field is not manually editable: {definition.field_code} "
+                f"({definition.field_name})"
+            )
+        locator.fill(str(value))
+        locator.press("Tab")
+        try:
+            return str(locator.input_value())
+        except Exception:
+            return str(value)
 
     def clear(self, field: ResolvedField, *, root=None) -> Any:
         locator = self.locate(field) if root is None else self.locate(field, root=root)

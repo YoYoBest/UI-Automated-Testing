@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from .contracts import field_kind
+from .contracts import field_kind, has_currency_amount_unit
 from .models import FieldDefinition
 
 
@@ -49,6 +49,13 @@ class GlobalDataPool:
         )
 
     def semantic_for(self, field: FieldDefinition) -> str:
+        kind = field_kind(field.field_type)
+        if kind == "amount":
+            return "amount"
+        if kind in {"text", "number", "unknown"} and has_currency_amount_unit(
+            field.field_name
+        ):
+            return "amount"
         values = (_normalized(field.field_code), _normalized(field.field_name))
         mappings = self.common.get("fieldMappings") or {}
         for semantic, aliases in mappings.items():

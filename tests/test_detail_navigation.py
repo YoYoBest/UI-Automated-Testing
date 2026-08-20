@@ -1023,7 +1023,50 @@ def test_detail_record_click_timeout_becomes_bounded_readiness_failure(monkeypat
     assert record.click_timeout == 10_000
 
 
-def test_detail_navigation_accepts_list_as_detail_when_action_is_visible(monkeypatch):
+def test_detail_record_activates_selected_page_tab_before_scanning_parent_records(monkeypatch):
+    events = []
+
+    class Page:
+        def goto(self, url, *, wait_until):
+            events.append(("goto", url, wait_until))
+
+    class Candidates:
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return object()
+
+    monkeypatch.setenv("EI_PAGE_TAB", "项目投后管理")
+    monkeypatch.setattr(
+        detail_navigation,
+        "activate_page_tab",
+        lambda _page, label: events.append(("tab", label)),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_wait_for_parent_records_ready",
+        lambda _page: events.append(("records",)) or Candidates(),
+    )
+    monkeypatch.setattr(
+        detail_navigation,
+        "_open_parent_list_record",
+        lambda _page, _record, _candidates: events.append(("open",)) or "after-project",
+    )
+
+    result = detail_navigation.enter_detail_record(
+        Page(), "https://example.test/ei-view/#/projectManage/detail"
+    )
+
+    assert result == "after-project"
+    assert events[:3] == [
+        ("goto", "https://example.test/ei-view/#/projectManage", "domcontentloaded"),
+        ("tab", "项目投后管理"),
+        ("records",),
+    ]
+
+
+def test_detail_navigation_requires_declared_target_tab(monkeypatch):
     class MissingTab:
         @property
         def first(self):
@@ -1039,44 +1082,74 @@ def test_detail_navigation_accepts_list_as_detail_when_action_is_visible(monkeyp
         def locator(self, _selector):
             return MissingTab()
 
-    monkeypatch.setattr(
-        detail_navigation,
-        "visible_action",
-        lambda _page, action, timeout=15_000: object() if action == "编辑" else None,
-    )
-
-    detail_navigation.navigate_detail_module(
-        Page(),
-        "建设项目/详情/投前管理/项目立项/编辑",
-        "编辑",
-        navigation_labels=["投前管理", "项目立项"],
-        timeout=1,
-    )
+    with pytest.raises(
+        detail_navigation.DetailTargetUnavailableError,
+        match="详情页未加载顶层页签：投前管理",
+    ):
+        detail_navigation.navigate_detail_module(
+            Page(),
+            "建设项目/详情/投前管理/项目立项/编辑",
+            "编辑",
+            navigation_labels=["投前管理", "项目立项"],
+            timeout=1,
+        )
 
 
-def test_detail_entry_falls_back_to_current_page_when_url_does_not_change(monkeypatch):
+def test_detail_entry_does_not_fall_back_to_current_parent_page(monkeypatch):
     attempts = []
-    navigations = []
 
     def no_url_change(_page, _url, record_index=0):
         attempts.append(record_index)
         raise AssertionError("已点击父列表记录，但未进入有效详情页；当前地址：/buildProject")
 
-    def navigate(_page, _module_name, _action, **kwargs):
-        navigations.append(kwargs["timeout"])
-
     monkeypatch.setattr(detail_navigation, "enter_detail_record", no_url_change)
-    monkeypatch.setattr(detail_navigation, "navigate_detail_module", navigate)
-
-    detail_navigation.enter_available_detail_module(
-        object(),
-        "/buildProject/detail",
-        "建设项目/详情/投前管理/项目立项/编辑",
-        "编辑",
+    monkeypatch.setattr(
+        detail_navigation,
+        "navigate_detail_module",
+        lambda *_args, **_kwargs: pytest.fail("不得在父页面尝试详情操作"),
     )
 
+    with pytest.raises(AssertionError, match="未进入有效详情页"):
+        detail_navigation.enter_available_detail_module(
+            object(),
+            "/buildProject/detail",
+            "建设项目/详情/投前管理/项目立项/编辑",
+            "编辑",
+            max_records=1,
+        )
+
     assert attempts == [0]
-    assert navigations == [2_000]
+
+
+def test_detail_entry_reports_shared_precondition_when_target_tab_is_unavailable(monkeypatch):
+    attempts = []
+
+    def enter(_page, _url, record_index=0, **_kwargs):
+        attempts.append(record_index)
+        return f"parent-{record_index}"
+
+    monkeypatch.setattr(detail_navigation, "enter_detail_record", enter)
+    monkeypatch.setattr(
+        detail_navigation,
+        "navigate_detail_module",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            detail_navigation.DetailTargetUnavailableError("详情页未加载顶层页签：投后管理")
+        ),
+    )
+
+    with pytest.raises(
+        detail_navigation.DetailModulePreconditionError,
+        match="已扫描 2 条父记录.*投后管理",
+    ):
+        detail_navigation.enter_available_detail_module(
+            object(),
+            "/projectManage/detail",
+            "对外投资项目/详情/投后管理/人员委派/新增",
+            "新增",
+            max_records=2,
+        )
+
+    assert attempts == [0, 1]
 
 
 def test_parent_list_readiness_failure_does_not_retry_every_record(monkeypatch):

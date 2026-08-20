@@ -478,6 +478,7 @@ def test_runtime_menu_attaches_after_detail_tree_to_matching_static_tab(tmp_path
     assert detail.path == ("External investment", "After", "详情", "After detail")
     assert detail.route == "/projectManage/detail"
     assert detail.requires_business_id
+    assert detail.tab_label == "After"
 
 
 def test_runtime_menu_does_not_attach_father_tree_when_owner_is_ambiguous(tmp_path):
@@ -600,6 +601,48 @@ def test_runtime_menu_attaches_permissions_filtered_actions_to_father_detail_nod
     assert [item.operation for item in actions] == ["Edit"]
     assert actions[0].path[-2:] == ("Agreement", "Edit")
     assert actions[0].requires_business_id and not actions[0].runnable
+
+
+def test_father_detail_actions_fall_back_when_menu_permissions_omit_component_codes(tmp_path):
+    root = tmp_path / "ei-view" / "srcEi" / "views" / "projectManage"
+    (tmp_path / "ei-view" / "src" / "views").mkdir(parents=True)
+    (root / "after" / "investmentMatters").mkdir(parents=True)
+    (root / "index.vue").write_text("<template />", encoding="utf-8")
+    (root / "after" / "investmentMatters" / "index.vue").write_text(
+        '''<div v-if="$hasButton('matter_add')"><el-button>新增</el-button></div>
+        <el-button v-if="$hasButton('matter_edit')">编辑</el-button>
+        <el-button v-if="$hasButton('matter_delete')">删除</el-button>''',
+        encoding="utf-8",
+    )
+    payload = {
+        "data": {"funcPerm": [{
+            "funcCode": "PROJECT_MANAGE",
+            "path": "/projectManage",
+            "component": "/srcEi/views/projectManage/index",
+            "meta": {"title": "对外投资项目"},
+            "children": [],
+        }]},
+        # This endpoint is successful, but it exposes only menu-level codes.
+        "_buttonCodes": ["unrelated_menu_button"],
+        "_detailFatherTrees": [{
+            "fatherId": "30022",
+            "sourceComponent": "projectManage/after/afterManage",
+            "nodes": [{
+                "funcCode": "PROJECT_AFTER_MATTERS",
+                "component": "/srcEi/views/projectManage/after/investmentMatters/index",
+                "meta": {"title": "投后事项"},
+                "children": [],
+            }],
+        }],
+    }
+
+    actions = [
+        item for item in modules_from_menu(payload, tmp_path)
+        if item.id.startswith("detail:father:30022:PROJECT_AFTER_MATTERS::action::")
+    ]
+
+    assert [item.operation for item in actions] == ["新增", "编辑", "删除"]
+    assert all(item.requires_business_id and not item.runnable for item in actions)
 
 
 def test_runtime_menu_ignores_legacy_visible_action_snapshot(tmp_path):

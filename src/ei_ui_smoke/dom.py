@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from .contracts import has_currency_amount_unit
 from .models import DomField
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ def is_semantic_numeric_field(field_code: str, label: str) -> bool:
     normalized_label = re.sub(r"^(?:请)?(?:输入|填写)", "", label or "").strip()
     return bool(
         _NUMERIC_LABEL_RE.search(normalized_label)
+        or has_currency_amount_unit(normalized_label)
         or _NUMERIC_CODE_RE.search(field_code or "")
     )
 
@@ -233,6 +235,11 @@ DOM_FIELD_SCRIPT = r"""
     const inputmode = (el.getAttribute('inputmode') || '').toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
     const cls = `${el.className || ''} ${el.closest(componentControlSelector)?.className || ''}`.toLowerCase();
+    const isMultipleSelect =
+      (el instanceof HTMLSelectElement && el.multiple) ||
+      Boolean(el.closest(
+        '[multiple],[aria-multiselectable="true"],.el-select--multiple,.ant-select-multiple'
+      ));
     if (type === 'file') return 'file';
     if (el.tagName === 'TEXTAREA') return 'textarea';
     // Element Plus date-picker inputs also expose role=combobox. Preserve the
@@ -241,7 +248,7 @@ DOM_FIELD_SCRIPT = r"""
     // Component semantics are stronger than label heuristics. Element Plus
     // select inputs are readonly comboboxes and numeric column labels must not
     // turn them into number inputs.
-    if (el.tagName === 'SELECT' || role === 'combobox' || cls.includes('select')) return cls.includes('multiple') ? 'multi_select' : 'select';
+    if (el.tagName === 'SELECT' || role === 'combobox' || cls.includes('select')) return isMultipleSelect || cls.includes('multiple') ? 'multi_select' : 'select';
     if (type === 'radio' || role === 'radio' || cls.includes('radio')) return 'radio';
     if (type === 'checkbox' || role === 'checkbox' || role === 'switch' || cls.includes('checkbox') || cls.includes('switch')) return 'checkbox';
     if (type === 'number' || ['numeric', 'decimal'].includes(inputmode) ||

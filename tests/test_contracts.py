@@ -1,6 +1,12 @@
 import json
 
-from ei_ui_smoke.contracts import build_runtime_data, field_kind, normalize_field, remove_runtime_fields
+from ei_ui_smoke.contracts import (
+    build_runtime_data,
+    field_kind,
+    has_currency_amount_unit,
+    normalize_field,
+    remove_runtime_fields,
+)
 
 
 def fields():
@@ -16,10 +22,18 @@ def fields():
 def test_field_type_aliases_cover_new_and_legacy_types():
     assert field_kind("TEXT") == "text"
     assert field_kind("ElInput-TEXT") == "text"
+    assert field_kind("AMOUNT") == "amount"
+    assert field_kind("ElInput-AMOUNT") == "amount"
     assert field_kind("PurvarDepartment-dept") == "org_select"
     assert field_kind("PurvarLibrary-FILE_LIBRARY") == "file_library"
     assert field_kind("PurvarAiParsePanel-AI_PARSE") == "ai_parse"
     assert field_kind("USER_SELECT_TABLE") == "user_select"
+
+
+def test_currency_amount_unit_requires_an_explicit_unit_boundary():
+    assert has_currency_amount_unit("总资产（万元）")
+    assert has_currency_amount_unit("合同金额: 元")
+    assert not has_currency_amount_unit("员工人数")
 
 
 def test_runtime_payload_only_contains_visible_fixed_type_zero_and_two():

@@ -31,6 +31,7 @@ from .common_field_cases import (
 from .failure_evidence import capture_failure_evidence, clear_failure_evidence
 from .dom import scan_dom_fields
 from .detail_navigation import visible_action
+from .interactions import FieldInteractor
 from .models import DomField, FieldDefinition, FixedType, ResolvedField
 from .module_driver import (
     AUTOMATION_RECORD_PREFIXES,
@@ -39,6 +40,7 @@ from .module_driver import (
     EDITABLE_FORM_CONTROL,
     INLINE_FORM,
     ModuleSmokeDriver,
+    ORDINARY_SAVE_COMMAND_PATTERN,
 )
 from .source_form import SourceBranchCandidate, SourceDetailEndpoint
 from .dynamic_collections import DynamicCollectionSpec
@@ -105,7 +107,7 @@ FORM_LEAVE_CONFIRM_CONTEXT_PATTERN = re.compile(
     r"(?:离开|未保存|放弃(?:修改|更改)|关闭.*(?:编辑|表单)|是否.*关闭)"
 )
 FORM_COMMAND_PATTERN = re.compile(
-    r"^\s*(?:保存|确定|提交|提交审批|取消|取消编辑|关闭)\s*$"
+    r"^\s*(?:保存|确定|暂存|提交|提交审批|取消|取消编辑|关闭)\s*$"
 )
 INLINE_COMMAND_HOST_XPATH = (
     "xpath=ancestor::*["
@@ -552,7 +554,7 @@ class CommonFieldExecutor:
                         )
                     network_tracker = self._start_branch_network_tracker()
                     try:
-                        self._select_branch_option(
+                        branch_changed = self._select_branch_option(
                             current_driver,
                             current_scope,
                             option_label,
@@ -570,8 +572,12 @@ class CommonFieldExecutor:
                                     os.getenv("EI_COMMON_FIELD_BRANCH_STABLE_MS", "700")
                                 ),
                                 network_tracker=network_tracker,
+                                allow_scope_rebind=branch_changed,
                             ),
                             definitions,
+                        )
+                        current_scope = (
+                            self._active_form_scope() or current_scope
                         )
                     finally:
                         self._stop_branch_network_tracker(network_tracker)
@@ -843,17 +849,17 @@ class CommonFieldExecutor:
         field: DiscoveredCommonField,
         scope,
         option_label: str,
-    ) -> None:
+    ) -> bool:
         locator = self._choice_locator_for_branch_driver(field, scope)
         if locator is None or not locator.count() or not locator.is_visible():
             raise AssertionError(
                 f"无法定位联动分支驱动字段：{field.field_key} ({field.label})"
             )
         if self._branch_option_already_selected(locator, option_label):
-            return
+            return False
         if field.kind == "radio":
             self._select_radio_branch_option(locator, option_label)
-            return
+            return True
         locator.click(force=True)
         self.page.wait_for_timeout(150)
         options = self._owned_select_options(locator)
@@ -864,6 +870,7 @@ class CommonFieldExecutor:
                 f"联动分支字段 {field.field_key} 没有选项：{option_label}"
             )
         options.nth(target_index).click(force=True)
+        return True
 
     def _branch_option_already_selected(self, locator, option_label: str) -> bool:
         wanted = self._normalize_choice_label(option_label)
@@ -1013,13 +1020,29 @@ class CommonFieldExecutor:
         if not conditions:
             return False
         for field_key, option_label in conditions:
+            scope = self._active_form_scope() or scope
             driver = self._branch_driver_field(field_key, scope)
-            self._select_branch_option(driver, scope, option_label)
-        self._wait_for_fields_stable(
-            scope,
-            timeout_ms=int(os.getenv("EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000")),
-            stable_ms=int(os.getenv("EI_COMMON_FIELD_BRANCH_STABLE_MS", "700")),
-        )
+            network_tracker = self._start_branch_network_tracker()
+            try:
+                branch_changed = self._select_branch_option(
+                    driver, scope, option_label
+                )
+                self._wait_for_fields_stable(
+                    scope,
+                    timeout_ms=int(os.getenv(
+                        "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                    )),
+                    stable_ms=int(os.getenv(
+                        "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+                    )),
+                    network_tracker=(
+                        network_tracker if branch_changed else None
+                    ),
+                    allow_scope_rebind=branch_changed,
+                )
+                scope = self._active_form_scope() or scope
+            finally:
+                self._stop_branch_network_tracker(network_tracker)
         print(
             "COMMON_BRANCH_APPLIED "
             f"conditions={conditions!r}",
@@ -1107,7 +1130,9 @@ class CommonFieldExecutor:
                     recover = lambda: self._restore_required_case(case, scope)
             elif case.field_type in {"select", "radio"}:
                 self._apply_case_branch_conditions(case, scope)
-                current = self._current_field(case, scope)
+                self._prepare_standard_choice_collection(case, scope)
+                scope = self._active_form_scope() or scope
+                current = self._wait_for_current_field(case, scope)
                 result = self._execute_choice_case(case, current, scope)
             elif case.field_type == "file":
                 self._apply_case_branch_conditions(case, scope)
@@ -1123,7 +1148,11 @@ class CommonFieldExecutor:
                 locator = self._locator(current)
                 before = self._input_value(locator)
                 requested = self._case_input_value(case, current, before)
-                self._replace_value(current, requested)
+                raw_invalid_date = self._should_use_raw_date_input(
+                    case, current, requested
+                )
+                replace_kwargs = {"raw_date_input": True} if raw_invalid_date else {}
+                self._replace_value(current, requested, **replace_kwargs)
                 actual = self._input_value(locator)
                 submitted[case.field_key] = actual
                 result = self._submit_case(
@@ -1138,6 +1167,21 @@ class CommonFieldExecutor:
         result = self._run_in_form_session(operation)[0]
         self._log_result(case, result)
         return result
+
+    def _prepare_standard_choice_collection(
+        self, case: BoundCommonCase, scope,
+    ) -> None:
+        """Render a manifest-owned child control before a standard choice check."""
+        strategy = getattr(self.driver, "data_strategy", None)
+        if str(getattr(strategy, "data_mode", "")).strip().lower() != "standard":
+            return
+        prepare = getattr(
+            self.driver,
+            "_prepare_configured_dynamic_collection_for_field",
+            None,
+        )
+        if callable(prepare):
+            prepare(scope, case.field_key)
 
     def _execute_file_case(
         self,
@@ -1178,7 +1222,13 @@ class CommonFieldExecutor:
             self.driver._stop_attachment_lifecycle_tracking(tracker)
 
     def _file_input(self, field: DiscoveredCommonField, scope):
-        locator = scope.locator(field.selector).first
+        active_scope = self._active_form_scope()
+        if active_scope is not None and active_scope is not scope:
+            scope = active_scope
+            selector = self._dom_for_discovered_field(field, scope).selector
+        else:
+            selector = field.selector
+        locator = scope.locator(selector).first
         if not locator.count():
             raise AssertionError(f"无法定位附件控件：{field.field_key}")
         return locator
@@ -2424,7 +2474,13 @@ class CommonFieldExecutor:
     def _upload_required_attachment(
         self, scope, field: DiscoveredCommonField,
     ) -> None:
-        file_input = scope.locator(field.selector).first
+        active_scope = self._active_form_scope()
+        if active_scope is not None and active_scope is not scope:
+            scope = active_scope
+            selector = self._dom_for_discovered_field(field, scope).selector
+        else:
+            selector = field.selector
+        file_input = scope.locator(selector).first
         if not file_input.count():
             raise AssertionError(f"无法定位必填附件控件：{field.field_key}")
         owner = file_input.locator(
@@ -2437,8 +2493,9 @@ class CommonFieldExecutor:
             raise AssertionError(f"必填附件上传未生效：{field.field_key}")
 
     def _discover_form_commands(self, scope) -> list[DiscoveredCommonField]:
+        scope = self._current_form_scope(scope)
         definitions = (
-            ("save_command", "保存", re.compile(r"^\s*(?:保存|确定)\s*$")),
+            ("save_command", "保存", ORDINARY_SAVE_COMMAND_PATTERN),
             ("submit_command", "提交", re.compile(r"^\s*(?:提交|提交审批)\s*$")),
             ("cancel_command", "取消", re.compile(r"^\s*(?:取消|取消编辑|关闭)\s*$")),
         )
@@ -2492,6 +2549,7 @@ class CommonFieldExecutor:
         return None
 
     def _execute_dialog_title_case(self, case: BoundCommonCase, scope):
+        scope = self._current_form_scope(scope)
         title = self._form_title(scope)
         if title is None or not title.count() or not title.is_visible():
             raise AssertionError("当前编辑表单不是对话框，无法检查对话框名称")
@@ -2510,6 +2568,7 @@ class CommonFieldExecutor:
 
     def _command_scope(self, scope):
         """Keep dialog commands scoped, with a bounded host fallback for inline edit."""
+        scope = self._current_form_scope(scope)
         try:
             if self._form_command_buttons(scope).count():
                 return scope
@@ -2540,11 +2599,12 @@ class CommonFieldExecutor:
         return None
 
     def _execute_command_case(self, case: BoundCommonCase, scope):
+        scope = self._current_form_scope(scope)
         if case.field_type == "close_command":
             button = self._form_close_button(scope, strict=True)
         else:
             pattern = {
-                "save_command": re.compile(r"^\s*(?:保存|确定)\s*$"),
+                "save_command": ORDINARY_SAVE_COMMAND_PATTERN,
                 "submit_command": re.compile(r"^\s*(?:提交|提交审批)\s*$"),
                 "cancel_command": re.compile(r"^\s*(?:取消|取消编辑|关闭)\s*$"),
             }[case.field_type]
@@ -2615,6 +2675,15 @@ class CommonFieldExecutor:
             if optional_clear_case
             else self._fill_valid_baseline(scope)
         )
+        scope = self._current_form_scope(scope)
+        if case.field_type == "close_command":
+            button = self._form_close_button(scope, strict=True)
+        else:
+            button = self._command_scope(scope).locator(
+                "button:visible"
+            ).filter(has_text=pattern).last
+        if button is None or not button.count() or not button.is_visible():
+            raise AssertionError(f"新增表单缺少{case.field_label}按钮")
         self._ensure_command_required_baseline(scope, submitted)
         cleared_optional_codes: set[str] = set()
         if optional_clear_case:
@@ -3788,6 +3857,13 @@ class CommonFieldExecutor:
                 )
             self.page.wait_for_timeout(100)
 
+    def _source_branch_driver_codes(self) -> set[str]:
+        return {
+            str(candidate.driver_field).strip().lower()
+            for candidate in getattr(self, "source_branch_candidates", ())
+            if str(candidate.driver_field).strip()
+        }
+
     def _fill_valid_baseline(
         self,
         scope,
@@ -3814,7 +3890,34 @@ class CommonFieldExecutor:
                 fill_kwargs: dict[str, Any] = {"only_codes": retry_codes}
                 if protected_codes:
                     fill_kwargs["protected_codes"] = protected_codes
-                submitted.update(self.driver._fill_dialog(**fill_kwargs))
+                source_driver_codes = self._source_branch_driver_codes()
+                network_tracker = (
+                    self._start_branch_network_tracker()
+                    if source_driver_codes else None
+                )
+                try:
+                    filled = self.driver._fill_dialog(**fill_kwargs)
+                    submitted.update(filled)
+                    filled_codes = {
+                        str(code).strip().lower()
+                        for code in filled
+                        if str(code).strip()
+                    }
+                    if filled_codes & source_driver_codes:
+                        self._wait_for_fields_stable(
+                            scope,
+                            timeout_ms=int(os.getenv(
+                                "EI_COMMON_FIELD_BRANCH_STABLE_TIMEOUT_MS", "6000"
+                            )),
+                            stable_ms=int(os.getenv(
+                                "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
+                            )),
+                            network_tracker=network_tracker,
+                            allow_scope_rebind=True,
+                        )
+                        scope = self._active_form_scope() or scope
+                finally:
+                    self._stop_branch_network_tracker(network_tracker)
                 fill_failures = list(self.driver._fill_failures)
                 if conditions:
                     self._wait_for_fields_stable(
@@ -4244,6 +4347,7 @@ class CommonFieldExecutor:
         require_edit_and_detail: bool = False,
         attachment_lifecycle_tracker=None,
     ) -> CommonFieldExecutionResult:
+        scope = self._current_form_scope(scope)
         if required_codes is None and not case.field_type.endswith("_command"):
             required_codes = {case.field_key}
         branch_protected_codes = {
@@ -5144,7 +5248,11 @@ class CommonFieldExecutor:
                 )
                 if callable(prepare_unique):
                     prepare_unique()
-            return self.open_add_form(require_new=True)
+            scope = self.open_add_form(require_new=True)
+            ensure_contract = getattr(getattr(self, "driver", None), "_ensure_field_contract", None)
+            if callable(ensure_contract):
+                ensure_contract()
+            return scope
         except SharedFormPreconditionError:
             raise
         except Exception as exc:
@@ -5232,6 +5340,16 @@ class CommonFieldExecutor:
         ]
         if len(compatible) == 1:
             return compatible[0]
+        # A single-select rule is intentionally not applicable to a rendered
+        # multi-select.  Return the actual control so the choice executor can
+        # emit the existing reasoned pytest skip, rather than manufacturing a
+        # generic select through the legacy locator fallback below.
+        if (
+            case.field_type == "select"
+            and len(candidates) == 1
+            and candidates[0].kind == "multi_select"
+        ):
+            return candidates[0]
         if len(compatible) > 1:
             choice_group = (
                 self._runtime_choice_field(case, scope)
@@ -5483,6 +5601,10 @@ class CommonFieldExecutor:
         active = getattr(session, "active", None)
         return active.scope if active is not None else None
 
+    def _current_form_scope(self, scope):
+        """Use a Session rebind for form-level work, never for nested row scopes."""
+        return self._active_form_scope() or scope
+
     def _same_runtime_field(
         self, item: DomField, field: DiscoveredCommonField
     ) -> bool:
@@ -5534,7 +5656,13 @@ class CommonFieldExecutor:
             else self.driver.interactor.locate(resolved)
         )
 
-    def _replace_value(self, field: DiscoveredCommonField, value: Any) -> None:
+    def _replace_value(
+        self,
+        field: DiscoveredCommonField,
+        value: Any,
+        *,
+        raw_date_input: bool = False,
+    ) -> None:
         definition = self._definition(field)
         dom = self._dom_for_discovered_field(field)
         resolved = ResolvedField(definition, dom)
@@ -5545,10 +5673,11 @@ class CommonFieldExecutor:
             else self.driver.interactor.locate(resolved)
         )
         if field.kind in {"year", "date", "datetime"}:
+            fill_kwargs = {"raw_date_input": True} if raw_date_input else {}
             if root is not None:
-                self.driver.interactor.fill(resolved, value, root=root)
+                self.driver.interactor.fill(resolved, value, root=root, **fill_kwargs)
             else:
-                self.driver.interactor.fill(resolved, value)
+                self.driver.interactor.fill(resolved, value, **fill_kwargs)
             return
         if field.kind not in {"text", "textarea", "number"}:
             raise AssertionError(
@@ -5556,6 +5685,19 @@ class CommonFieldExecutor:
             )
         locator.fill("" if value is None else str(value))
         locator.press("Tab")
+
+    @staticmethod
+    def _should_use_raw_date_input(
+        case: BoundCommonCase,
+        field: DiscoveredCommonField,
+        value: Any,
+    ) -> bool:
+        """Reserve raw date typing for negative cases a calendar cannot select."""
+        return (
+            case.expected_type == "field_error"
+            and field.kind in {"date", "datetime"}
+            and not FieldInteractor.is_valid_date_value(value)
+        )
 
     @staticmethod
     def _definition(field: DiscoveredCommonField) -> FieldDefinition:
@@ -5585,6 +5727,14 @@ class CommonFieldExecutor:
     def _execute_choice_case(
         self, case: BoundCommonCase, field: DiscoveredCommonField, form_scope=None
     ) -> CommonFieldExecutionResult:
+        if case.field_type == "select" and field.kind == "multi_select":
+            return CommonFieldExecutionResult(
+                case.case_id,
+                case.field_key,
+                "runtime_not_applicable",
+                f"当前字段为多选下拉框：{field.field_key}（{field.label}），"
+                "单选下拉框用例不适用",
+            )
         readonly_result = self._runtime_readonly_choice_result(case, field)
         if readonly_result is not None:
             return readonly_result
@@ -5941,6 +6091,7 @@ class CommonFieldExecutor:
                 stable_ms=int(os.getenv(
                     "EI_COMMON_FIELD_BRANCH_STABLE_MS", "700"
                 )),
+                allow_scope_rebind=(attempt == 1),
             )
             scope = self._active_form_scope() or scope
             if conditions:
@@ -6241,15 +6392,15 @@ class CommonFieldExecutor:
             pass
         return "; ".join(dict.fromkeys(text.strip() for text in texts if text.strip()))
 
-    def _scan_fields(self, scope=None):
-        """Apply the same runtime/source identity mapping as the form driver."""
+    def _scan_fields(self, scope=None, *, allow_scope_rebind: bool = False):
+        """Scan one scope; rebind only during an explicitly expected rerender."""
         if scope is None:
             session = getattr(self, "_form_session", None)
             active = getattr(session, "active", None)
             if active is not None:
                 scope = active.scope
         fields = scan_dom_fields(self.page, scope)
-        if scope is not None:
+        if allow_scope_rebind and not fields and scope is not None:
             recovered_scope = self._recover_replaced_active_form_scope(scope)
             if recovered_scope is not None:
                 fields = scan_dom_fields(self.page, recovered_scope)
@@ -6262,7 +6413,7 @@ class CommonFieldExecutor:
         return mapped
 
     def _recover_replaced_active_form_scope(self, scope):
-        """Rebind when exactly one live form replaces the pinned DOM instance."""
+        """Rebind one empty pinned scope during an expected linkage rerender."""
         session = getattr(self, "_form_session", None)
         active = getattr(session, "active", None)
         if active is None or active.scope is not scope:
@@ -6357,8 +6508,9 @@ class CommonFieldExecutor:
         timeout_ms: int | None = None,
         stable_ms: int | None = None,
         network_tracker: _BranchNetworkTracker | None = None,
+        allow_scope_rebind: bool = False,
     ):
-        """Wait for fields, loading state, and tracked linkage requests to settle."""
+        """Wait for stability and allow at most one expected form replacement."""
         timeout_ms = timeout_ms or int(
             os.getenv("EI_COMMON_FIELD_STABLE_TIMEOUT_MS", "10000")
         )
@@ -6369,11 +6521,22 @@ class CommonFieldExecutor:
         stable_since = None
         last_signature = None
         latest = []
+        rebind_pending = bool(allow_scope_rebind)
         while time.monotonic() < deadline:
             active_scope = self._active_form_scope()
             if active_scope is not None and active_scope is not scope:
                 scope = active_scope
-            current = self._scan_fields(scope)
+                rebind_pending = False
+            if rebind_pending:
+                current = self._scan_fields(
+                    scope, allow_scope_rebind=True
+                )
+                active_scope = self._active_form_scope()
+                if active_scope is not None and active_scope is not scope:
+                    scope = active_scope
+                    rebind_pending = False
+            else:
+                current = self._scan_fields(scope)
             signature = tuple(
                 sorted(
                     (

@@ -127,6 +127,41 @@
           "label": "投资额币种"
         }
       ]
+    },
+    {
+      "component": "buildProject/before/projectDecision/index",
+      "fieldCode": "financeSources",
+      "sectionTitle": "预算及资金来源明细子表",
+      "mode": "add-row",
+      "rootSelector": ".form_content:has(.finance-table)",
+      "createSelector": "button:has-text('新增')",
+      "itemSelector": ".finance-table .el-table__body-wrapper .el-table__row:has(input)",
+      "minRows": 1,
+      "createOnOuterAdd": false,
+      "children": [
+        {
+          "fieldCodeTemplate": "financeSources.{index}.sourceFrom",
+          "columnHeader": "资金来源",
+          "selector": ".el-select",
+          "kind": "select",
+          "label": "资金来源"
+        },
+        {
+          "fieldCodeTemplate": "financeSources.{index}.amount",
+          "columnHeader": "预算金额（万元）",
+          "selector": "input",
+          "kind": "number",
+          "label": "预算金额（万元）"
+        },
+        {
+          "fieldCodeTemplate": "financeSources.{index}.fundsPlan",
+          "columnHeader": "资金筹措方案",
+          "selector": "textarea",
+          "kind": "textarea",
+          "label": "资金筹措方案",
+          "required": false
+        }
+      ]
     }
   ]
 }

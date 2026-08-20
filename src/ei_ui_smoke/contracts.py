@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
 
 from .models import FieldDefinition, FixedType
@@ -11,8 +12,9 @@ FIELD_KIND_ALIASES = {
     "TEXT": "text", "INPUT": "text", "ElInput-TEXT": "text",
     "TEXTAREA": "textarea", "PurvarTextarea-TEXTAREA": "textarea",
     "NUMBER": "number", "ElInputNumber-NUMBER": "number",
-    "SELECT": "select", "PurvarCodeSelect-SELECT": "select",
-    "MULTI_SELECT": "multi_select", "PurvarCodeSelect-MULTI_SELECT": "multi_select",
+    "AMOUNT": "amount", "ElInput-AMOUNT": "amount",
+    "SELECT": "select", "ElSelect-SELECT": "select", "PurvarCodeSelect-SELECT": "select",
+    "MULTI_SELECT": "multi_select", "ElSelect-MULTIPLE": "multi_select", "PurvarCodeSelect-MULTI_SELECT": "multi_select",
     "RADIO": "radio", "PurvarCodeSelect-RADIO": "radio",
     "CHECKBOX": "checkbox", "PurvarCodeSelect-CHECKBOX": "checkbox",
     "DATE": "date", "ElDatePicker-DATE": "date",
@@ -37,6 +39,10 @@ FIELD_KIND_ALIASES = {
     "LINK_TAG_SINGLE": "select", "PurvarLinkTag-LINK_TAG_SINGLE": "select",
     "FORMULA": "formula", "FormulaConfig-FORMULA": "formula",
 }
+
+CURRENCY_AMOUNT_UNIT = re.compile(
+    r"(?:^|[（(：:\s])(?:人民币)?(?:亿元|万元|元)(?=$|[）)\s])"
+)
 
 
 def parse_json_object(value: Any) -> dict[str, Any]:
@@ -89,6 +95,11 @@ def field_kind(field_type: str) -> str:
         return FIELD_KIND_ALIASES[field_type]
     suffix = field_type.rsplit("-", 1)[-1].upper()
     return FIELD_KIND_ALIASES.get(suffix, "unknown")
+
+
+def has_currency_amount_unit(label: str) -> bool:
+    """Recognize an explicit currency unit without treating words like 员工 as 元."""
+    return bool(CURRENCY_AMOUNT_UNIT.search(str(label or "")))
 
 
 def runtime_fields(fields: Iterable[FieldDefinition]) -> list[FieldDefinition]:

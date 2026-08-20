@@ -1,6 +1,9 @@
 import json
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import ei_ui_smoke.launcher as launcher_module
 
@@ -11,6 +14,7 @@ from ei_ui_smoke.launcher import (
     add_standard_common_field_commands,
     add_standard_module_case_commands,
     build_pytest_command,
+    build_workflow_environment,
     command_log_name,
     command_failure_names,
     command_preflight_commands,
@@ -24,6 +28,7 @@ from ei_ui_smoke.launcher import (
     clear_discovery_manifest,
     default_common_cases_workbook,
     default_module_cases_workbook,
+    default_system_url,
     default_storage_state,
     console_python_executable,
     format_failure_message,
@@ -53,6 +58,7 @@ from ei_ui_smoke.launcher import (
     maintenance_gate_failure_message,
     linked_case_id_options,
     missing_zentao_settings,
+    merge_workflow_role_states_json,
     save_url_history,
     safe_run_log_name,
     target_preflight_error,
@@ -70,7 +76,14 @@ from ei_ui_smoke.launcher import (
     omit_discovered_validation_commands,
     check_maintenance_gate_once,
     DEFER_SKILL_GATE_ENV,
+    RESOURCE_POOL_APPROVAL_CONFIG_ENV,
+    WORKFLOW_TEST_FILE,
+    WORKFLOW_AUTH_ROLE_LABELS,
     Launcher,
+    workflow_launcher_configuration_error,
+    workflow_launcher_defaults,
+    workflow_role_storage_state_path,
+    workflow_timeout_seconds,
 )
 from ei_ui_smoke.environment_api import ApiProbe, ApiProbeResult, EnvironmentBlock
 from ei_ui_smoke.execution_guard import RuntimeVersion, runtime_version_changed, runtime_version_mismatch_message
@@ -139,6 +152,26 @@ def test_runtime_version_check_accepts_the_exact_loaded_checkout():
     version = RuntimeVersion(commit="a" * 40, worktree_fingerprint="stable")
 
     assert not runtime_version_changed(version, version)
+
+
+def test_launcher_main_registers_only_the_real_gui_process(monkeypatch, tmp_path):
+    registered = []
+
+    class StubLauncher:
+        project_root = tmp_path
+
+        def mainloop(self):
+            return None
+
+    monkeypatch.setattr(launcher_module, "Launcher", StubLauncher)
+    monkeypatch.setattr(
+        launcher_module,
+        "register_launcher_process",
+        lambda project_root: registered.append(project_root),
+    )
+
+    assert launcher_module.main() == 0
+    assert registered == [tmp_path]
 
 
 def test_run_selected_blocks_a_real_launcher_without_a_startup_version(monkeypatch, tmp_path):
@@ -245,6 +278,15 @@ def test_pytest_commands_forward_selected_case_ids_and_target_only_business_test
         "test_build_project_add_personalized.py::test_build_project_add_personalized"
     ) for item in module)
     assert module[module.index("--module-case-ids") + 1] == '["LX-ADD-002"]'
+
+    for workflow_mode in ("standard", "probe", "stable"):
+        workflow = build_pytest_command(
+            "python.exe", WORKFLOW_TEST_FILE, {}, workflow_mode, tmp_path,
+        )
+        assert any(item.endswith(
+            "test_business_workflow.py::test_selected_business_workflow"
+        ) for item in workflow)
+        assert workflow[workflow.index("--data-mode") + 1] == workflow_mode
 from ei_ui_smoke.module_index import ModuleItem
 
 
@@ -289,6 +331,181 @@ def test_default_storage_state_prefers_environment_then_saved_state(tmp_path, mo
     assert default_storage_state(tmp_path) == str(saved.resolve())
     monkeypatch.setenv("EI_STORAGE_STATE", "configured-state.json")
     assert default_storage_state(tmp_path) == "configured-state.json"
+
+
+def test_workflow_launcher_configuration_requires_factory_and_role_file_mapping():
+    role_states = json.dumps(
+        {"maker": "maker.json", "approver": "approver.json"},
+        ensure_ascii=False,
+    )
+
+    assert "流程 ID" in workflow_launcher_configuration_error(
+        "EI", "", "tests.workflows.approval:build", role_states
+    )
+    assert "python.module:factory" in workflow_launcher_configuration_error(
+        "EI", "approval", "missing-separator", role_states
+    )
+    assert "文件路径" in workflow_launcher_configuration_error(
+        "EI", "approval", "tests.workflows.approval:build",
+        '{"maker":{"cookies":[]}}',
+    )
+    assert workflow_launcher_configuration_error(
+        "EI", "approval", "tests.workflows.approval:build", role_states
+    ) == ""
+
+
+def test_builtin_workflow_requires_nonempty_json_config_but_custom_factory_does_not():
+    role_states = json.dumps({
+        "maker": "maker.json",
+        "approver": "approver.json",
+    })
+    builtin_factory = (
+        "ei_ui_smoke.workflows.resource_pool_approval:build_workflow"
+    )
+
+    for invalid_config in ("", "not-json", "[]", "{}"):
+        error = workflow_launcher_configuration_error(
+            "EI",
+            "resource-pool-approval",
+            builtin_factory,
+            role_states,
+            invalid_config,
+        )
+        assert "EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON" in error
+        assert "非空 JSON 对象" in error
+
+    assert workflow_launcher_configuration_error(
+        "EI",
+        "resource-pool-approval",
+        builtin_factory,
+        role_states,
+        '{"resourcePoolUrl":"https://host/ei-view/#/resourcePool"}',
+    ) == ""
+    assert workflow_launcher_configuration_error(
+        "EI",
+        "resource-pool-approval",
+        "tests.workflows.custom:build_workflow",
+        role_states,
+    ) == ""
+
+
+def test_repository_workflow_has_launcher_defaults_but_custom_factory_is_preserved():
+    assert workflow_launcher_defaults("") == (
+        "EI",
+        "resource-pool-approval",
+        "ei_ui_smoke.workflows.resource_pool_approval:build_workflow",
+    )
+    assert workflow_launcher_defaults(
+        "custom-approval",
+        project_key="FI",
+        factory_spec="tests.workflows.custom:build_workflow",
+    ) == (
+        "FI",
+        "custom-approval",
+        "tests.workflows.custom:build_workflow",
+    )
+
+
+def test_launcher_has_no_business_workflow_panel():
+    source = inspect.getsource(Launcher._build)
+    assert "workflow_panel" not in source
+    assert 'text="业务流程"' not in source
+    assert 'text=f"采集{label}"' not in source
+
+
+def test_workflow_has_a_longer_bounded_outer_process_timeout():
+    assert workflow_timeout_seconds({}, 300) == 1_200
+    assert workflow_timeout_seconds(
+        {"EI_WORKFLOW_TIMEOUT_SECONDS": "1800"}, 300
+    ) == 1_800
+    assert workflow_timeout_seconds(
+        {"EI_WORKFLOW_TIMEOUT_SECONDS": "120"}, 300
+    ) == 300
+
+
+def test_workflow_environment_removes_independent_action_and_single_role_auth():
+    base = {
+        "EI_BASE_URL": "https://host/ei-view",
+        "EI_ACTION": "新增",
+        "EI_ACTION_PATH": '["新增"]',
+        "EI_ACTION_PATHS_JSON": '[["新增"]]',
+        "EI_ACTIONS_JSON": '[{"action":"新增"}]',
+        "EI_ACTION_TIMEOUT": "30",
+        "EI_REQUIRE_ADD": "true",
+        "EI_STORAGE_STATE": "single-role.json",
+        "EI_USERNAME": "legacy-user",
+        "EI_PASSWORD": "legacy-password",
+        "EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON": '{"stale":true}',
+    }
+    role_states = '{"maker":"maker.json"}'
+    workflow_config = '{"resourcePoolUrl":"https://host/ei-view/#/resourcePool"}'
+
+    environment = build_workflow_environment(
+        base,
+        workflow_id="project-approval",
+        factory_spec="tests.workflows.project_approval:build_workflow",
+        role_states_json=role_states,
+        workflow_config_json=workflow_config,
+        workflow_login_password="workflow-password",
+    )
+
+    assert environment["EI_BASE_URL"] == "https://host/ei-view"
+    assert environment["EI_WORKFLOW_ID"] == "project-approval"
+    assert environment["EI_WORKFLOW_FACTORY"] == (
+        "tests.workflows.project_approval:build_workflow"
+    )
+    assert environment["EI_WORKFLOW_ROLE_STATES_JSON"] == role_states
+    assert environment["EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON"] == workflow_config
+    assert not any(name.startswith("EI_ACTION") for name in environment)
+    assert "EI_REQUIRE_ADD" not in environment
+    assert "EI_STORAGE_STATE" not in environment
+    assert "EI_USERNAME" not in environment
+    assert "EI_PASSWORD" not in environment
+    assert environment["EI_WORKFLOW_LOGIN_PASSWORD"] == "workflow-password"
+    assert base["EI_ACTION"] == "新增"
+
+    without_config = build_workflow_environment(
+        base,
+        workflow_id="custom-approval",
+        factory_spec="tests.workflows.custom:build_workflow",
+        role_states_json=role_states,
+    )
+    assert "EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON" not in without_config
+
+
+def test_workflow_role_state_paths_are_strictly_cleaned_and_role_scoped(tmp_path):
+    assert WORKFLOW_AUTH_ROLE_LABELS == {
+        "maker": "经办人",
+    }
+
+    maker = workflow_role_storage_state_path(
+        tmp_path, "../resource pool:审批", "maker"
+    )
+    expected_parent = (tmp_path / "artifacts" / "workflow-auth").resolve()
+    assert maker == expected_parent / "resource_pool-maker.json"
+    with pytest.raises(ValueError, match="不支持"):
+        workflow_role_storage_state_path(
+            tmp_path, "../resource pool:审批", "approver"
+        )
+
+
+def test_workflow_role_state_json_merge_preserves_other_roles_and_uses_absolute_path(
+    tmp_path,
+):
+    maker = tmp_path / "maker.json"
+    existing = json.dumps({"viewer": "viewer.json", "maker": "old-maker.json"})
+
+    merged = merge_workflow_role_states_json(
+        existing,
+        role="maker",
+        state_path=maker,
+        project_root=tmp_path,
+    )
+
+    assert json.loads(merged) == {
+        "viewer": "viewer.json",
+        "maker": str(maker.resolve()),
+    }
 
 
 def test_common_cases_dialog_reopens_current_file_directory(tmp_path):
@@ -1256,7 +1473,14 @@ def test_all_actions_are_grouped_into_one_browser_command():
     )
     commands = [
         (query, {"EI_ACTION": "查询"}, "tests/test_module_action.py"),
-        (nested, {"EI_ACTION": "新增", "EI_REQUIRE_ADD": "true"}, "tests/test_module_action.py"),
+        (
+            nested,
+            {
+                "EI_ACTION": "新增", "EI_REQUIRE_ADD": "true",
+                "EI_PAGE_TAB": "项目投后管理",
+            },
+            "tests/test_module_action.py",
+        ),
         (other, {"EI_ACTION": "查询"}, "tests/test_module_action.py"),
     ]
 
@@ -1268,6 +1492,7 @@ def test_all_actions_are_grouped_into_one_browser_command():
     assert [item["action"] for item in pool_actions] == ["查询", "新增", "查询"]
     assert pool_actions[1]["action_path"] == ["新增", "股权结构", "新增"]
     assert pool_actions[1]["require_add"] == "true"
+    assert pool_actions[1]["page_tab"] == "项目投后管理"
     assert pool_actions[2]["component"] == "other/index"
 
 
@@ -1590,6 +1815,32 @@ def test_url_history_is_limited_and_ignores_invalid_cache(tmp_path):
     assert history[-1] == "https://host-2.example/ei-view/"
 
 
+def test_default_system_url_prefers_last_entered_address(monkeypatch):
+    monkeypatch.setenv("EI_BASE_URL", "https://environment.example/ei-view/")
+    monkeypatch.setenv("FI_BASE_URL", "https://environment.example/fi-view/")
+
+    assert default_system_url(["https://last-entered.example/ei-view/"]) == (
+        "https://last-entered.example/ei-view/"
+    )
+    assert default_system_url([]) == "https://environment.example/ei-view/"
+
+
+def test_remember_system_url_persists_an_editable_address(tmp_path):
+    input_widget = _StubWidget()
+    launcher = SimpleNamespace(
+        url_history_file=tmp_path / "artifacts" / "launcher-history.json",
+        system_url=_StubValue("https://edited.example/ei-view/"),
+        url_history=[],
+        project_url_inputs={"EI": input_widget},
+    )
+
+    Launcher._remember_system_url(launcher)
+
+    assert launcher.url_history == ["https://edited.example/ei-view/"]
+    assert load_url_history(launcher.url_history_file) == launcher.url_history
+    assert input_widget.options["values"] == launcher.url_history
+
+
 class _StubValue:
     def __init__(self, value):
         self.value = value
@@ -1841,6 +2092,126 @@ def test_run_selected_builds_environment_and_form_url_from_aligned_url(
     assert commands[0][1]["EI_FORM_URL"] == "https://host/fi-view/#/buildProject"
 
 
+def test_run_selected_plans_an_isolated_workflow_without_module_selection_or_excel(
+    monkeypatch, tmp_path
+):
+    source_root = tmp_path / "source"
+    (source_root / "ei-view" / "src" / "views").mkdir(parents=True)
+    workflow_config = json.dumps({
+        "resourcePoolUrl": "https://host/ei-view/#/resourcePool",
+    })
+    started = []
+    warnings = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            started.append(self)
+
+    profile = SimpleNamespace(
+        key="EI",
+        label="EI 项目",
+        source=_StubValue(str(source_root)),
+        system_url=_StubValue("https://host/ei-view/"),
+        storage=_StubValue(""),
+        username=_StubValue(""),
+        password=_StubValue(""),
+        enabled=_StubValue(True),
+    )
+    monkeypatch.setenv("EI_ACTION", "新增")
+    monkeypatch.setenv("EI_ACTION_PATH", '["新增"]')
+    monkeypatch.setenv("EI_ACTION_PATHS_JSON", '[["新增"]]')
+    monkeypatch.setenv("EI_ACTIONS_JSON", '[{"action":"新增"}]')
+    monkeypatch.setenv(
+        RESOURCE_POOL_APPROVAL_CONFIG_ENV, workflow_config
+    )
+    monkeypatch.setattr(launcher_module.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(
+        launcher_module.messagebox,
+        "showwarning",
+        lambda title, message: warnings.append((title, message)),
+    )
+    launcher = SimpleNamespace(
+        _selected_targets=lambda: (_ for _ in ()).throw(
+            AssertionError("workflow must not require module selection")
+        ),
+        projects={"EI": profile},
+        workflow_enabled=_StubValue(True),
+        mode=_StubValue("standard"),
+        submit_zentao=_StubValue(False),
+        headless=_StubValue(True),
+        project_root=tmp_path,
+        run_button=_StubWidget(),
+        status=_StubValue(""),
+        _set_execution_progress=lambda *_args: None,
+        _execute_commands_worker=lambda *_args: None,
+    )
+
+    Launcher.run_selected(launcher)
+
+    assert warnings == []
+    assert len(started) == 1
+    commands, preflight, mode, base_url, headless, _submit = started[0].args
+    assert preflight == []
+    assert mode == "standard"
+    assert base_url == "https://host/ei-view"
+    assert headless is True
+    assert len(commands) == 1
+    target, environment, test_file = commands[0]
+    assert test_file == WORKFLOW_TEST_FILE
+    assert target.id == "EI::workflow::resource-pool-approval"
+    assert target.path == ("EI 项目", "业务流程", "resource-pool-approval")
+    assert environment["EI_WORKFLOW_ID"] == "resource-pool-approval"
+    assert environment["EI_WORKFLOW_FACTORY"] == (
+        "ei_ui_smoke.workflows.resource_pool_approval:build_workflow"
+    )
+    assert json.loads(environment["EI_WORKFLOW_ROLE_STATES_JSON"]) == {
+        "maker": str(
+            workflow_role_storage_state_path(
+                tmp_path, "resource-pool-approval", "maker"
+            )
+        )
+    }
+    assert (
+        environment["EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON"]
+        == workflow_config
+    )
+    assert environment["EI_DATA_MODE"] == "standard"
+    assert environment["EI_AUTOMATION_PROJECT"] == "EI"
+    assert not any(name.startswith("EI_ACTION") for name in environment)
+    assert "EI_STORAGE_STATE" not in environment
+
+
+def test_run_selected_rejects_builtin_workflow_without_config_before_planning(
+    monkeypatch, tmp_path,
+):
+    warnings = []
+    monkeypatch.delenv(RESOURCE_POOL_APPROVAL_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(
+        launcher_module.messagebox,
+        "showwarning",
+        lambda title, message: warnings.append((title, message)),
+    )
+    launcher = SimpleNamespace(
+        _selected_targets=lambda: (_ for _ in ()).throw(
+            AssertionError("invalid workflow must fail before module planning")
+        ),
+        workflow_enabled=_StubValue(True),
+        project_root=tmp_path,
+    )
+
+    Launcher.run_selected(launcher)
+
+    assert warnings == [(
+        "业务流程配置无效",
+        "内建资源池审批流程配置必须是有效的非空 JSON 对象（"
+        "EI_RESOURCE_POOL_APPROVAL_CONFIG_JSON）。",
+    )]
+
+
 def test_run_selected_uses_all_sheets_and_ids_when_sheet_and_id_selection_are_empty(
     monkeypatch, tmp_path
 ):
@@ -1930,11 +2301,16 @@ def test_project_namespaces_keep_identical_module_ids_and_all_selection_isolated
 
     assert ei_item.id == "EI::FUND::add"
     assert fi_item.id == "FI::FUND::add"
+    assert ei_item.path == ("基金管理", "新增")
+    assert fi_item.path == ("基金管理", "新增")
+    assert launcher_module.tree_branch_identity(ei_item, 1) != (
+        launcher_module.tree_branch_identity(fi_item, 1)
+    )
     assert project_key_from_item(fi_item) == "FI"
     assert resolve_selected_targets([ei_all, ei_item, fi_all, fi_item], [ei_all]) == [ei_item]
 
 
-def test_project_all_shortcuts_are_ordered_before_module_trees():
+def test_global_all_shortcut_executes_all_loaded_project_modules():
     ei_all = launcher_module.ModuleItem(
         "EI::ALL", "全部模块", ("EI 项目", "ALL"), runnable=True,
     )
@@ -1944,10 +2320,18 @@ def test_project_all_shortcuts_are_ordered_before_module_trees():
     ordinary = launcher_module.ModuleItem(
         "EI::FUND", "基金管理", ("EI 项目", "基金管理"), runnable=True,
     )
+    fi_module = launcher_module.ModuleItem(
+        "FI::PROJ", "项目管理", ("FI 项目", "项目管理"), runnable=True,
+    )
 
-    shortcuts = launcher_module.ordered_project_all_items([fi_all, ordinary, ei_all])
+    shortcut = launcher_module.global_all_item([fi_all, ordinary, fi_module, ei_all])
 
-    assert [item.id for item in shortcuts] == ["EI::ALL", "FI::ALL"]
+    assert shortcut is not None
+    assert shortcut.id == "ALL"
+    assert shortcut.path == ("ALL",)
+    assert launcher_module.resolve_selected_targets(
+        [ei_all, ordinary, fi_all, fi_module], [shortcut]
+    ) == [ordinary, fi_module]
 
 
 def test_run_selected_plans_ei_then_fi_with_independent_session_environment(

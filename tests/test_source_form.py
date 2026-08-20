@@ -21,6 +21,30 @@ def test_follows_dialog_component_and_extracts_interactive_fields(tmp_path):
     assert discover_custom_form_fields(tmp_path, "fund/index") == [("fundName", "基金名称", False)]
 
 
+def test_follows_default_component_import_with_type_import(tmp_path):
+    views = tmp_path / "ei-view" / "src" / "views" / "staffAssignment"
+    (views / "components").mkdir(parents=True)
+    (views / "index.vue").write_text('''
+      <template><FormPage /></template>
+      <script setup lang="ts">
+      import FormPage, { type StaffAssignmentItem } from "./components/formPage.vue";
+      </script>
+    ''', encoding="utf-8")
+    (views / "components" / "formPage.vue").write_text('''
+      <PurvarCol field-code="userName" :label="fieldLabel('userName', '委派人员')">
+        <el-form-item prop="userName"><PurvarSelectUserDropdown /></el-form-item>
+      </PurvarCol>
+      <PurvarCol field-code="dutyDate" :label="fieldLabel('dutyDate', '委派开始时间')">
+        <el-form-item prop="dutyDate"><el-date-picker /></el-form-item>
+      </PurvarCol>
+    ''', encoding="utf-8")
+
+    assert discover_custom_form_fields(tmp_path, "staffAssignment/index") == [
+        ("userName", "委派人员", False),
+        ("dutyDate", "委派开始时间", False),
+    ]
+
+
 def test_resolves_runtime_src_ei_view_alias(tmp_path):
     src_views = tmp_path / "ei-view" / "src" / "views"
     src_ei_views = tmp_path / "ei-view" / "srcEi" / "views"

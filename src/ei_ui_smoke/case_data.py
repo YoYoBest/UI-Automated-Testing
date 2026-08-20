@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SAVE_BUTTON = "button:has-text('保存'),button:has-text('提交')"
+# Some deployed forms label their ordinary persistence action as "暂存".
+# Keep the legacy submit fallback for configuration-driven form smoke cases.
+DEFAULT_SAVE_BUTTON = (
+    "button:has-text('保存'),button:has-text('确定'),"
+    "button:has-text('暂存'),button:has-text('提交')"
+)
 DEFAULT_SUCCESS_TEXTS = ("保存成功", "新增成功", "提交成功")
 
 
